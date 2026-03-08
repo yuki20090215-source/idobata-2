@@ -72,6 +72,10 @@ function httpsPost(hostname, reqPath, headers, bodyObj) {
         let raw = '';
         res.on('data', c => { raw += c; });
         res.on('end', () => {
+          if (res.statusCode === 429) {
+            reject(new Error('GEMINI_QUOTA_EXCEEDED'));
+            return;
+          }
           if (res.statusCode >= 400) {
             reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 300)}`));
             return;
@@ -141,38 +145,88 @@ function parseAI(raw) {
 }
 
 // ===== AI呼び出し =====
-async function callGemini(prompt) {
-  const reqBody = {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.85,
-      maxOutputTokens: 1500,
-      // JSON出力を強制。Geminiが確実にJSONのみ返す
-      responseMimeType: 'application/json'
-    }
+async function callGemini(prompt, schema) {
+  // ★ schema を受け取り、responseMimeType + responseSchema をセットで指定
+  // Gemini 2.0 Flash は responseSchema なしの JSON モードは 400 エラーになる
+  const generationConfig = {
+    temperature: 0.85,
+    maxOutputTokens: 1500,
+    responseMimeType: 'application/json',
+    responseSchema: schema
   };
 
-  // ★ デバッグ: 送信プロンプトをログ出力（Renderのログで確認可能）
+  const reqBody = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig
+  };
+
   console.log('[gemini-prompt]\n' + prompt);
 
   const d = await httpsPost(
     'generativelanguage.googleapis.com',
-    `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+    // ★ 正式モデル名 gemini-2.0-flash-001 を使用
+    `/v1beta/models/gemini-2.0-flash-001:generateContent?key=${GEMINI_KEY}`,
     {},
     reqBody
   );
 
   const raw = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-
-  // ★ デバッグ: Geminiの生レスポンスをログ出力
   console.log('[gemini-raw-response]\n' + raw);
 
   return parseAI(raw);
 }
 
-async function callAI(prompt) {
+// ===== JSONスキーマ定義 =====
+// Gemini に返すべき構造を明示することで 400 エラーを防ぐ
+const REPLY_SCHEMA = {
+  type: 'object',
+  properties: {
+    replies: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name:    { type: 'string' },
+          id:      { type: 'string' },
+          avatar:  { type: 'string' },
+          comment: { type: 'string' },
+          likes:   { type: 'integer' }
+        },
+        required: ['name', 'id', 'avatar', 'comment', 'likes']
+      }
+    }
+  },
+  required: ['replies']
+};
+
+const TIMELINE_SCHEMA = {
+  type: 'object',
+  properties: {
+    posts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name:    { type: 'string' },
+          id:      { type: 'string' },
+          avatar:  { type: 'string' },
+          comment: { type: 'string' },
+          likes:   { type: 'integer' }
+        },
+        required: ['name', 'id', 'avatar', 'comment', 'likes']
+      }
+    }
+  },
+  required: ['posts']
+};
+
+async function callReplyAI(prompt)    {
   if (!GEMINI_KEY) throw new Error('GEMINI_API_KEY が設定されていません');
-  return callGemini(prompt);
+  return callGemini(prompt, REPLY_SCHEMA);
+}
+async function callTimelineAI(prompt) {
+  if (!GEMINI_KEY) throw new Error('GEMINI_API_KEY が設定されていません');
+  return callGemini(prompt, TIMELINE_SCHEMA);
 }
 
 // ===== プロンプト =====
@@ -277,11 +331,15 @@ http.createServer(async (req, res) => {
       const vm = ['influencer','mental','debate','legend'].includes(mode) ? mode : 'influencer';
       console.log(`[reply] mode=${vm} ip=${ip} text="${text.slice(0,40)}"`);
 
-      const replies = await callAI(buildReplyPrompt(text, vm, interests));
+      const replies = await callReplyAI(buildReplyPrompt(text, vm, interests));
       sendJSON(res, 200, { replies });
     } catch(e) {
       console.error('[reply error]', e.message);
-      sendJSON(res, 500, { error: e.message, replies: [] });
+      if (e.message === 'GEMINI_QUOTA_EXCEEDED') {
+        sendJSON(res, 503, { error: 'QUOTA_EXCEEDED', replies: [] });
+      } else {
+        sendJSON(res, 500, { error: e.message, replies: [] });
+      }
     }
     return;
   }
@@ -299,11 +357,11 @@ http.createServer(async (req, res) => {
       const { interests = [], mode = 'influencer' } = await readBody(req);
       console.log(`[timeline] mode=${mode} ip=${ip}`);
 
-      const posts = await callAI(buildTimelinePrompt(interests, mode));
+      const posts = await callTimelineAI(buildTimelinePrompt(interests, mode));
       sendJSON(res, 200, { posts });
     } catch(e) {
       console.error('[timeline error]', e.message);
-      sendJSON(res, 500, { error: e.message, posts: [] });
+      sendJSON(res, e.message === 'GEMINI_QUOTA_EXCEEDED' ? 503 : 500, { error: e.message, posts: [] });
     }
     return;
   }
