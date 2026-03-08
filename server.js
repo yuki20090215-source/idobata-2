@@ -196,21 +196,50 @@ async function callAI(sys, userMsg) {
 }
 
 // ===== プロンプト =====
-function replyPrompt(mode, interests) {
+// ★修正: postText を引数に追加し、投稿内容をプロンプトに直接埋め込む
+function replyPrompt(mode, interests, postText) {
   const int = interests.length ? interests.join('、') : '未設定';
-  const modeDesc = {
-    influencer: '熱狂的・共感的な3〜5人で返信。likes:100〜99999。',
-    mental:     '温かく寄り添う3〜4人で返信。likes:10〜2000。',
-    debate:     '賛成・反対・中立の3〜5人が議論。likes:10〜5000。',
-    legend:     '歴史上の偉人3〜4人が返信。likes:1000〜100000。'
-  }[mode] || '熱狂的・共感的な3〜5人で返信。likes:100〜99999。';
 
-  return `あなたは日本語SNS「いどばた」のAIです。
-ユーザーの趣味: ${int}
-${modeDesc}
-各キャラのフィールド: name(日本語の名前), id(@英数字), avatar(絵文字1個), comment(返信文), likes(整数)
-必ず {"replies": [...]} の形式のJSONで返してください。説明文は不要です。
-例: {"replies":[{"name":"象のり造","id":"@zou","avatar":"🐘","comment":"バズる！","likes":2341}]}`;
+  // モードごとのキャラクター設定と返信スタイル
+  const modeConfig = {
+    influencer: {
+      desc: '熱狂的なSNSユーザー3〜5人',
+      style: '上記の投稿を絶賛・共感・拡散したがる反応。投稿の具体的な内容（キーワード・話題）に直接言及すること。バズりそうなコメントで盛り上げる。likes:100〜99999。',
+    },
+    mental: {
+      desc: '優しく共感してくれる3〜4人',
+      style: '上記の投稿の悩みや気持ちに寄り添い、投稿の具体的な内容を受け止めて温かく返す。「それは辛かったね」「わかるよ」など共感の言葉を含める。likes:10〜2000。',
+    },
+    debate: {
+      desc: '賛成派・反対派・中立派が混在する3〜5人',
+      style: '上記の投稿の主張や意見に対して、それぞれ異なる立場から具体的に反論・賛同・補足する。投稿のキーワードや論点を必ず使うこと。likes:10〜5000。',
+    },
+    legend: {
+      desc: '歴史上の偉人3〜4人（名前とidは実在の人物にすること）',
+      style: '上記の投稿テーマに関連した名言や哲学を交えて返信する。投稿の内容・テーマに具体的に言及し、その偉人らしい視点でコメントする。likes:1000〜100000。',
+    },
+  };
+
+  const cfg = modeConfig[mode] || modeConfig.influencer;
+
+  return `あなたは日本語SNS「いどばた」のAIキャラクター生成エンジンです。
+
+【返信対象の投稿】
+"${postText}"
+
+【ユーザーの趣味】: ${int}
+
+【登場キャラクター】: ${cfg.desc}
+【返信スタイル】: ${cfg.style}
+
+絶対ルール:
+- 各キャラのcommentは必ず上記の【返信対象の投稿】の内容・キーワード・感情に直接反応すること
+- 投稿と無関係な汎用コメント（「すごいですね！」だけなど）は禁止
+- 返信は自然な日本語口語で、SNSらしい短め〜中程度の長さにすること
+
+各キャラのフィールド: name(日本語), id(@英数字), avatar(絵文字1個), comment(返信文), likes(整数)
+必ず {"replies": [...]} の形式のJSONのみ返してください。説明文は不要です。
+例: {"replies":[{"name":"象のり造","id":"@zou","avatar":"🐘","comment":"これまじでわかる！昨日も同じこと思ってた笑","likes":2341}]}`;
 }
 
 function timelinePrompt(interests, mode) {
@@ -262,7 +291,11 @@ http.createServer(async (req, res) => {
       const vm = ['influencer','mental','debate','legend'].includes(mode) ? mode : 'influencer';
       console.log(`[reply] mode=${vm} ip=${ip} text="${text.slice(0,40)}"`);
 
-      const replies = await callAI(replyPrompt(vm, interests), text);
+      // ★修正: postTextをプロンプトに埋め込み、userMsgは指示のみにする
+      const replies = await callAI(
+        replyPrompt(vm, interests, text),
+        '上記の投稿への返信キャラクターを生成してください。'
+      );
       sendJSON(res, 200, { replies });
     } catch(e) {
       console.error('[reply error]', e.message);
