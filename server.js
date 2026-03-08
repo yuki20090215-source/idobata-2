@@ -144,6 +144,20 @@ function parseAI(raw) {
   throw new Error(`AIレスポンスをJSONとして解釈できませんでした: ${raw.slice(0, 200)}`);
 }
 
+// ===== リクエストキュー（RPM超過防止） =====
+// Gemini 1.5 Flash 8B 無料枠: 15 RPM / 1,000,000 TPD
+// 1リクエストあたり最低4秒間隔 = 最大15RPM以内に収める
+let lastCallTime = 0;
+async function waitForRateLimit() {
+  const MIN_INTERVAL = 4000; // ms
+  const now = Date.now();
+  const elapsed = now - lastCallTime;
+  if (elapsed < MIN_INTERVAL) {
+    await new Promise(r => setTimeout(r, MIN_INTERVAL - elapsed));
+  }
+  lastCallTime = Date.now();
+}
+
 // ===== AI呼び出し =====
 async function callGemini(prompt, schema) {
   // ★ schema を受け取り、responseMimeType + responseSchema をセットで指定
@@ -160,12 +174,13 @@ async function callGemini(prompt, schema) {
     generationConfig
   };
 
+  await waitForRateLimit();
   console.log('[gemini-prompt]\n' + prompt);
 
   const d = await httpsPost(
     'generativelanguage.googleapis.com',
     // ★ 正式モデル名 gemini-2.0-flash-001 を使用
-    `/v1beta/models/gemini-2.0-flash-001:generateContent?key=${GEMINI_KEY}`,
+    `/v1beta/models/gemini-1.5-flash-8b:generateContent?key=${GEMINI_KEY}`,
     {},
     reqBody
   );
