@@ -180,7 +180,7 @@ async function callGemini(prompt, schema) {
   const d = await httpsPost(
     'generativelanguage.googleapis.com',
     // ★ 正式モデル名 gemini-2.0-flash-001 を使用
-    `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+    `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
     {},
     reqBody
   );
