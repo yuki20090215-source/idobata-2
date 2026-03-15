@@ -186,7 +186,7 @@ return parseAI(raw);
 
 // –– \u7D71\u5408\u547C\u3073\u51FA\u3057: Claude\u512A\u5148 \u2192 Gemini\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF ––
 async function callAI(systemPrompt, userPrompt, geminiPrompt, schema) {
-// Claude\u3042\u308A\u306A\u3089\u307E\u305FClaudeを試みる。失敗時はGeminiにフォールバック
+// Claude\u3042\u308A\u306A\u3089\u307E\u305FClaude\u3092\u8A66\u307F\u308B\u3002\u5931\u6557\u6642\u306FGemini\u306B\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF
 if (CLAUDE_KEY) {
 try {
 return await callClaude(systemPrompt, userPrompt);
@@ -520,14 +520,14 @@ debate:    ‘\u610F\u898B\u3092\u3076\u3064\u3051\u3042\u3046\u30C7\u30A3\u30D9
 legend:    ‘\u6B74\u53F2\u4E0A\u306E\u5049\u4EBA\u305F\u3061\u304C\u8A9E\u308B\u30EC\u30B8\u30A7\u30F3\u30C9\u30C8\u30FC\u30AF\u30E2\u30FC\u30C9\u3002\u540D\u8A00\u30FB\u54F2\u5B66\u30FB\u6642\u4EE3\u306E\u77E5\u6075\u3092\u6D3B\u7528’,
 }[mode] || ‘’;
 
-// legendモードのときはWikipediaから実際の情報を取得
+// legend\u30E2\u30FC\u30C9\u306E\u3068\u304D\u306FWikipedia\u304B\u3089\u5B9F\u969B\u306E\u60C5\u5831\u3092\u53D6\u5F97
 let wikiCtx = ‘’;
 if (mode === ‘legend’) {
 const wikiNames = rChars.slice(0, 3).map(c => c.name);
 const summaries = await Promise.all(wikiNames.map(n => fetchWikiSummary(n)));
 const valid = summaries.filter(Boolean);
 if (valid.length) {
-wikiCtx = ‘\n## Wikipedia情報（プロンプトに活用すること）\n’
+wikiCtx = ‘\n## Wikipedia\u60C5\u5831\uFF08\u30D7\u30ED\u30F3\u30D7\u30C8\u306B\u6D3B\u7528\u3059\u308B\u3053\u3068\uFF09\n’
 + wikiNames.map((n,i) => summaries[i] ? `${n}: ${summaries[i]}` : ‘’).filter(Boolean).join(’\n’);
 }
 }
