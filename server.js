@@ -1,61 +1,124 @@
 'use strict';
+
 const http  = require('http');
 const https = require('https');
 
-const PORT       = process.env.PORT || 3000;
-const GEMINI_KEY       = process.env.GEMINI_API_KEY      || '';
-const UNSPLASH_KEY     = process.env.UNSPLASH_ACCESS_KEY  || '';
-const FIREBASE_DB_URL  = process.env.FIREBASE_DB_URL      || ''; // e.g. https://xxx.firebaseio.com
+// ===================================================
+//  定数・設定（一箇所にまとめる）
+// ===================================================
+const PORT         = process.env.PORT || 3000;
+const GEMINI_KEY   = process.env.GEMINI_API_KEY       || '';
+const UNSPLASH_KEY = process.env.UNSPLASH_ACCESS_KEY  || '';
+const FIREBASE_DB_URL = process.env.FIREBASE_DB_URL   || '';
+const CLAUDE_KEY   = process.env.ANTHROPIC_API_KEY    || '';
+const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
 
+const RL_WIN   = 60_000;   // 1分
+const RL_MAX   = 5;
+const RPD_HARD = 1480;
+const API_MIN_INTERVAL_MS = 4200;
+const WIKI_CACHE_TTL_MS   = 60 * 60 * 1000; // 1時間
+const BODY_MAX_BYTES       = 200_000;
+const HTTP_TIMEOUT_MS      = 15_000;
 
-// ===== IP\u30EC\u30FC\u30C8\u5236\u9650 =====
-const RL_WIN = 60 * 1000;  // 1\u5206
-const RL_MAX = 5;           // 1\u5206\u3042\u305F\u308A5\u56DE
+const STORE_KEY = 'idobata_v6';
 
-// RPD(1\u65E5\u30EA\u30AF\u30A8\u30B9\u30C8\u6570)\u30AB\u30A6\u30F3\u30BF\u30FC
-let rpdCount = 0;
-let rpdResetAt = Date.now() + 24 * 60 * 60 * 1000;
-const RPD_LIMIT = 1400;
-const RPD_HARD  = 1480;
+// ===================================================
+//  ユーティリティ
+// ===================================================
 
-function checkRPD() {
-  const now = Date.now();
-  if (now > rpdResetAt) {
-    rpdCount  = 0;
-    rpdResetAt = now + 24 * 60 * 60 * 1000;
-    console.log('[rpd] \u65E5\u6B21\u30EA\u30BB\u30C3\u30C8');
-  }
-  rpdCount++;
-  console.log(`[rpd] \u672C\u65E5${rpdCount}\u56DE\u76EE / \u4E0A\u9650${RPD_HARD}\u56DE`);
-  if (rpdCount >= RPD_HARD) throw new Error('RPD_EXCEEDED');
-  return rpdCount;
+/** シードつき疑似乱数（seededRand と tRand を統合） */
+function seededRand(seed) {
+  let s = (seed >>> 0) || 1;
+  return () => {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return (s >>> 0) / 0xFFFFFFFF;
+  };
 }
 
-const rlMap  = new Map();
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++)
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+/** キーワード抽出（重複定義を1つに統合） */
+function extractKeywordsFromText(text) {
+  const KW_STOP = new Set([
+    'てる','でる','いる','ある','なる','くる','もの','こと','とき',
+    'ため','から','まで','より','など','でも','しか','だけ','ほど',
+  ]);
+  const kws = [];
+  (text.match(/#[\w\u3000-\u9FFF\uF900-\uFAFF]+/g) || [])
+    .forEach(t => kws.push({ w: t, isTag: true }));
+  (text.match(/[\u30A1-\u30FF]{3,}/g) || [])
+    .filter(w => !KW_STOP.has(w))
+    .forEach(w => kws.push({ w: '#' + w, isTag: false }));
+  (text.match(/[\u4E00-\u9FFF]{2,6}/g) || [])
+    .forEach(w => kws.push({ w: '#' + w, isTag: false }));
+  (text.match(/[A-Za-z][A-Za-z0-9]{2,}/g) || [])
+    .forEach(w => kws.push({ w: '#' + w, isTag: false }));
+  return [...new Map(kws.map(k => [k.w, k])).values()];
+}
+
+/** キーワード抽出（短縮版 — Geminiプロンプト用） */
+function extractKeyword(text) {
+  const tags = (text.match(/#[\w\u3041-\u9FFF]+/g) || []).map(t => t.replace('#',''));
+  if (tags.length) return tags[0];
+  const words = text.split(/[\s\u3001\u3002\uFF01\uFF1F!?.]+/)
+    .filter(w => w.length >= 2 && /[\u30A1-\u30FF\u3041-\u9FFF]/.test(w));
+  return words[0] || text.slice(0, 8);
+}
+
+// ===================================================
+//  レート制限・RPD管理
+// ===================================================
+const rlMap = new Map();
 
 function checkRL(ip) {
   const now = Date.now();
-  const e   = rlMap.get(ip);
-  if (!e || now - e.w > RL_WIN) { rlMap.set(ip, {c:1, w:now}); return true; }
-  e.c++;
-  return e.c <= RL_MAX;
+  const e = rlMap.get(ip);
+  if (!e || now - e.w > RL_WIN) { rlMap.set(ip, { c: 1, w: now }); return true; }
+  return ++e.c <= RL_MAX;
 }
-// \u53E4\u3044\u30A8\u30F3\u30C8\u30EA\u30925\u5206\u3054\u3068\u306B\u524A\u9664\uFF08\u30E1\u30E2\u30EA\u30EA\u30FC\u30AF\u9632\u6B62\uFF09
+
 setInterval(() => {
   const now = Date.now();
   for (const [ip, e] of rlMap.entries())
     if (now - e.w > RL_WIN * 5) rlMap.delete(ip);
-}, 5 * 60 * 1000);
+}, 5 * 60_000);
 
-// ===== HTML =====
-const INDEX_HTML = "<!DOCTYPE html>\n<html lang=\"ja\" data-theme=\"dark\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no\">\n<title>\u3044\u3069\u3070\u305f</title>\n<link href=\"https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700;900&display=swap\" rel=\"stylesheet\">\n<style>\n/* ===== CSS\u5909\u6570 ===== */\n:root{\n  --bg:#0f0f13;--sf:#1a1a22;--sf2:#22222e;--bd:#2e2e3e;\n  --tx:#f0f0f5;--sub:#8888aa;--like:#ff4488;--acc:#ff6b35;\n  --fn:'Noto Sans JP',sans-serif;\n}\n[data-theme=\"light\"]{\n  --bg:#f5f5f7;--sf:#ffffff;--sf2:#ebebf0;--bd:#d8d8e8;\n  --tx:#111122;--sub:#666688;\n}\n/* ===== \u30ea\u30bb\u30c3\u30c8 ===== */\n*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}\nbody{background:var(--bg);color:var(--tx);font-family:var(--fn);min-height:100vh;display:flex;justify-content:center;transition:background .25s,color .25s;}\nbutton,input,textarea{font-family:var(--fn);}\nbutton{cursor:pointer;border:none;background:none;}\na{text-decoration:none;color:inherit;}\n\n/* ===== \u30a2\u30d7\u30ea\u67a0 ===== */\n.app{width:390px;min-height:100vh;background:var(--bg);display:flex;flex-direction:column;position:relative;overflow-x:hidden;}\n@media(max-width:420px){.app{width:100vw;}}\n\n/* ===== \u30b9\u30af\u30ea\u30fc\u30f3\u5207\u66ff ===== */\n.screen{display:none;flex-direction:column;flex:1;}\n.screen.active{display:flex;}\n\n/* ===== \u30ed\u30fc\u30c7\u30a3\u30f3\u30b0\u30aa\u30fc\u30d0\u30fc\u30ec\u30a4 ===== */\n.overlay{position:fixed;inset:0;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:1000;gap:18px;transition:opacity .3s;}\n.overlay.hide{display:none;}\n.ov-logo{font-size:36px;font-weight:900;letter-spacing:-1.5px;}\n.ov-logo em{color:var(--acc);font-style:normal;}\n.ov-sub{font-size:13px;color:var(--sub);}\n.spinner{width:38px;height:38px;border:3px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:spin .75s linear infinite;}\n@keyframes spin{to{transform:rotate(360deg);}}\n\n/* ===== \u30bb\u30c3\u30c8\u30a2\u30c3\u30d7\u753b\u9762 ===== */\n#setupScreen{overflow-y:auto;padding-bottom:60px;}\n.s-hero{text-align:center;padding:56px 24px 28px;background:linear-gradient(180deg,var(--sf) 0%,var(--bg) 100%);}\n.s-logo{font-size:46px;font-weight:900;letter-spacing:-2px;margin-bottom:8px;}\n.s-logo em{color:var(--acc);font-style:normal;}\n.s-catchcopy{font-size:14px;color:var(--sub);line-height:1.9;}\n.s-mascot{font-size:68px;margin:14px 0 0;}\n.s-body{padding:24px 20px 0;}\n.s-desc{font-size:13px;color:var(--sub);line-height:1.9;text-align:center;margin-bottom:24px;}\n.s-sec{margin-bottom:22px;}\n.s-lbl{font-size:10.5px;font-weight:700;color:var(--sub);letter-spacing:1.8px;text-transform:uppercase;margin-bottom:8px;}\n.s-inp{width:100%;background:var(--sf);border:1.5px solid var(--bd);border-radius:14px;padding:13px 16px;color:var(--tx);font-size:15px;outline:none;transition:border-color .2s;}\n.s-inp:focus{border-color:var(--acc);}\n.s-inp::placeholder{color:var(--sub);}\n/* \u30a2\u30d0\u30bf\u30fc\u9078\u629e */\n.av-grid{display:flex;flex-wrap:wrap;gap:10px;}\n.av-item{width:52px;height:52px;border-radius:50%;background:var(--sf);border:2px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:26px;cursor:pointer;transition:all .2s;}\n.av-item.sel{border-color:var(--acc);background:rgba(255,107,53,.15);transform:scale(1.1);}\n/* \u8208\u5473\u30bf\u30b0 */\n.int-grid{display:flex;flex-wrap:wrap;gap:8px;}\n.int-tag{padding:7px 14px;border-radius:20px;border:1.5px solid var(--bd);font-size:12px;font-weight:700;color:var(--sub);cursor:pointer;transition:all .2s;}\n.int-tag.sel{border-color:var(--acc);color:var(--acc);background:rgba(255,107,53,.1);}\n/* \u958b\u59cb\u30dc\u30bf\u30f3 */\n.s-btn{width:100%;padding:15px;border-radius:14px;background:var(--acc);color:#fff;font-size:16px;font-weight:900;margin-top:8px;transition:transform .15s,opacity .15s;}\n.s-btn:hover{transform:translateY(-2px);}\n.s-btn:active{transform:translateY(0);}\n.s-btn:disabled{opacity:.4;transform:none;cursor:not-allowed;}\n\n/* ===== \u30e1\u30a4\u30f3\u753b\u9762 ===== */\n#mainScreen{height:100vh;overflow:hidden;}\n/* \u30d8\u30c3\u30c0\u30fc */\n.hdr{flex-shrink:0;background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid var(--bd);padding:10px 14px 8px;position:sticky;top:0;z-index:100;}\n.hdr-row{display:flex;align-items:center;justify-content:space-between;}\n.hdr-left{display:flex;align-items:center;gap:8px;}\n/* \u30e1\u30cb\u30e5\u30fc\u30dc\u30bf\u30f3 */\n.menu-btn{width:36px;height:36px;border-radius:10px;background:var(--sf);border:1.5px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:17px;transition:all .2s;flex-shrink:0;}\n.menu-btn:hover{border-color:var(--acc);}\n.logo{font-size:21px;font-weight:900;letter-spacing:-.5px;white-space:nowrap;cursor:pointer;}\n.logo em{color:var(--acc);font-style:normal;}\n.mode-badge{display:inline-block;font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;background:var(--acc);color:#fff;white-space:nowrap;transition:background .3s;margin-top:6px;}\n.hdr-right{display:flex;align-items:center;gap:5px;}\n.nav-btn{width:34px;height:34px;border-radius:50%;background:var(--sf);border:1.5px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:15px;transition:all .2s;position:relative;flex-shrink:0;}\n.nav-btn:hover,.nav-btn.on{border-color:var(--acc);background:rgba(255,107,53,.1);}\n.ndot{position:absolute;top:2px;right:2px;width:8px;height:8px;border-radius:50%;background:var(--like);border:2px solid var(--bg);display:none;}\n.ndot.show{display:block;}\n\n/* ===== \u30d1\u30cd\u30eb\u30b7\u30b9\u30c6\u30e0 ===== */\n.panels{flex:1;overflow:hidden;position:relative;}\n.panel{position:absolute;inset:0;overflow-y:auto;padding-bottom:88px;opacity:0;pointer-events:none;transition:opacity .2s;scrollbar-width:thin;scrollbar-color:var(--bd) transparent;}\n.panel.on{opacity:1;pointer-events:auto;}\n.panel-hdr{padding:14px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg);z-index:10;}\n.panel-ttl{font-size:18px;font-weight:900;}\n.panel-act{color:var(--sub);font-size:12px;}\n\n/* ===== \u6295\u7a3f\u30ab\u30fc\u30c9 ===== */\n.post-card{padding:14px 16px;border-bottom:1px solid var(--bd);transition:background .15s;animation:fadeUp .3s ease;}\n.post-card:hover{background:var(--sf);}\n/* \u30e6\u30fc\u30b6\u30fc\u81ea\u8eab\u306e\u6295\u7a3f\u306f\u5de6border\u4ed8\u304d */\n.post-card.mine{border-left:3px solid var(--acc);background:color-mix(in srgb,var(--acc) 4%,var(--bg));}\n@keyframes fadeUp{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}\n.pc-top{display:flex;gap:11px;align-items:flex-start;}\n/* \u30a2\u30d0\u30bf\u30fc */\n.pc-av{width:44px;height:44px;border-radius:50%;background:var(--sf2);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;border:2px solid transparent;}\n.pc-av.mine{border-color:var(--acc);}\n.pc-meta{flex:1;min-width:0;}\n.pc-nr{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:2px;}\n.pc-name{font-size:13px;font-weight:700;}\n.pc-id{font-size:11px;color:var(--sub);}\n/* \u30e2\u30fc\u30c9\u30bf\u30b0 */\n.mtag{font-size:10px;padding:2px 7px;border-radius:10px;font-weight:700;}\n.t-inf{background:rgba(255,107,53,.2);color:#ff6b35;}\n.t-men{background:rgba(91,156,246,.2);color:#5b9cf6;}\n.t-deb{background:rgba(244,63,94,.2);color:#f43f5e;}\n.t-leg{background:rgba(167,139,250,.2);color:#a78bfa;}\n/* \u6295\u7a3f\u672c\u6587 */\n.pc-body{font-size:14px;line-height:1.7;margin:8px 0 10px;word-break:break-word;}\n/* \u30a2\u30af\u30b7\u30e7\u30f3\u30dc\u30bf\u30f3 */\n.pc-acts{display:flex;gap:20px;}\n.act{display:flex;align-items:center;gap:5px;color:var(--sub);font-size:12px;cursor:pointer;transition:color .2s;padding:3px 0;background:none;border:none;}\n.act:hover{color:var(--tx);}\n.act.lkd{color:var(--like);}\n.act-ico{font-size:15px;}\n@keyframes lpop{0%{transform:scale(1);}40%{transform:scale(1.5);}100%{transform:scale(1);}}\n.lpop{animation:lpop .3s ease;}\n\n/* ===== \u30b3\u30e1\u30f3\u30c8\u6b04 ===== */\n.cmt-sec{display:none;background:var(--sf2);border-top:1px solid var(--bd);padding:12px 14px;}\n.cmt-sec.open{display:block;animation:fadeUp .2s ease;}\n.cmt-item{padding:9px 0;border-bottom:1px solid var(--bd);font-size:13px;line-height:1.6;}\n.cmt-item:last-child{border:none;}\n.cmt-who{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:var(--acc);margin-bottom:4px;}\n.cmt-av{font-size:16px;}\n.cmt-add{display:flex;gap:8px;margin-top:10px;}\n.cmt-inp{flex:1;background:var(--bg);border:1.5px solid var(--bd);border-radius:20px;padding:8px 14px;color:var(--tx);font-size:13px;outline:none;transition:border-color .2s;}\n.cmt-inp:focus{border-color:var(--acc);}\n.cmt-inp::placeholder{color:var(--sub);}\n.cmt-snd{width:32px;height:32px;border-radius:50%;background:var(--acc);color:#fff;font-size:13px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}\n\n/* ===== \u30ed\u30fc\u30c7\u30a3\u30f3\u30b0\u30ab\u30fc\u30c9 ===== */\n.ld-card{padding:14px 16px;border-bottom:1px solid var(--bd);}\n.typing{display:flex;align-items:center;gap:5px;margin-top:6px;}\n.dot{width:7px;height:7px;border-radius:50%;background:var(--sub);animation:bounce 1.2s infinite;}\n.dot:nth-child(2){animation-delay:.2s;}\n.dot:nth-child(3){animation-delay:.4s;}\n@keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.4;}30%{transform:translateY(-6px);opacity:1;}}\n\n/* ===== \u7a7a\u72b6\u614b ===== */\n.empty{text-align:center;padding:64px 28px;color:var(--sub);}\n.empty-ico{font-size:54px;margin-bottom:16px;}\n.empty-ttl{font-size:17px;font-weight:700;color:var(--tx);margin-bottom:10px;}\n.empty-txt{font-size:13px;line-height:1.8;}\n\n/* ===== \u901a\u77e5\u30d1\u30cd\u30eb ===== */\n.notif-item{padding:14px 16px;border-bottom:1px solid var(--bd);display:flex;gap:12px;align-items:flex-start;animation:fadeUp .3s ease;}\n.notif-item.unread{background:color-mix(in srgb,var(--acc) 4%,var(--bg));}\n.ni-ico{font-size:22px;flex-shrink:0;margin-top:1px;}\n.ni-body{flex:1;}\n.ni-text{font-size:13px;line-height:1.65;margin-bottom:3px;}\n.ni-time{font-size:11px;color:var(--sub);}\n.no-notif{text-align:center;padding:52px 24px;color:var(--sub);font-size:13px;}\n\n/* ===== \u30c8\u30ec\u30f3\u30c9\u30d1\u30cd\u30eb ===== */\n.tr-item{display:flex;align-items:center;padding:14px 16px;border-bottom:1px solid var(--bd);cursor:pointer;transition:background .15s;}\n.tr-item:hover{background:var(--sf);}\n.tr-rank{font-size:17px;font-weight:900;color:var(--sub);width:34px;flex-shrink:0;}\n.tr-rank.top{color:var(--acc);}\n.tr-info{flex:1;}\n.tr-tag{font-size:15px;font-weight:700;margin-bottom:2px;}\n.tr-meta{font-size:11px;color:var(--sub);}\n.tr-cnt{font-size:12px;color:var(--sub);}.tr-empty{text-align:center;padding:52px 24px;color:var(--sub);}.tr-empty-ico{font-size:48px;margin-bottom:14px;}.tr-empty-ttl{font-size:15px;font-weight:700;color:var(--tx);margin-bottom:8px;}.tr-empty-txt{font-size:12px;line-height:1.8;}.tr-sec{padding:10px 16px 4px;font-size:10px;font-weight:700;color:var(--sub);letter-spacing:1.5px;border-bottom:1px solid var(--bd);}.tr-src{font-size:10px;padding:2px 7px;border-radius:8px;font-weight:700;margin-left:4px;}.ts-topic{background:rgba(255,107,53,.15);color:var(--acc);}.ts-post{background:rgba(100,200,100,.15);color:#4ade80;}.ts-kw{background:rgba(250,204,21,.15);color:#facc15;}.ts-int{background:rgba(91,156,246,.15);color:#5b9cf6;}.tr-bar{height:3px;border-radius:2px;background:var(--acc);opacity:.5;margin-top:4px;max-width:100%;}.tr-likes{font-size:11px;color:var(--acc);font-weight:700;}.tr-arrow{font-size:10px;margin-left:3px;}.tr-arrow.up{color:#4ade80;}.tr-arrow.down{color:#f43f5e;}.ts-post{background:rgba(255,107,53,.15);color:var(--acc);}.ts-int{background:rgba(91,156,246,.15);color:#5b9cf6;}.ts-ai{background:rgba(167,139,250,.15);color:#a78bfa;}\n\n/* ===== \u30d7\u30ed\u30d5\u30a3\u30fc\u30eb\u30d1\u30cd\u30eb ===== */\n.pr-hero{padding:24px 20px;border-bottom:1px solid var(--bd);display:flex;gap:16px;align-items:center;}\n.pr-av{width:74px;height:74px;border-radius:50%;background:var(--sf2);display:flex;align-items:center;justify-content:center;font-size:40px;border:3px solid var(--acc);flex-shrink:0;}\n.pr-name{font-size:22px;font-weight:900;}\n.pr-id{font-size:13px;color:var(--sub);margin-bottom:10px;}\n.pr-stats{display:flex;gap:20px;}\n.stat-n{font-size:17px;font-weight:900;color:var(--acc);}\n.stat-l{font-size:11px;color:var(--sub);}\n.pr-sec{padding:16px 20px;border-bottom:1px solid var(--bd);}\n.pr-stl{font-size:10.5px;font-weight:700;color:var(--sub);letter-spacing:1.8px;margin-bottom:10px;}\n.pr-tags{display:flex;flex-wrap:wrap;gap:7px;}\n.pr-tag{padding:5px 13px;border-radius:20px;border:1.5px solid var(--acc);color:var(--acc);font-size:12px;font-weight:700;}\n.pr-acts{padding:16px 20px;display:flex;flex-direction:column;gap:10px;}\n.pr-btn{padding:13px 16px;border-radius:12px;border:1.5px solid var(--bd);background:var(--sf);color:var(--tx);font-size:14px;text-align:left;transition:border-color .2s;}\n.pr-btn:hover{border-color:var(--acc);}\n.pr-btn.danger{color:#f43f5e;border-color:rgba(244,63,94,.3);}\n\n/* ===== \u6295\u7a3f\u5165\u529b\u30d0\u30fc ===== */\n.compose{position:fixed;bottom:0;width:390px;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--bd);padding:10px 14px 12px;z-index:200;}\n@media(max-width:420px){.compose{width:100vw;}}\n.cmp-row{display:flex;gap:9px;align-items:flex-end;}\n.cmp-av{width:36px;height:36px;border-radius:50%;background:var(--sf2);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;border:2px solid var(--acc);transition:border-color .3s;}\n.cmp-inp{flex:1;background:var(--sf);border:1.5px solid var(--bd);border-radius:22px;padding:10px 16px;color:var(--tx);font-size:14px;resize:none;outline:none;max-height:100px;line-height:1.5;transition:border-color .2s;}\n.cmp-inp:focus{border-color:var(--acc);}\n.cmp-inp::placeholder{color:var(--sub);}\n.snd-btn{width:40px;height:40px;border-radius:50%;background:var(--acc);color:#fff;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .2s;}\n.snd-btn:hover{transform:scale(1.08);}\n.snd-btn:active{transform:scale(.96);}\n.snd-btn:disabled{opacity:.4;transform:none;cursor:not-allowed;}\n\n/* ===== \u30e2\u30fc\u30c9\u9078\u629e\u30e2\u30fc\u30c0\u30eb ===== */\n.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:300;display:none;align-items:flex-end;justify-content:center;}\n.modal-bg.open{display:flex;animation:bgFade .2s ease;}\n@keyframes bgFade{from{opacity:0;}to{opacity:1;}}\n.mode-sheet{width:390px;background:var(--sf);border-radius:22px 22px 0 0;padding:18px 20px 44px;animation:slideUp .3s cubic-bezier(.22,.61,.36,1);}\n@keyframes slideUp{from{transform:translateY(100%);}to{transform:translateY(0);}}\n@media(max-width:420px){.mode-sheet{width:100vw;}}\n.sh-bar{width:42px;height:4px;border-radius:2px;background:var(--bd);margin:0 auto 18px;}\n.sh-title{font-size:18px;font-weight:900;margin-bottom:14px;}\n/* \u30e2\u30fc\u30c9\u30ab\u30fc\u30c9 */\n.mode-card{padding:14px 16px;border-radius:14px;border:2px solid var(--bd);margin-bottom:10px;display:flex;align-items:center;gap:14px;cursor:pointer;transition:all .2s;}\n.mode-card:hover{border-color:var(--acc);}\n.mode-card.cur{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 6%,var(--sf));}\n.mc-ico{font-size:30px;flex-shrink:0;}\n.mc-name{font-size:15px;font-weight:700;margin-bottom:3px;}\n.mc-desc{font-size:12px;color:var(--sub);line-height:1.5;}\n\n/* ===== \u30c8\u30fc\u30b9\u30c8 ===== */\n.toast{position:fixed;bottom:96px;left:50%;transform:translateX(-50%) translateY(14px);background:var(--sf2);border:1px solid var(--bd);border-radius:12px;padding:10px 20px;font-size:13px;font-weight:700;opacity:0;transition:all .3s;z-index:500;pointer-events:none;white-space:nowrap;}\n.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}\n\n/* ===== \u3044\u3044\u306d\u30d5\u30ed\u30fc\u30c8\u30a2\u30cb\u30e1 ===== */\n.lf{position:fixed;pointer-events:none;font-size:20px;z-index:999;animation:floatUp 1.2s ease forwards;}#imgStrip{position:fixed;bottom:70px;width:390px;background:color-mix(in srgb,var(--bg) 96%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--bd);z-index:199;}@media(max-width:420px){#imgStrip{width:100vw;}}.img-strip{display:flex;gap:7px;overflow-x:auto;padding:8px 14px 4px;scrollbar-width:none;}.img-strip::-webkit-scrollbar{display:none;}.img-thumb{width:64px;height:64px;border-radius:10px;object-fit:cover;cursor:pointer;border:2px solid transparent;transition:all .2s;flex-shrink:0;}.img-thumb:hover{border-color:var(--acc);transform:scale(1.05);}.img-thumb.sel{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc);}.img-credit{font-size:9px;color:var(--sub);padding:0 14px 6px;}.pc-img{width:100%;border-radius:12px;margin:6px 0 8px;max-height:240px;object-fit:cover;cursor:pointer;}.sync-bar{display:flex;align-items:center;gap:6px;padding:5px 16px;font-size:11px;color:var(--sub);border-bottom:1px solid var(--bd);}.sync-dot{width:7px;height:7px;border-radius:50%;background:var(--sub);}.sync-dot.ok{background:#22c55e;}.sync-dot.err{background:#f43f5e;}.sync-dot.loading{background:#f59e0b;animation:spin .8s linear infinite;}\n@keyframes floatUp{0%{opacity:1;transform:translateY(0)scale(1);}100%{opacity:0;transform:translateY(-90px)scale(1.7);}}\n</style>\n</head>\n<body>\n<div class=\"app\" id=\"app\">\n\n<!-- \u30ed\u30fc\u30c7\u30a3\u30f3\u30b0 -->\n<div class=\"overlay\" id=\"overlay\">\n  <div class=\"ov-logo\">\u3044\u3069<em>\u3070\u305f</em></div>\n  <div class=\"spinner\"></div>\n  <div class=\"ov-sub\" id=\"ovTxt\">\u8d77\u52d5\u4e2d\u2026</div>\n</div>\n\n<!-- ========== \u30bb\u30c3\u30c8\u30a2\u30c3\u30d7 ========== -->\n<div class=\"screen\" id=\"setupScreen\">\n  <div class=\"s-hero\">\n    <div class=\"s-logo\">\u3044\u3069<em>\u3070\u305f</em></div>\n    <div class=\"s-catchcopy\">\u79c1\u4ee5\u5916\u5168\u54e1AI\u2049<br>\u3042\u306a\u305f\u3060\u3051\u306e\u7a76\u6975\u306b\u308f\u304c\u307e\u307e\u306aSNS</div>\n    <div class=\"s-mascot\">\ud83e\udea3</div>\n  </div>\n  <div class=\"s-body\">\n    <p class=\"s-desc\">\u300c\u3044\u3069\u3070\u305f\u300d\u3078\u3088\u3046\u3053\u305d\uff01<br>\u521d\u671f\u8a2d\u5b9a\u3092\u3057\u3066\u3001\u3042\u306a\u305f\u3060\u3051\u306e\u4e16\u754c\u3092\u4f5c\u308d\u3046\u3002</p>\n    <div class=\"s-sec\">\n      <div class=\"s-lbl\">\u30e6\u30fc\u30b6\u30fc\u540d</div>\n      <input class=\"s-inp\" id=\"sName\" type=\"text\" placeholder=\"\u4f8b\uff1a\u4e95\u6238\u7aef \u6cf0\u5e0c\" maxlength=\"20\" oninput=\"chkSetup()\">\n    </div>\n    <div class=\"s-sec\">\n      <div class=\"s-lbl\">\u30ed\u30b0\u30a4\u30f3ID</div>\n      <input class=\"s-inp\" id=\"sId\" type=\"text\" placeholder=\"\u4f8b\uff1aidobata_taiki\uff08\u82f1\u6570\u5b57\uff09\" maxlength=\"20\" oninput=\"chkSetup()\">\n    </div>\n    <div class=\"s-sec\">\n      <div class=\"s-lbl\">\u30a2\u30d0\u30bf\u30fc\u3092\u9078\u3076</div>\n      <div class=\"av-grid\" id=\"avGrid\">\n        <div class=\"av-item sel\" data-av=\"\ud83d\ude0a\" onclick=\"selAv(this)\">\ud83d\ude0a</div>\n        <div class=\"av-item\" data-av=\"\ud83d\ude0e\" onclick=\"selAv(this)\">\ud83d\ude0e</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc36\" onclick=\"selAv(this)\">\ud83d\udc36</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc31\" onclick=\"selAv(this)\">\ud83d\udc31</div>\n        <div class=\"av-item\" data-av=\"\ud83e\udd8a\" onclick=\"selAv(this)\">\ud83e\udd8a</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc38\" onclick=\"selAv(this)\">\ud83d\udc38</div>\n        <div class=\"av-item\" data-av=\"\ud83e\udd84\" onclick=\"selAv(this)\">\ud83e\udd84</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc3c\" onclick=\"selAv(this)\">\ud83d\udc3c</div>\n        <div class=\"av-item\" data-av=\"\ud83e\udd81\" onclick=\"selAv(this)\">\ud83e\udd81</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc2f\" onclick=\"selAv(this)\">\ud83d\udc2f</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc3b\" onclick=\"selAv(this)\">\ud83d\udc3b</div>\n        <div class=\"av-item\" data-av=\"\ud83d\udc28\" onclick=\"selAv(this)\">\ud83d\udc28</div>\n      </div>\n    </div>\n    <div class=\"s-sec\">\n      <div class=\"s-lbl\">\u8da3\u5473\u30fb\u8208\u5473\uff08\u8907\u6570\u9078\u629eOK\uff09</div>\n      <div class=\"int-grid\">\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udfb5 \u97f3\u697d</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udfac \u6620\u753b</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udfae \u30b2\u30fc\u30e0</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udf73 \u6599\u7406</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83d\udcbb \u30c6\u30af\u30ce\u30ed\u30b8\u30fc</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83d\udcda \u8aad\u66f8</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\u2708\ufe0f \u65c5\u884c</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83d\udc3e \u52d5\u7269</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\u26bd \u30b9\u30dd\u30fc\u30c4</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udf3f \u30e9\u30a4\u30d5\u30b9\u30bf\u30a4\u30eb</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udfad \u30a2\u30cb\u30e1</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83d\udcb0 \u30d3\u30b8\u30cd\u30b9</div>\n        <div class=\"int-tag\" onclick=\"togInt(this)\">\ud83c\udf1f \u63a8\u3057\u6d3b</div>\n      </div>\n    </div>\n    <button class=\"s-btn\" id=\"setupBtn\" onclick=\"doSetup()\" disabled>\u3044\u3069\u3070\u305f\u3092\u306f\u3058\u3081\u308b \u2192</button>\n  </div>\n</div>\n\n<!-- ========== \u30e1\u30a4\u30f3 ========== -->\n<div class=\"screen\" id=\"mainScreen\" style=\"height:100vh;overflow:hidden;display:none;flex-direction:column;\">\n  <!-- \u30d8\u30c3\u30c0\u30fc -->\n  <div class=\"hdr\">\n    <div class=\"hdr-row\">\n      <div class=\"hdr-left\">\n        <button class=\"menu-btn\" onclick=\"openModal()\" title=\"\u30e1\u30cb\u30e5\u30fc\">\u2630</button>\n        <div class=\"logo\" onclick=\"showPanel('timeline')\">\u3044\u3069<em>\u3070\u305f</em></div>\n      </div>\n      <div class=\"hdr-right\">\n        <button class=\"nav-btn\" id=\"btnTheme\" onclick=\"toggleTheme()\" title=\"\u30c6\u30fc\u30de\u5207\u66ff\">\ud83c\udf19</button>\n        <button class=\"nav-btn\" id=\"btnNotif\" onclick=\"showPanel('notif')\" title=\"\u901a\u77e5\">\ud83d\udd14<div class=\"ndot\" id=\"ndot\"></div></button>\n        <button class=\"nav-btn\" id=\"btnTrends\" onclick=\"showPanel('trends')\" title=\"\u30c8\u30ec\u30f3\u30c9\">\ud83d\udcc8</button>\n        <button class=\"nav-btn\" id=\"btnProfile\" onclick=\"showPanel('profile')\" title=\"\u30d7\u30ed\u30d5\u30a3\u30fc\u30eb\">\ud83d\udc64</button>\n      </div>\n    </div>\n    <div>\n      <div class=\"mode-badge\" id=\"modeBadge\">\ud83d\udd25 \u30a4\u30f3\u30d5\u30eb\u30a8\u30f3\u30b5\u30fc</div>\n    </div>\n  </div>\n\n  <!-- \u30d1\u30cd\u30eb\u7fa4 -->\n  <div class=\"sync-bar\" id=\"syncBar\" style=\"display:none\"><div class=\"sync-dot\" id=\"syncDot\"></div><span id=\"syncTxt\">Firebase\u540c\u671f</span></div><div class=\"panels\" style=\"flex:1;overflow:hidden;position:relative;\">\n    <!-- \u30bf\u30a4\u30e0\u30e9\u30a4\u30f3 -->\n    <div class=\"panel on\" id=\"pTimeline\"></div>\n\n    <!-- \u901a\u77e5 -->\n    <div class=\"panel\" id=\"pNotif\">\n      <div class=\"panel-hdr\">\n        <span class=\"panel-ttl\">\ud83d\udd14 \u901a\u77e5</span>\n        <button class=\"panel-act\" onclick=\"clearNotifs()\">\u3059\u3079\u3066\u65e2\u8aad</button>\n      </div>\n      <div id=\"notifList\"></div>\n    </div>\n\n    <!-- \u30c8\u30ec\u30f3\u30c9 -->\n    <div class=\"panel\" id=\"pTrends\">\n      <div class=\"panel-hdr\"><span class=\"panel-ttl\">\ud83d\udcc8 \u30c8\u30ec\u30f3\u30c9</span><button class=\"panel-act\" onclick=\"renderTrends()\">\u66f4\u65b0</button></div>\n      <div id=\"trendsList\"></div>\n    </div>\n\n    <!-- \u30d7\u30ed\u30d5\u30a3\u30fc\u30eb -->\n    <div class=\"panel\" id=\"pProfile\">\n      <div class=\"pr-hero\">\n        <div class=\"pr-av\" id=\"prAv\">\ud83d\ude0a</div>\n        <div>\n          <div class=\"pr-name\" id=\"prName\">\u2014</div>\n          <div class=\"pr-id\" id=\"prId\">@\u2014</div>\n          <div class=\"pr-stats\">\n            <div><div class=\"stat-n\" id=\"stP\">0</div><div class=\"stat-l\">\u6295\u7a3f</div></div>\n            <div><div class=\"stat-n\" id=\"stL\">0</div><div class=\"stat-l\">\u3044\u3044\u306d</div></div>\n            <div><div class=\"stat-n\" id=\"stC\">0</div><div class=\"stat-l\">\u30b3\u30e1\u30f3\u30c8</div></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"pr-sec\"><div class=\"pr-stl\">INTERESTS</div><div class=\"pr-tags\" id=\"prInts\"></div></div>\n      <div class=\"pr-acts\">\n        <button class=\"pr-btn\" onclick=\"editProfile()\">\u270f\ufe0f \u30d7\u30ed\u30d5\u30a3\u30fc\u30eb\u3092\u7de8\u96c6</button>\n        <button class=\"pr-btn danger\" onclick=\"clearAll()\">\ud83d\uddd1\ufe0f \u30c7\u30fc\u30bf\u3092\u3059\u3079\u3066\u524a\u9664</button>\n      </div>\n    </div>\n  </div>\n\n  <!-- \u6295\u7a3f\u5165\u529b\u30d0\u30fc -->\n  <div class=\"compose\" id=\"compose\">\n    <div class=\"cmp-row\">\n      <div class=\"cmp-av\" id=\"cmpAv\">\ud83d\ude0a</div>\n      <textarea class=\"cmp-inp\" id=\"postInput\" placeholder=\"\u3044\u307e\u3069\u3093\u306a\u6c17\u6301\u3061\uff1f\" rows=\"1\"\n        oninput=\"autoResize(this)\" onkeydown=\"handleKey(event)\"></textarea>\n      <button class=\"nav-btn\" onclick=\"manualImgSearch()\" title=\"\u753b\u50cf\u3092\u691c\u7d22\" style=\"flex-shrink:0;font-size:16px;\">\ud83d\udcf7</button>\n      <button class=\"snd-btn\" id=\"sendBtn\" onclick=\"submitPost()\" disabled>\u27a4</button>\n    </div>\n  </div>\n</div>\n\n<div id=\"imgStrip\" style=\"display:none\"><div class=\"img-strip\" id=\"imgList\"></div><div class=\"img-credit\" id=\"imgCredit\"></div></div>\n</div><!-- /app -->\n\n<!-- \u30e2\u30fc\u30c9\u9078\u629e\u30e2\u30fc\u30c0\u30eb -->\n<div class=\"modal-bg\" id=\"modeModal\" onclick=\"bgClose(event)\">\n  <div class=\"mode-sheet\" onclick=\"event.stopPropagation()\">\n    <div class=\"sh-bar\"></div>\n    <div class=\"sh-title\">\u30e2\u30fc\u30c9\u3092\u9078\u629e</div>\n    <div class=\"mode-card cur\" data-mode=\"influencer\" onclick=\"selectMode('influencer')\">\n      <div class=\"mc-ico\">\ud83d\udd25</div>\n      <div><div class=\"mc-name\">\u30a4\u30f3\u30d5\u30eb\u30a8\u30f3\u30b5\u30fc\u30e2\u30fc\u30c9</div><div class=\"mc-desc\">\u3042\u306a\u305f\u306e\u6295\u7a3f\u306b\u307f\u3093\u306a\u304c\u71b1\u72c2\uff01\u30d0\u30ba\u308a\u4f53\u9a13\u3092\u3069\u3046\u305e</div></div>\n    </div>\n    <div class=\"mode-card\" data-mode=\"mental\" onclick=\"selectMode('mental')\">\n      <div class=\"mc-ico\">\ud83d\udc99</div>\n      <div><div class=\"mc-name\">\u30e1\u30f3\u30bf\u30eb\u30b1\u30a2\u30e2\u30fc\u30c9</div><div class=\"mc-desc\">\u8ab0\u306b\u3082\u8a00\u3048\u306a\u3044\u60a9\u307f\u3092\u305d\u3063\u3068\u8a71\u3057\u3066\u307f\u3066</div></div>\n    </div>\n    <div class=\"mode-card\" data-mode=\"debate\" onclick=\"selectMode('debate')\">\n      <div class=\"mc-ico\">\u26a1</div>\n      <div><div class=\"mc-name\">\u30c7\u30a3\u30d9\u30fc\u30c8\u30e2\u30fc\u30c9</div><div class=\"mc-desc\">\u610f\u898b\u3092\u3076\u3064\u3051\u3088\u3046\u3002\u8b70\u8ad6\u3067\u601d\u8003\u3092\u6df1\u3081\u308b</div></div>\n    </div>\n    <div class=\"mode-card\" data-mode=\"legend\" onclick=\"selectMode('legend')\">\n      <div class=\"mc-ico\">\ud83d\udc51</div>\n      <div><div class=\"mc-name\">\u30ec\u30b8\u30a7\u30f3\u30c9\u30c8\u30fc\u30af\u30e2\u30fc\u30c9</div><div class=\"mc-desc\">\u6b74\u53f2\u4e0a\u306e\u5049\u4eba\u305f\u3061\u3068\u8a9e\u308a\u5408\u304a\u3046</div></div>\n    </div>\n  </div>\n</div>\n\n<div id=\"imgStrip\" style=\"display:none\"><div class=\"img-strip\" id=\"imgList\"></div><div class=\"img-credit\" id=\"imgCredit\"></div></div><div class=\"toast\" id=\"toast\"></div>\n\n<script>\n'use strict';\n// ===================================================\n//  \u5b9a\u6570\u30fb\u8a2d\u5b9a\n// ===================================================\nconst STORE_KEY = 'idobata_v6';\n\n// \u30e2\u30fc\u30c9\u8a2d\u5b9a\nconst MC = {\n  influencer:{ label:'\u30a4\u30f3\u30d5\u30eb\u30a8\u30f3\u30b5\u30fc', badge:'\ud83d\udd25 \u30a4\u30f3\u30d5\u30eb\u30a8\u30f3\u30b5\u30fc', acc:'#ff6b35', tc:'t-inf', ph:'\u30d0\u30ba\u3089\u305b\u305f\u3044\u3053\u3068\u3092\u3064\u3076\u3084\u3044\u3066\uff01' },\n  mental:    { label:'\u30e1\u30f3\u30bf\u30eb\u30b1\u30a2',     badge:'\ud83d\udc99 \u30e1\u30f3\u30bf\u30eb\u30b1\u30a2',     acc:'#5b9cf6', tc:'t-men', ph:'\u60a9\u307f\u3092\u5171\u6709\u2026' },\n  debate:    { label:'\u30c7\u30a3\u30d9\u30fc\u30c8',       badge:'\u26a1 \u30c7\u30a3\u30d9\u30fc\u30c8',       acc:'#f43f5e', tc:'t-deb', ph:'\u610f\u898b\u3092\u3076\u3064\u3051\u3088\u3046\uff01' },\n  legend:    { label:'\u30ec\u30b8\u30a7\u30f3\u30c9\u30c8\u30fc\u30af', badge:'\ud83d\udc51 \u30ec\u30b8\u30a7\u30f3\u30c9\u30c8\u30fc\u30af', acc:'#a78bfa', tc:'t-leg', ph:'\u6b74\u53f2\u4e0a\u306e\u4eba\u3068\u8a71\u305d\u3046\u2026' },\n};\n\n// AI\u30ad\u30e3\u30e9\u540d\u30d7\u30fc\u30eb\uff08\u3044\u3044\u306d\u901a\u77e5\u306b\u4f7f\u7528\uff09\nconst AI_NAMES = [\n  '\u8c61\u306e\u308a\u9020','\u7b4b\u8089\u5bff\u559c\u7537','\u30c1\u30ef\u30ef\u306b\u306a\u308a\u305f\u3044\u72ac','\u5948\u826f\u3067\u9e7f\u3084\u3063\u3066\u307e\u3059','\u6bce\u671d5\u6642\u8d77\u304d\u306e\u7537',\n  '\u5375\u304b\u3051\u3054\u98ef\u4fe1\u8005','\u6df1\u591c\u306e\u30e9\u30fc\u30e1\u30f3\u54f2\u5b66\u8005','\u30b9\u30fc\u30d1\u30fc\u92ad\u6e6f\u306e\u5e1d\u738b','\u30b3\u30f3\u30d3\u30cb\u9650\u5b9a\u30b9\u30a4\u30fc\u30c4\u90e8','\u5ddd\u6cbf\u3044\u30b8\u30e7\u30ae\u30f3\u30b0\u4e2d',\n  '\u3069\u3053\u3067\u3082\u5bdd\u308c\u308b\u7537','\u3072\u3068\u308a\u30ab\u30e9\u30aa\u30b1\u5e38\u9023','\u516c\u5712\u306e\u30cf\u30c8\u89b3\u5bdf\u54e1','\u5927\u76db\u308a\u7121\u6599\u306e\u5b58\u5728','\u96fb\u67f1\u306e\u88cf\u306e\u54f2\u5b66',\n  '\u8fd1\u6240\u306e\u30b9\u30fc\u30d1\u30fc\u8a73\u3057\u3044','\u30e1\u30ed\u30f3\u30bd\u30fc\u30c0\u81f3\u4e0a\u4e3b\u7fa9','\u30d0\u30a4\u30af\u4e57\u308a\u305f\u3044\u539f\u4ed8','\u30b2\u30fc\u30bb\u30f3\u5ec3\u4eba\u5019\u88dc','\u30bf\u30d4\u30aa\u30ab\u98f2\u307f\u904e\u304e\u8b66\u5831',\n  '\u306d\u3053\u306b\u597d\u304b\u308c\u306a\u3044\u72ac\u597d\u304d','\u5b9f\u5bb6\u306e\u67f4\u72ac\u306e\u307b\u3046\u304c\u6709\u540d','\u5e03\u56e3\u304b\u3089\u51fa\u3089\u308c\u306a\u3044\u4f1a','\u663c\u9593\u304b\u3089\u516c\u5712\u3044\u308b\u4eba','\u30b9\u30cb\u30fc\u30ab\u30fc\u6cbc\u306e\u4f4f\u4eba',\n  '\u30d1\u30bd\u30b3\u30f3\u3081\u304c\u306d','\u3054\u98ef\u529b\u58eb','\u30ed\u30dc\u30c3\u30c8\u30ea\u30ad\u30b7','\u6df1\u591c\u306e\u4e3b\u5a66','\u5bdd\u8d77\u304d\u306e\u5927\u5b66\u751f',\n  '\u4f1a\u793e\u5e30\u308a\u306e\u96fb\u8eca','\u7a7a\u304d\u5730\u306e\u54f2\u5b66\u8005','\u5098\u3092\u5fd8\u308c\u308b\u5929\u624d','\u30aa\u30e0\u30e9\u30a4\u30b9\u3067\u6ce3\u3044\u305f\u5973','\u732b\u3068\u6dfb\u3044\u5bdd\u7814\u7a76\u5bb6',\n  '\u5915\u65b9\u306e\u516c\u5712\u30d9\u30f3\u30c1','\u3072\u3068\u308a\u713c\u304d\u8089\u306e\u5148\u99c6\u8005','\u6708\u66dc\u65e5\u304c\u6016\u3044\u4eba','\u8fd4\u4fe1\u9045\u304f\u3066\u3054\u3081\u3093\u306e\u4eba','\u63a8\u3057\u306b\u8ab2\u91d1\u3057\u305f\u5f8c\u6094',\n  '\u5b9f\u306f\u5bc2\u3057\u3044\u30d1\u30ea\u30d4','\u30e1\u30f3\u30d8\u30e9\u3068\u306f\u8a00\u308f\u305b\u306a\u3044','\u6ce3\u3051\u308b\u6620\u753b\u5c02\u9580\u5bb6','\u306c\u3044\u3050\u308b\u307f\u3068\u66ae\u3089\u3059\u4eba','HSP\u304b\u3082\u3057\u308c\u306a\u3044\u666e\u901a\u306e\u4eba',\n  '\u5f37\u9762\u304a\u3058\u3055\u3093','\u3089\u304f\u3060\u5c0f\u50e7','\u30bf\u30e9\u30d0\u30ac\u30cb','\u306e\u308a\u3084\u3059','\u8ad6\u7834\u3057\u305f\u3044\u9ad8\u6821\u751f',\n  'Wikipedia\u4f9d\u5b58\u75c7','\u30a8\u30d3\u30c7\u30f3\u30b9\u6301\u3063\u3066\u304d\u3066','\u53cd\u8ad6\u306f\u6b63\u7fa9\u3060\u3068\u601d\u3046\u4eba','\u3067\u3082\u5b9f\u969b\u3069\u3046\u306a\u306e\u6d3e','\u305d\u308c\u3063\u3066\u610f\u5473\u3042\u308b\uff1f\u30de\u30f3',\n  '\u5168\u90e8AI\u306e\u305b\u3044\u306b\u3059\u308b\u4eba','\u30b3\u30b9\u30d1\u6700\u5f37\u8ad6\u8005','\u662d\u548c\u306e\u307b\u3046\u304c\u3088\u304b\u3063\u305f\u4eba','Z\u4e16\u4ee3\u306b\u7269\u7533\u3059\u4eba','\u6b63\u8ad6\u3067\u4eba\u3092\u50b7\u3064\u3051\u308b\u4eba',\n  '\u8b70\u8ad6\u30de\u30cb\u30a2\u306e\u7121\u8077','\u30d5\u30a1\u30af\u30c8\u30c1\u30a7\u30c3\u30af\u8b66\u5bdf','\u533f\u540d\u3067\u5f37\u3044\u4eba','\u306a\u3093\u3067\u3082\u6570\u5b57\u3067\u8a9e\u308b\u4eba','\u6279\u5224\u7684\u601d\u8003\u306e\u584a',\n  '\u30d6\u30c3\u30c0','\u30bd\u30af\u30e9\u30c6\u30b9','\u5fb3\u5ddd\u5bb6\u5eb7','\u30af\u30ec\u30aa\u30d1\u30c8\u30e9','\u7e54\u7530\u4fe1\u9577',\n  '\u30ca\u30dd\u30ec\u30aa\u30f3','\u30a8\u30b8\u30bd\u30f3','\u30ec\u30aa\u30ca\u30eb\u30c9\u30fb\u30c0\u30fb\u30f4\u30a3\u30f3\u30c1','\u30b8\u30e5\u30ea\u30a2\u30b9\u30fb\u30b7\u30fc\u30b6\u30fc','\u30de\u30ea\u30fc\u30fb\u30ad\u30e5\u30ea\u30fc',\n  '\u5b54\u5b50','\u7d2b\u5f0f\u90e8','\u5742\u672c\u9f8d\u99ac','\u897f\u90f7\u9686\u76db','\u30a2\u30ec\u30ad\u30b5\u30f3\u30c0\u30fc\u5927\u738b',\n  '\u30de\u30eb\u30b3\u30fb\u30dd\u30fc\u30ed','\u30ac\u30ea\u30ec\u30aa\u30fb\u30ac\u30ea\u30ec\u30a4','\u6e90\u983c\u671d','\u30e2\u30fc\u30c4\u30a1\u30eb\u30c8','\u8056\u30d5\u30e9\u30f3\u30c1\u30a7\u30b9\u30b3',\n  '\u901a\u308a\u3059\u304c\u308a\u306e\u30d7\u30ed','\u5168\u90e8\u898b\u3066\u305f\u4eba','\u306a\u305c\u304b\u8a73\u3057\u3044\u304a\u3058\u3055\u3093','\u30d0\u30ba\u308a\u305f\u3044\u4f1a\u793e\u54e1','\u30b3\u30e1\u6b04\u306e\u826f\u5fc3',\n  '\u73fe\u5b9f\u9003\u907f\u4e2d\u306e\u793e\u4f1a\u4eba','\u591c\u66f4\u304b\u3057\u540c\u76df\u4f1a\u9577','\u304a\u5f01\u5f53\u4f5c\u308a\u5fd8\u308c\u305f\u4eba','\u81ea\u708a\u5931\u6557\u6b7410\u5e74','\u81ea\u8ee2\u8eca\u3053\u304e\u904e\u304e\u3066\u8db3\u30d1\u30f3\u30d1\u30f3',\n  '\u30da\u30c3\u30c8\u52d5\u753b\u3057\u304b\u898b\u306a\u3044\u4eba','\u63a8\u3057\u8a9e\u308a\u304c\u6b62\u307e\u3089\u306a\u3044','\u6563\u6b69\u4e2d\u306b\u54f2\u5b66\u3059\u308b\u4eba','\u968e\u6bb5\u3088\u308a\u7d76\u5bfe\u30a8\u30ec\u30d9\u30fc\u30bf\u30fc\u6d3e','\u8aad\u307f\u304b\u3051\u306e\u672c\u304c15\u518a\u3042\u308b\u4eba',\n];\n\n// ===================================================\n//  \u30a2\u30d7\u30ea\u72b6\u614b\n// ===================================================\nlet user     = { name:'', id:'', avatar:'\ud83d\ude0a', interests:[], theme:'dark' };\n// \u30e2\u30fc\u30c9\u3054\u3068\u306b\u72ec\u7acb\u3057\u305f\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\nlet mPosts   = { influencer:[], mental:[], debate:[], legend:[] };\nlet trends   = [];\nlet notifs   = [];\nlet curMode  = 'influencer';\nlet curPanel = 'timeline';\nlet busy     = false;\nlet pidCtr   = 0;\nlet unread   = 0;\nlet ltimers  = [];\nlet selAv_   = '\ud83d\ude0a';\nlet selImgUrl = '';\n\n// ===================================================\n//  \u30bb\u30c3\u30c8\u30a2\u30c3\u30d7\n// ===================================================\nfunction selAv(el) {\n  document.querySelectorAll('.av-item').forEach(e => e.classList.remove('sel'));\n  el.classList.add('sel');\n  selAv_ = el.dataset.av;\n}\nfunction togInt(el) { el.classList.toggle('sel'); }\nfunction chkSetup() {\n  const n = document.getElementById('sName').value.trim();\n  const i = document.getElementById('sId').value.trim();\n  document.getElementById('setupBtn').disabled = !(n && i);\n}\n\nasync function doSetup() {\n  const name = document.getElementById('sName').value.trim();\n  const id   = '@' + document.getElementById('sId').value.trim().replace(/^@/, '');\n  const interests = [...document.querySelectorAll('.int-tag.sel')].map(e => e.textContent.trim());\n  // \u672c\u5f53\u306b\u65b0\u898f\u767b\u9332\u304b\uff08\u65e2\u5b58\u30c7\u30fc\u30bf\u304c\u306a\u3044\uff09\u304b\u3092\u5224\u5b9a\n  const isNewUser = !user.name;\n  user = { name, id, avatar: selAv_, interests, theme: user.theme || 'dark' };\n  saveData();\n  // \u65b0\u898f\u30e6\u30fc\u30b6\u30fc\u306e\u307fAPI\u3067\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u3092\u53d6\u5f97\u3002\u7de8\u96c6\u6642\u306f\u65e2\u5b58TL\u3092\u7dad\u6301\n  await toMain(isNewUser);\n}\n\n// ===================================================\n//  \u30e1\u30a4\u30f3\u753b\u9762\u3078\u79fb\u884c\n// ===================================================\nasync function toMain(isNew = false) {\n  document.getElementById('setupScreen').classList.remove('active');\n  const ms = document.getElementById('mainScreen');\n  ms.classList.add('active');\n  ms.style.display = 'flex';\n  applyMode(curMode);\n  applyTheme(user.theme || 'dark');\n  updCmpAv();\n  renderTL();\n  renderTrends();\n  updProfile();\n  renderNotifs();\n  if (isNew) {\n    reqNotifPerm();\n    // Firebase \u304b\u3089\u65e2\u5b58\u30c7\u30fc\u30bf\u3092\u8aad\u307f\u8fbc\u3080\n    const fbData = await fbLoad();\n    if (fbData && fbData.pidCtr > pidCtr) {\n      // \u30af\u30e9\u30a6\u30c9\u306e\u30c7\u30fc\u30bf\u306e\u65b9\u304c\u65b0\u3057\u3051\u308c\u3070\u30de\u30fc\u30b8\n      mPosts = fbData.mPosts || mPosts;\n      trends = fbData.trends || trends;\n      notifs = fbData.notifs || notifs;\n      pidCtr = fbData.pidCtr || pidCtr;\n      renderTL(); renderTrends(); renderNotifs();\n    }\n    await loadInitTL();\n  }\n  await checkFirebase();\n  hideLd();\n}\n\n// ===================================================\n//  \u30c6\u30fc\u30de\u5207\u66ff\n// ===================================================\nfunction applyTheme(t) {\n  document.documentElement.setAttribute('data-theme', t);\n  document.getElementById('btnTheme').textContent = t === 'dark' ? '\ud83c\udf19' : '\u2600\ufe0f';\n}\nfunction toggleTheme() {\n  user.theme = user.theme === 'dark' ? 'light' : 'dark';\n  applyTheme(user.theme);\n  saveData();\n}\n\n// ===================================================\n//  \u30e2\u30fc\u30c9\u30e2\u30fc\u30c0\u30eb\n// ===================================================\nfunction openModal() {\n  document.getElementById('modeModal').classList.add('open');\n  document.querySelectorAll('.mode-card').forEach(c =>\n    c.classList.toggle('cur', c.dataset.mode === curMode));\n}\nfunction bgClose(e) {\n  if (e.target === document.getElementById('modeModal'))\n    document.getElementById('modeModal').classList.remove('open');\n}\nfunction selectMode(mode) {\n  document.getElementById('modeModal').classList.remove('open');\n  if (mode === curMode) return;\n  curMode = mode;\n  applyMode(mode);\n  showPanel('timeline');\n  saveData();\n}\nfunction applyMode(mode) {\n  const c = MC[mode];\n  document.documentElement.style.setProperty('--acc', c.acc);\n  document.getElementById('modeBadge').textContent = c.badge;\n  const inp = document.getElementById('postInput');\n  if (inp) inp.placeholder = c.ph;\n  updCmpAv();\n  // \u305d\u306e\u30e2\u30fc\u30c9\u306eTL\u304c\u7a7a\u306a\u3089\u305d\u306e\u5834\u3067\u751f\u6210\n  if (user.name && (!mPosts[mode] || mPosts[mode].length === 0)) {\n    for (let i = 0; i < 10; i++) {\n      const p = genOneTLPost(mode);\n      mPosts[mode].push(mkAI(p, mode));\n    }\n    saveData();\n  }\n  renderTL();\n}\n\n// ===================================================\n//  \u30d1\u30cd\u30eb\u5207\u66ff\n// ===================================================\nfunction showPanel(name) {\n  curPanel = name;\n  document.querySelectorAll('.panel').forEach(p => p.classList.remove('on'));\n  document.getElementById('compose').style.display = name === 'timeline' ? '' : 'none';\n  ['btnNotif','btnTrends','btnProfile'].forEach(id => document.getElementById(id).classList.remove('on'));\n  const map = { timeline:'pTimeline', notif:'pNotif', trends:'pTrends', profile:'pProfile' };\n  document.getElementById(map[name] || 'pTimeline').classList.add('on');\n  if (name === 'notif')   { document.getElementById('btnNotif').classList.add('on'); markRead(); renderNotifs(); }\n  if (name === 'trends')  { document.getElementById('btnTrends').classList.add('on'); renderTrends(); }\n  if (name === 'profile') { document.getElementById('btnProfile').classList.add('on'); updProfile(); }\n}\n\n// ===================================================\n//  \u521d\u56de\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\uff08\u8d77\u52d5\u6642\u306e\u307fAPI\u547c\u3073\u51fa\u3057\uff09\n// ===================================================\nasync function loadInitTL() {\n  if (!user.interests.length) return;\n  if (mPosts[curMode] && mPosts[curMode].length > 0) {\n    // \u65e2\u5b58\u30c7\u30fc\u30bf\u304c\u3042\u308c\u3070\u81ea\u52d5\u30bf\u30a4\u30de\u30fc\u3060\u3051\u518d\u958b\n    startAutoTL();\n    return;\n  }\n  showLd('\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u3092\u6e96\u5099\u4e2d\u2026');\n  // \u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u30a8\u30f3\u30b8\u30f3\u3067\u521d\u671f20\u4ef6\u751f\u6210\uff08API\u4e0d\u8981\uff09\n  initTopicTL();\n  startLikeSim();\n  startAutoTL();\n  hideLd();\n}\n\n// ===================================================\n//  \u6295\u7a3f\u9001\u4fe1\n// ===================================================\nasync function submitPost() {\n  const ta = document.getElementById('postInput');\n  const text = ta.value.trim();\n  if (!text || busy) return;\n  busy = true;\n  document.getElementById('sendBtn').disabled = true;\n  ta.value = ''; ta.style.height = 'auto';\n  showPanel('timeline');\n\n  // \u30e6\u30fc\u30b6\u30fc\u6295\u7a3f\u3092\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306b\u8ffd\u52a0\n  const pid = ++pidCtr;\n  const imgUrl = selImgUrl;\n  const up = {\n    id: pid, type: 'user', text,\n    name: user.name, uid: user.id, avatar: user.avatar,\n    mode: curMode, likes: 0, liked: false, comments: [], ts: Date.now(),\n    img: imgUrl\n  };\n  selImgUrl = '';\n  document.getElementById('imgStrip').style.display = 'none';\n  document.getElementById('imgList').innerHTML = '';\n  adjustPanelPb(false);\n\n  mPosts[curMode].push(up);\n  renderTL();\n\n  // \u30ed\u30fc\u30c7\u30a3\u30f3\u30b0\u30ab\u30fc\u30c9\u30923\u679a\u8868\u793a\n  const lids = ['a','b','c'].map(x => `ld-${pid}-${x}`);\n  lids.forEach(id => addLdCard(id));\n  scrollBot();\n\n  try {\n    const r = await fetch('/api/post', {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ text, mode: curMode, interests: user.interests })\n    });\n    if (!r.ok) {\n      if (r.status === 429) throw new Error('RATE_LIMIT');\n      const d = await r.json().catch(() => ({}));\n      if (d.error === 'QUOTA_EXCEEDED') throw new Error('QUOTA_EXCEEDED');\n      throw new Error('HTTP_' + r.status);\n    }\n    let { replies = [], timelinePosts = [] } = await r.json();\n    // \u6295\u7a3f\u5185\u5bb9\u306b\u53cd\u5fdc\u3059\u308b\u30ad\u30fc\u30ef\u30fc\u30c9\u8fd4\u4fe1\u3092\u5148\u982d\u306b\u8ffd\u52a0\n    const _kwR = genKwReply(text, curMode, replies.map(r=>r.name));\n    if (_kwR) replies = [_kwR, ...replies].slice(0, 6);\n\n    // \u30ed\u30fc\u30c7\u30a3\u30f3\u30b0\u524a\u9664\n    lids.forEach(id => document.getElementById(id)?.remove());\n\n    // replies \u2192 \u30b3\u30e1\u30f3\u30c8\u6b04\u306b\u683c\u7d0d\uff08\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306b\u306f\u51fa\u3055\u306a\u3044\uff09\n    if (replies.length) {\n      up.comments.push(...replies.map(r => ({\n        a: r.name, t: r.comment, av: r.avatar || '\ud83e\udd16', lk: r.likes || 0\n      })));\n      const cc = document.getElementById('cc-' + pid);\n      if (cc) cc.textContent = up.comments.length;\n    }\n\n    // timelinePosts \u2192 \u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306b\u6d41\u308c\u308bAI\u306e\u3064\u3076\u3084\u304d\n    timelinePosts.forEach((p, i) => {\n      const ap = mkAI(p, curMode);\n      mPosts[curMode].push(ap);\n      setTimeout(() => { appendCard(ap); scrollBot(); }, i * 200 + 100);\n    });\n\n    addHashtags(text);\n    scheduleAutoLikes(pid);\n    setTimeout(() => { saveData(); renderTrends(); }, 1500);\n\n  } catch(err) {\n    lids.forEach(id => document.getElementById(id)?.remove());\n    const fb = getFallback(curMode);\n    if (err.message === 'RATE_LIMIT') {\n      toast('\u26a0\ufe0f \u5c11\u3057\u5f85\u3063\u3066\u304b\u3089\u6295\u7a3f\u3057\u3066\u304f\u3060\u3055\u3044');\n    } else if (err.message === 'QUOTA_EXCEEDED') {\n      toast('\ud83d\ude14 AI\u306e\u5229\u7528\u4e0a\u9650\u306b\u9054\u3057\u307e\u3057\u305f\u3002\u3057\u3070\u3089\u304f\u5f8c\u3067');\n      up.comments.push(...fb.map(r => ({ a:r.name, t:r.comment, av:r.avatar||'\ud83e\udd16', lk:r.likes||0 })));\n      document.getElementById('cc-'+pid)?.textContent !== undefined &&\n        (document.getElementById('cc-'+pid).textContent = up.comments.length);\n    } else {\n      console.warn('API error:', err.message);\n      up.comments.push(...fb.map(r => ({ a:r.name, t:r.comment, av:r.avatar||'\ud83e\udd16', lk:r.likes||0 })));\n      const cc = document.getElementById('cc-'+pid);\n      if (cc) cc.textContent = up.comments.length;\n    }\n    scheduleAutoLikes(pid);\n    saveData();\n  }\n\n  busy = false;\n  document.getElementById('sendBtn').disabled = document.getElementById('postInput').value.trim() === '';\n  saveData();\n}\n\n// ===================================================\n//  \u30d8\u30eb\u30d1\u30fc: AI\u6295\u7a3f\u30aa\u30d6\u30b8\u30a7\u30af\u30c8\u751f\u6210\n// ===================================================\nfunction mkAI(p, mode) {\n  return {\n    id: ++pidCtr, type: 'ai',\n    text: p.text || p.comment || '',\n    name: p.name, uid: p.uid || p.id || ('@' + (p.name||'').slice(0,15)),\n    avatar: p.avatar || '\u2b50', mode,\n    likes: p.likes || Math.floor(Math.random() * 5000) + 10,\n    liked: false, comments: [], ts: Date.now()\n  };\n}\n\n// ===================================================\n//  \u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u63cf\u753b\n// ===================================================\nfunction renderTL() {\n  const panel = document.getElementById('pTimeline');\n  const posts = mPosts[curMode] || [];\n  if (!posts.length) {\n    panel.innerHTML = '<div class=\"empty\"><div class=\"empty-ico\">\ud83e\udea3</div><div class=\"empty-ttl\">\u4e95\u6238\u7aef\u4f1a\u8b70\u3078\u3088\u3046\u3053\u305d\uff01</div><div class=\"empty-txt\">\u4f55\u3067\u3082\u3064\u3076\u3084\u3044\u3066\u307f\u3088\u3046\u3002<br>AI\u305f\u3061\u304c\u5fc5\u305a\u53cd\u5fdc\u3057\u3066\u304f\u308c\u308b\u3088\u2728</div></div>';\n    return;\n  }\n  panel.innerHTML = '';\n  posts.forEach(p => appendCard(p, false));\n}\n\nfunction appendCard(p, anim = true) {\n  const panel = document.getElementById('pTimeline');\n  panel.querySelector('.empty')?.remove();\n  const d = document.createElement('div');\n  d.className = 'post-card' + (p.type === 'user' ? ' mine' : '');\n  d.id = 'pc-' + p.id;\n  if (!anim) d.style.animationDuration = '0s';\n  const c = MC[p.mode] || MC.influencer;\n  const tag = p.type === 'ai' ? `<span class=\"mtag ${c.tc}\">${c.badge}</span>` : '';\n  const li  = p.liked ? '\u2764\ufe0f' : '\ud83e\udd0d';\n  d.innerHTML = `\n    <div class=\"pc-top\">\n      <div class=\"pc-av${p.type==='user'?' mine':''}\">${p.avatar}</div>\n      <div class=\"pc-meta\">\n        <div class=\"pc-nr\">\n          <span class=\"pc-name\"${p.type==='user'?' style=\"color:var(--acc)\"':''}>${esc(p.name)}</span>\n          <span class=\"pc-id\">${esc(p.uid)}</span>${tag}\n        </div>\n      </div>\n    </div>\n    <div class=\"pc-body\">${esc(p.text)}</div>\n    ${p.img ? `<img class=\"pc-img\" src=\"${esc(p.img)}\" loading=\"lazy\" onclick=\"window.open('${esc(p.img)}','_blank')\" alt=\"post image\">` : ''}\n    <div class=\"pc-acts\">\n      <button class=\"act\" onclick=\"togCmt(${p.id})\">\n        <span class=\"act-ico\">\ud83d\udcac</span><span id=\"cc-${p.id}\">${p.comments?.length||0}</span>\n      </button>\n      <button class=\"act${p.liked?' lkd':''}\" id=\"lb-${p.id}\" onclick=\"togLike(${p.id})\">\n        <span id=\"li-${p.id}\">${li}</span><span id=\"lc-${p.id}\">${fmt(p.likes)}</span>\n      </button>\n    </div>\n    <div class=\"cmt-sec\" id=\"cw-${p.id}\">\n      <div id=\"cl-${p.id}\">${renderCmts(p.comments)}</div>\n      <div class=\"cmt-add\">\n        <input class=\"cmt-inp\" id=\"ci-${p.id}\" placeholder=\"\u30b3\u30e1\u30f3\u30c8\u3092\u5165\u529b\u2026\" onkeydown=\"cmtKey(event,${p.id})\">\n        <button class=\"cmt-snd\" onclick=\"addCmt(${p.id})\">\u27a4</button>\n      </div>\n    </div>`;\n  panel.appendChild(d);\n}\n\nfunction addLdCard(lid) {\n  const panel = document.getElementById('pTimeline');\n  panel.querySelector('.empty')?.remove();\n  const d = document.createElement('div');\n  d.className = 'ld-card'; d.id = lid;\n  d.innerHTML = '<div class=\"pc-top\"><div class=\"pc-av\">\u23f3</div><div class=\"pc-meta\"><div class=\"pc-nr\"><span class=\"pc-name\" style=\"color:var(--sub)\">\u8003\u3048\u4e2d\u2026</span></div></div></div><div class=\"typing\"><div class=\"dot\"></div><div class=\"dot\"></div><div class=\"dot\"></div></div>';\n  panel.appendChild(d);\n}\n\nfunction renderCmts(cmts) {\n  if (!cmts?.length) return '';\n  return cmts.map(c => `\n    <div class=\"cmt-item\">\n      <div class=\"cmt-who\"><span class=\"cmt-av\">${c.av||'\ud83e\udd16'}</span>${esc(c.a)}</div>\n      <div>${esc(c.t)}</div>\n    </div>`).join('');\n}\n\n// ===================================================\n//  \u30a4\u30f3\u30bf\u30e9\u30af\u30b7\u30e7\u30f3\n// ===================================================\nfunction togLike(pid) {\n  const p = findPost(pid); if (!p) return;\n  p.liked = !p.liked; p.likes += p.liked ? 1 : -1;\n  const btn = document.getElementById('lb-'+pid);\n  if (btn) {\n    btn.className = 'act' + (p.liked ? ' lkd' : '');\n    btn.innerHTML = `<span id=\"li-${pid}\">${p.liked?'\u2764\ufe0f':'\ud83e\udd0d'}</span><span id=\"lc-${pid}\">${fmt(p.likes)}</span>`;\n    if (p.liked) { btn.classList.add('lpop'); setTimeout(() => btn.classList.remove('lpop'), 400); }\n  }\n  if (p.liked) showLikeFloat();\n  saveData();\n}\nfunction findPost(pid) {\n  for (const arr of Object.values(mPosts)) {\n    const p = arr.find(x => x.id === pid);\n    if (p) return p;\n  }\n  return null;\n}\nfunction togCmt(pid) { document.getElementById('cw-'+pid)?.classList.toggle('open'); }\nfunction cmtKey(e, pid) { if (e.key === 'Enter') addCmt(pid); }\nfunction addCmt(pid) {\n  const inp = document.getElementById('ci-'+pid); if (!inp) return;\n  const t = inp.value.trim(); if (!t) return;\n  const p = findPost(pid); if (!p) return;\n  p.comments.push({ a: user.name || '\u3042\u306a\u305f', t, av: user.avatar });\n  inp.value = '';\n  const cl = document.getElementById('cl-'+pid);\n  if (cl) cl.innerHTML = renderCmts(p.comments);\n  const cc = document.getElementById('cc-'+pid);\n  if (cc) cc.textContent = p.comments.length;\n  saveData(); toast('\ud83d\udcac \u30b3\u30e1\u30f3\u30c8\u3057\u307e\u3057\u305f\uff01');\n}\n\n// ===================================================\n//  \u81ea\u52d5\u3044\u3044\u306d\u30b7\u30df\u30e5\u30ec\u30fc\u30b7\u30e7\u30f3\n// ===================================================\nfunction scheduleAutoLikes(pid) {\n  [\n    {d:20000, mn:2, mx:15},\n    {d:70000, mn:8, mx:60},\n    {d:200000, mn:25, mx:180},\n    {d:450000, mn:60, mx:450},\n    {d:800000, mn:120, mx:1000},\n  ].forEach(({d, mn, mx}) => {\n    ltimers.push(setTimeout(() =>\n      autoLike(pid, Math.floor(Math.random() * (mx - mn) + mn)),\n      d + Math.random() * 15000));\n  });\n}\n\nfunction autoLike(pid, cnt) {\n  const p = findPost(pid); if (!p) return;\n  p.likes += cnt;\n  const lc = document.getElementById('lc-'+pid);\n  if (lc) lc.textContent = fmt(p.likes);\n  const lb = document.getElementById('lb-'+pid);\n  if (lb) { lb.classList.add('lpop'); setTimeout(() => lb.classList.remove('lpop'), 400); }\n  const who = AI_NAMES[Math.floor(Math.random() * AI_NAMES.length)];\n  const msg = cnt >= 50\n    ? `\ud83d\udd25 ${who}\u3055\u3093\u307b\u304b${fmt(cnt)}\u4eba\u304c\u3042\u306a\u305f\u306e\u6295\u7a3f\u3092\u3044\u3044\u306d\uff01`\n    : `\u2764\ufe0f ${who}\u3055\u3093\u304c\u3044\u3044\u306d\u3057\u307e\u3057\u305f`;\n  addNotif(msg, p.text);\n  pushNotif('\u3044\u3069\u3070\u305f\u901a\u77e5', msg);\n  showLikeFloat();\n  saveData();\n  // \u3044\u3044\u306d\u5909\u52d5 \u2192 \u30c8\u30d4\u30c3\u30af\u30e9\u30f3\u30ad\u30f3\u30b0\u5fd8\u6642\u66f4\u65b0\n  if (curPanel === 'trends') renderTrends();\n}\n\nfunction startLikeSim() {\n  ltimers.push(setInterval(() => {\n    const all = Object.values(mPosts).flat().filter(p => p.type === 'user');\n    if (!all.length) return;\n    autoLike(all[Math.floor(Math.random() * all.length)].id,\n             Math.floor(Math.random() * 30) + 1);\n  }, 90000 + Math.random() * 90000));\n}\n\nfunction showLikeFloat() {\n  const el = document.createElement('div');\n  el.className = 'lf'; el.textContent = '\u2764\ufe0f';\n  el.style.left = (80 + Math.random() * 200) + 'px';\n  el.style.bottom = '100px';\n  document.getElementById('app').appendChild(el);\n  setTimeout(() => el.remove(), 1300);\n}\n\n// ===================================================\n//  \u901a\u77e5\n// ===================================================\nfunction reqNotifPerm() {\n  if ('Notification' in window && Notification.permission === 'default')\n    Notification.requestPermission();\n}\nfunction pushNotif(title, body) {\n  if ('Notification' in window && Notification.permission === 'granted')\n    try { new Notification(title, {body}); } catch(e) {}\n}\nfunction addNotif(text, postText = '') {\n  notifs.unshift({\n    text,\n    pt: postText.slice(0, 30) + (postText.length > 30 ? '\u2026' : ''),\n    ts: Date.now(), read: false\n  });\n  unread++;\n  document.getElementById('ndot').classList.add('show');\n  if (curPanel === 'notif') renderNotifs();\n  saveData();\n}\nfunction renderNotifs() {\n  const list = document.getElementById('notifList');\n  if (!notifs.length) { list.innerHTML = '<div class=\"no-notif\">\u307e\u3060\u901a\u77e5\u306f\u3042\u308a\u307e\u305b\u3093</div>'; return; }\n  list.innerHTML = notifs.slice(0, 30).map(n => `\n    <div class=\"notif-item${n.read ? '' : ' unread'}\">\n      <div class=\"ni-ico\">${n.text.startsWith('\ud83d\udd25') ? '\ud83d\udd25' : '\u2764\ufe0f'}</div>\n      <div class=\"ni-body\">\n        <div class=\"ni-text\">${esc(n.text)}</div>\n        <div class=\"ni-time\">${n.pt ? `\u300c${esc(n.pt)}\u300d\u3078\u306e\u53cd\u5fdc \u00b7 ` : ''}${timeAgo(n.ts)}</div>\n      </div>\n    </div>`).join('');\n}\nfunction markRead() {\n  notifs.forEach(n => n.read = true); unread = 0;\n  document.getElementById('ndot').classList.remove('show');\n  saveData();\n}\nfunction clearNotifs() {\n  notifs = []; unread = 0;\n  document.getElementById('ndot').classList.remove('show');\n  renderNotifs(); saveData();\n}\n\n// ===================================================\n//  \u30c8\u30ec\u30f3\u30c9\n// ===================================================\n// ===================================================\n//  \u30c8\u30ec\u30f3\u30c9\uff08\u30e6\u30fc\u30b6\u30fc\u6295\u7a3f\uff0b\u8208\u5473\u306e\u307f\uff09\n// ===================================================\n\n// ===== \u30ad\u30fc\u30ef\u30fc\u30c9\u62bd\u51fa\u30a8\u30f3\u30b8\u30f3 =====\nconst KW_STOP = new Set(['\u3066\u308b','\u3067\u308b','\u3044\u308b','\u3042\u308b','\u306a\u308b','\u304f\u308b','\u3082\u306e','\u3053\u3068','\u3068\u304d','\u305f\u3081','\u304b\u3089','\u307e\u3067','\u3088\u308a','\u306a\u3069','\u3067\u3082','\u3057\u304b','\u3060\u3051','\u307b\u3069','\u304f\u3089\u3044','\u305f\u3061','\u307e\u3060','\u3082\u3046','\u307e\u305f','\u305d\u308c','\u3053\u308c','\u3042\u306e','\u3053\u306e','\u305d\u306e','\u3057\u305f','\u3057\u3066','\u3059\u308b','\u306a\u3044','\u306a\u304f','\u3051\u3069','\u306e\u3067','\u306a\u304c\u3089','\u3068\u3057\u3066','\u3068\u3044\u3046','\u3088\u3046\u306b','\u3068\u3053\u308d','\u306a\u3093\u304b','\u3059\u3054\u304f','\u3068\u3066\u3082','\u3061\u3087\u3063\u3068','\u3084\u3063\u3071','\u3084\u3063\u3071\u308a','\u3067\u3057\u305f','\u307e\u3057\u305f','\u307e\u305b\u3093','\u3044\u307e\u3059','\u3066\u305f','\u3067\u305f','\u3057\u3066\u305f','\u3089\u308c\u308b','\u3067\u304d\u308b','\u308c\u308b','\u3089\u308c','\u3066\u3044','\u3058\u3083\u306a','\u3058\u3083\u3093','\u304b\u306a','\u304b\u3082','\u3088\u306a','\u3088\u306d','\u304b\u306a','\u3060\u306a','\u307b\u3093\u3068','\u307e\u3058\u3067','\u3081\u3063\u3061\u3083','\u3059\u3067\u306b','\u3059\u3053\u3057','\u305a\u3063\u3068','\u305c\u3093\u305c\u3093']);\n\nfunction extractKeywordsFromText(text) {\n  const kws = [];\n  // \u30cf\u30c3\u30b7\u30e5\u30bf\u30b0\u306f\u6700\u512a\u5148\n  (text.match(/#[\\w\\u3000-\\u9FFF\\uF900-\\uFAFF]+/g) || []).forEach(t => kws.push({w:t, isTag:true}));\n  // \u30ab\u30bf\u30ab\u30ca\u8a9e\uff083\u6587\u5b57\u4ee5\u4e0a\uff09 \u2192 \u56fa\u6709\u540d\u8a5e\u30fb\u30b5\u30fc\u30d3\u30b9\u540d\n  (text.match(/[\\u30A1-\\u30FF]{3,}/g) || []).forEach(w => {\n    if (!KW_STOP.has(w) && w.length >= 3) kws.push({w:'#'+w, isTag:false});\n  });\n  // \u6f22\u5b57\u306e\u307f\u306e\u719f\u8a9e\uff082\u6587\u5b57\u4ee5\u4e0a\uff09\u2192 \u56fa\u6709\u540d\u8a5e\u30fb\u719f\u8a9e\n  (text.match(/[\\u4E00-\\u9FFF]{2,6}/g) || []).forEach(w => {\n    if (w.length >= 2) kws.push({w:'#'+w, isTag:false});\n  });\n  // \u82f1\u6570\u5b57\u30c8\u30fc\u30af\u30f3\uff083\u6587\u5b57\u4ee5\u4e0a\u3001\u3088\u304f\u3042\u308b\u7565\u8a9e\u306a\u3069\uff09\n  (text.match(/[A-Za-z][A-Za-z0-9]{2,}/g) || []).forEach(w => kws.push({w:'#'+w, isTag:false}));\n  return [...new Map(kws.map(k => [k.w, k])).values()];\n}\n\n// \u30c8\u30d4\u30c3\u30af\u5225\u3044\u3044\u306d\u96c6\u8a08\nfunction calcTopicLikes() {\n  const m = {};\n  Object.values(mPosts).flat()\n    .filter(p => p.type === 'ai' && p.topic)\n    .forEach(p => { m[p.topic] = (m[p.topic] || 0) + (p.likes || 0); });\n  return m;\n}\n\n// \u4ee5\u524d\u306e\u3044\u3044\u306d\u6570\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\uff08\u30e9\u30f3\u30ad\u30f3\u30b0\u5909\u52d5\u691c\u77e5\u7528\uff09\nlet _prevTopicRank = {};\n\nfunction addHashtags(text) {\n  const kws = extractKeywordsFromText(text);\n  kws.forEach(({w: tag, isTag}) => {\n    if (!tag || tag === '#' || tag.length < 2) return;\n    const ex = trends.find(t => t.tag === tag);\n    if (ex) { ex.cnt++; ex.lastSeen = Date.now(); }\n    else trends.push({tag, cnt:1, mode:curMode, src: isTag ? 'post' : 'kw', lastSeen:Date.now()});\n  });\n}\n\nfunction buildTrendsData() {\n  const kwMap = {};\n  const add = (tag, mode, src, w=1) => {\n    if (!tag || tag.length < 2 || tag === '#') return;\n    if (!kwMap[tag]) kwMap[tag] = {cnt:0, mode, src, lastSeen:0};\n    kwMap[tag].cnt += w;\n  };\n\n  // \u2460 \u30e6\u30fc\u30b6\u30fc\u6295\u7a3f\u304b\u3089\u30ad\u30fc\u30ef\u30fc\u30c9\u62bd\u51fa\uff08\u30cf\u30c3\u30b7\u30e5\u30bf\u30b0\uff0b\u540d\u8a5e\uff09\n  Object.values(mPosts).flat()\n    .filter(p => p.type === 'user')\n    .forEach(p => {\n      extractKeywordsFromText(p.text).forEach(({w, isTag}) => {\n        add(w, p.mode, isTag ? 'post' : 'kw');\n      });\n    });\n\n  // \u2461 trends\u84c4\u7a4d\u30c7\u30fc\u30bf\uff08addHashtags\u3067\u4fdd\u5b58\u6e08\u307f\uff09\n  trends.forEach(t => {\n    add(t.tag, t.mode, t.src || 'post', t.cnt);\n  });\n\n  // \u2462 \u7d50\u679c\u914d\u5217\u5316\uff08\u30e6\u30fc\u30b6\u30fc\u6295\u7a3f/\u30ad\u30fc\u30ef\u30fc\u30c9\uff09\n  const keywords = Object.entries(kwMap)\n    .map(([tag, v]) => ({tag, ...v}))\n    .sort((a, b) => b.cnt - a.cnt)\n    .slice(0, 15);\n\n  // \u2463 \u30c8\u30d4\u30c3\u30af\u5225\u3044\u3044\u306d\u96c6\u8a08\uff08\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u5168\u4f53\uff09\n  const topicLikes = calcTopicLikes();\n  const topicRanking = Object.entries(topicLikes)\n    .map(([topic, likes]) => ({topic, likes}))\n    .sort((a, b) => b.likes - a.likes)\n    .slice(0, 10);\n\n  // \u2464 \u8208\u5473\u30bf\u30b0\uff08\u3044\u3044\u306d\u6570\u3067\u30bd\u30fc\u30c8\uff09\n  const intItems = (user.interests || []).map(int => {\n    const label = int.replace(/^[\\s\\S]+?\\s/, '').trim();\n    const tag = '#' + label;\n    const topicLike = topicLikes[label] || 0;\n    return {tag, cnt: topicLike, src:'int', mode:curMode, topicLike};\n  }).sort((a, b) => b.topicLike - a.topicLike);\n\n  return {keywords, topicRanking, intItems};\n}\n\nfunction renderTrends() {\n  const list = document.getElementById('trendsList');\n  const {keywords, topicRanking, intItems} = buildTrendsData();\n  const topicLikes = calcTopicLikes();\n  const maxLikes = Math.max(1, ...Object.values(topicLikes));\n\n  const ml = {influencer:'\u30a4\u30f3\u30d5\u30eb', mental:'\u30e1\u30f3\u30bf\u30eb', debate:'\u30c7\u30a3\u30d9\u30fc\u30c8', legend:'\u30ec\u30b8\u30a7\u30f3\u30c9'};\n  const srcLabel = {post:'\u6295\u7a3f\u30bf\u30b0', kw:'\u6295\u7a3f\u30ad\u30fc\u30ef\u30fc\u30c9', int:'\u3042\u306a\u305f\u306e\u8208\u5473', ai:'AI'};\n  const srcCls   = {post:'ts-post', kw:'ts-kw', int:'ts-int', ai:'ts-ai', topic:'ts-topic'};\n\n  let h = '';\n\n  // ===== \u30bb\u30af\u30b7\u30e7\u30f31: \u30c8\u30d4\u30c3\u30af\u30e9\u30f3\u30ad\u30f3\u30b0\uff08\u3044\u3044\u306d\u6570\u57fa\u6e96\uff09 =====\n  if (topicRanking.length) {\n    h += '<div class=\"tr-sec\">\ud83d\udd25 \u30db\u30c3\u30c8\u306a\u30c8\u30d4\u30c3\u30af \u2014 \u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306e\u3044\u3044\u306d\u6570</div>';\n    topicRanking.forEach((t, i) => {\n      const pct = Math.round((t.likes / maxLikes) * 100);\n      // \u524d\u56de\u304b\u3089\u306e\u9806\u4f4d\u5909\u52d5\n      const prevRank = _prevTopicRank[t.topic];\n      let arrow = '';\n      if (prevRank !== undefined && prevRank !== i) {\n        arrow = prevRank > i\n          ? '<span class=\"tr-arrow up\">\u25b2' + (prevRank - i) + '</span>'\n          : '<span class=\"tr-arrow down\">\u25bc' + (i - prevRank) + '</span>';\n      }\n      h += `\n        <div class=\"tr-item\" onclick=\"searchTopic('${t.topic.replace(/'/g, \"\\\\'\")}')\">\n          <div class=\"tr-rank${i < 3 ? ' top' : ''}\">${i+1}</div>\n          <div class=\"tr-info\">\n            <div class=\"tr-tag\">${esc(t.topic)}${arrow}</div>\n            <div class=\"tr-bar\" style=\"width:${pct}%\"></div>\n            <div class=\"tr-meta\"><span class=\"tr-src ts-topic\">\u30c8\u30d4\u30c3\u30af</span> \u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u6295\u7a3f\u304b\u3089</div>\n          </div>\n          <div class=\"tr-likes\">\u2764 ${fmt(t.likes)}</div>\n        </div>`;\n    });\n    // \u9806\u4f4d\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u3092\u66f4\u65b0\n    topicRanking.forEach((t, i) => { _prevTopicRank[t.topic] = i; });\n  }\n\n  // ===== \u30bb\u30af\u30b7\u30e7\u30f32: \u6295\u7a3f\u30ad\u30fc\u30ef\u30fc\u30c9 =====\n  const postKws = keywords.filter(t => t.src !== 'int');\n  if (postKws.length) {\n    h += '<div class=\"tr-sec\">\ud83d\udcdd \u3042\u306a\u305f\u306e\u6295\u7a3f\u30ad\u30fc\u30ef\u30fc\u30c9</div>';\n    postKws.slice(0, 8).forEach((t, i) => {\n      h += `\n        <div class=\"tr-item\" onclick=\"useTrend('${t.tag.replace(/'/g, \"\\\\'\")}')\">\n          <div class=\"tr-rank${i < 3 ? ' top' : ''}\">${i+1}</div>\n          <div class=\"tr-info\">\n            <div class=\"tr-tag\">${esc(t.tag)}</div>\n            <div class=\"tr-meta\">${ml[t.mode]||t.mode} <span class=\"tr-src ${srcCls[t.src]||'ts-post'}\">${srcLabel[t.src]||''}</span></div>\n          </div>\n          <div class=\"tr-cnt\">${t.cnt > 0 ? fmt(t.cnt)+'\u56de' : '\u2014'}</div>\n        </div>`;\n    });\n  }\n\n  // ===== \u30bb\u30af\u30b7\u30e7\u30f33: \u8208\u5473\u30bf\u30b0\uff08\u3044\u3044\u306d\u9806\uff09 =====\n  if (intItems.length) {\n    h += '<div class=\"tr-sec\">\ud83d\udca1 \u3042\u306a\u305f\u306e\u8208\u5473\uff08\u4eba\u6c17\u9806\uff09</div>';\n    intItems.forEach((t, i) => {\n      const pct = maxLikes > 0 ? Math.round((t.topicLike / maxLikes) * 100) : 0;\n      h += `\n        <div class=\"tr-item\" onclick=\"useTrend('${t.tag.replace(/'/g, \"\\\\'\")}')\">\n          <div class=\"tr-rank\" style=\"color:var(--acc);font-size:13px\">${i+1}</div>\n          <div class=\"tr-info\">\n            <div class=\"tr-tag\">${esc(t.tag)}</div>\n            ${pct > 0 ? '<div class=\"tr-bar\" style=\"width:'+pct+'%\"></div>' : ''}\n            <div class=\"tr-meta\"><span class=\"tr-src ts-int\">\u3042\u306a\u305f\u306e\u8208\u5473</span>${t.topicLike > 0 ? ' \u2764 '+fmt(t.topicLike) : ''}</div>\n          </div>\n          <div class=\"tr-cnt\" style=\"color:var(--acc);font-size:11px\">\u30bf\u30c3\u30d7\u3057\u3066\u6295\u7a3f</div>\n        </div>`;\n    });\n  }\n\n  if (!h) {\n    list.innerHTML = `<div class=\"tr-empty\">\n      <div class=\"tr-empty-ico\">\ud83d\udcc8</div>\n      <div class=\"tr-empty-ttl\">\u307e\u3060\u30c8\u30ec\u30f3\u30c9\u304c\u3042\u308a\u307e\u305b\u3093</div>\n      <div class=\"tr-empty-txt\">\u6295\u7a3f\u3059\u308b\u3068\u30ad\u30fc\u30ef\u30fc\u30c9\u304c\u81ea\u52d5\u62bd\u51fa\u3055\u308c\u307e\u3059\u3002<br>\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306e\u3044\u3044\u306d\u304c\u5897\u3048\u308b\u3068\u30c8\u30d4\u30c3\u30af\u30e9\u30f3\u30ad\u30f3\u30b0\u3082\u8868\u793a\u3055\u308c\u307e\u3059\u2728</div>\n    </div>`;\n    return;\n  }\n  list.innerHTML = h;\n}\n\nfunction useTrend(tag) {\n  showPanel('timeline');\n  const inp = document.getElementById('postInput');\n  if (inp) { inp.value = tag + ' '; inp.focus(); document.getElementById('sendBtn').disabled = false; }\n}\n\n// \u30c8\u30d4\u30c3\u30af\u540d\u3067\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306b\u30b8\u30e3\u30f3\u30d7\uff08\u8a72\u5f53\u6295\u7a3f\u3078\u30b9\u30af\u30ed\u30fc\u30eb\uff09\nfunction searchTopic(topic) {\n  showPanel('timeline');\n  // \u5f53\u8a72\u30c8\u30d4\u30c3\u30af\u306e\u6700\u65b0AI\u6295\u7a3f\u306b\u30b9\u30af\u30ed\u30fc\u30eb\n  const all = Object.values(mPosts).flat();\n  const found = [...all].reverse().find(p => p.topic === topic);\n  if (found) {\n    const el = document.getElementById('pc-' + found.id);\n    if (el) { el.scrollIntoView({behavior:'smooth', block:'center'}); el.style.outline='2px solid var(--acc)'; setTimeout(()=>el.style.outline='',1500); }\n  } else {\n    useTrend('#' + topic);\n  }\n}\n\n// ===================================================\n//  \u30d7\u30ed\u30d5\u30a3\u30fc\u30eb\n// ===================================================\nfunction updProfile() {\n  document.getElementById('prAv').textContent   = user.avatar || '\ud83d\ude0a';\n  document.getElementById('prName').textContent = user.name   || '\u2014';\n  document.getElementById('prId').textContent   = user.id     || '@\u2014';\n  const all = Object.values(mPosts).flat();\n  document.getElementById('stP').textContent = all.filter(p => p.type === 'user').length;\n  document.getElementById('stL').textContent = fmt(all.reduce((s,p) => s + (p.liked?1:0), 0));\n  document.getElementById('stC').textContent = all.reduce((s,p) => s + (p.comments?.length||0), 0);\n  document.getElementById('prInts').innerHTML =\n    (user.interests||[]).map(i => `<div class=\"pr-tag\">${esc(i)}</div>`).join('') ||\n    '<span style=\"color:var(--sub);font-size:13px;\">\u672a\u8a2d\u5b9a</span>';\n}\nfunction updCmpAv() {\n  const el = document.getElementById('cmpAv');\n  if (el) el.textContent = user.avatar || '\ud83d\ude0a';\n}\nfunction editProfile() {\n  document.getElementById('sName').value = user.name;\n  document.getElementById('sId').value   = user.id.replace('@','');\n  document.querySelectorAll('.av-item').forEach(e => e.classList.toggle('sel', e.dataset.av === user.avatar));\n  document.querySelectorAll('.int-tag').forEach(e => e.classList.toggle('sel', user.interests.includes(e.textContent.trim())));\n  selAv_ = user.avatar;\n  document.getElementById('setupBtn').textContent = '\u66f4\u65b0\u3059\u308b \u2192';\n  document.getElementById('setupBtn').disabled = false;\n  document.getElementById('mainScreen').classList.remove('active');\n  document.getElementById('mainScreen').style.display = 'none';\n  document.getElementById('setupScreen').classList.add('active');\n}\nfunction clearAll() {\n  if (!confirm('\u3059\u3079\u3066\u306e\u30c7\u30fc\u30bf\u3092\u524a\u9664\u3057\u307e\u3059\u304b\uff1f')) return;\n  ltimers.forEach(t => clearTimeout(t)); ltimers = [];\n  localStorage.removeItem(STORE_KEY);\n  mPosts = {influencer:[],mental:[],debate:[],legend:[]};\n  trends = []; notifs = []; pidCtr = 0; unread = 0;\n  user = {name:'',id:'',avatar:'\ud83d\ude0a',interests:[],theme:user.theme};\n  document.getElementById('mainScreen').classList.remove('active');\n  document.getElementById('mainScreen').style.display = 'none';\n  document.getElementById('setupScreen').classList.add('active');\n  ['sName','sId'].forEach(id => document.getElementById(id).value = '');\n  document.getElementById('setupBtn').disabled = true;\n  document.getElementById('setupBtn').textContent = '\u3044\u3069\u3070\u305f\u3092\u306f\u3058\u3081\u308b \u2192';\n  document.querySelectorAll('.int-tag,.av-item').forEach(e => e.classList.remove('sel'));\n  document.querySelector('.av-item').classList.add('sel');\n  selAv_ = '\ud83d\ude0a';\n}\n\n// ===================================================\n//  \u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af\u8fd4\u4fe1\n// ===================================================\nfunction getFallback(mode) {\n  const s = {\n    influencer:[\n      {name:'\u8c61\u306e\u308a\u9020',id:'@zou',avatar:'\ud83d\udc18',comment:'\u3053\u308c\u306f\u30d0\u30ba\u308b\u3084\u3064\uff01\uff01\u5b8c\u5168\u306b\u540c\u610f\ud83d\udd25',likes:2341},\n      {name:'\u7b4b\u8089\u5bff\u559c\u7537',id:'@kinniku',avatar:'\ud83d\udcaa',comment:'\u3081\u3061\u3083\u304f\u3061\u3083\u308f\u304b\u308b\u301c\uff01\u6bce\u65e5\u3053\u308c\u601d\u3063\u3066\u305f\u7b11',likes:887},\n      {name:'\u30c1\u30ef\u30ef\u306b\u306a\u308a\u305f\u3044\u72ac',id:'@chiwawa',avatar:'\ud83d\udc15',comment:'\u5929\u624d\u304b\uff1f\uff1fSNS\u306b\u6d41\u3057\u3066\u307b\u3057\u3044',likes:321},\n    ],\n    mental:[\n      {name:'\u30d1\u30bd\u30b3\u30f3\u3081\u304c\u306d',id:'@megane',avatar:'\ud83d\udc53',comment:'\u305d\u308c\u3001\u3059\u3054\u304f\u8f9b\u304b\u3063\u305f\u306d\u3002\u8a71\u3057\u3066\u304f\u308c\u3066\u3042\u308a\u304c\u3068\u3046\u3002',likes:102},\n      {name:'\u3054\u98ef\u529b\u58eb',id:'@gohan',avatar:'\ud83c\udf5a',comment:'\u3042\u306a\u305f\u306e\u6c17\u6301\u3061\u3001\u3061\u3083\u3093\u3068\u53d7\u3051\u53d6\u3063\u305f\u3088\u3002\u7121\u7406\u3057\u306a\u3044\u3067\u3002',likes:580},\n    ],\n    debate:[\n      {name:'\u3089\u304f\u3060\u5c0f\u50e7',id:'@rakuda',avatar:'\ud83d\udc2a',comment:'\u4e00\u5ea6\u306f\u81ea\u5206\u3067\u8003\u3048\u308b\u3053\u3068\u3092\u304a\u3059\u3059\u3081\u3057\u307e\u3059\uff01\u7b54\u3048\u306f\u81ea\u5206\u306e\u4e2d\u306b\u3042\u308a\u307e\u3059\u3002',likes:1572},\n      {name:'\u5f37\u9762\u304a\u3058\u3055\u3093',id:'@kowamote',avatar:'\ud83d\ude24',comment:'\u666e\u901a\u306b\u3084\u3063\u3066\u3066\u3082\u610f\u5473\u306a\u3044\u3063\u3066\u601d\u3063\u305f\u3089AI\u306b\u4e38\u6295\u3052\u3067\u3082\u3088\u304f\u306d\u3002',likes:294},\n    ],\n    legend:[\n      {name:'\u30d6\u30c3\u30c0',id:'@buddha',avatar:'\ud83e\uddd8',comment:'\u300c\u3044\u3044\u306d\u300d\u304c\u6b32\u3057\u304f\u3066\u5fc3\u304c\u3056\u308f\u3064\u304f\u306a\u3089\u3001\u30b9\u30de\u30db\u3092\u7f6e\u3044\u3066\u76ee\u3092\u9589\u3058\u306a\u3055\u3044\u3002',likes:78000},\n      {name:'\u30bd\u30af\u30e9\u30c6\u30b9',id:'@socrates',avatar:'\ud83c\udfdb\ufe0f',comment:'\u6b63\u7fa9\u3068\u306f\u4f55\u3067\u3059\u304b\uff1f\u8ab0\u304b\u79c1\u306b\u6559\u3048\u3066\u304f\u308c\u307e\u305b\u3093\u304b\uff1f',likes:990},\n    ]\n  };\n  return s[mode] || s.influencer;\n}\n\n// ===================================================\n//  \u30e6\u30fc\u30c6\u30a3\u30ea\u30c6\u30a3\n// ===================================================\nfunction autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 100) + 'px'; }\nfunction handleKey(e) {\n  if (e.key === 'Enter' && !e.shiftKey) {\n    e.preventDefault();\n    const sb = document.getElementById('sendBtn');\n    if (!sb.disabled) submitPost();\n  }\n}\nfunction scrollBot() {\n  const p = document.getElementById('pTimeline');\n  if (p) setTimeout(() => { p.scrollTop = p.scrollHeight; }, 100);\n}\nfunction fmt(n) {\n  n = Number(n) || 0;\n  if (n >= 10000) return (n / 10000).toFixed(1) + '\u4e07';\n  return n.toLocaleString();\n}\nfunction esc(s) {\n  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');\n}\nfunction toast(msg) {\n  const t = document.getElementById('toast');\n  t.textContent = msg; t.classList.add('show');\n  setTimeout(() => t.classList.remove('show'), 2600);\n}\nfunction showLd(txt = '') {\n  document.getElementById('overlay').classList.remove('hide');\n  if (txt) document.getElementById('ovTxt').textContent = txt;\n}\nfunction hideLd() { document.getElementById('overlay').classList.add('hide'); }\nfunction timeAgo(ts) {\n  const s = Math.floor((Date.now() - ts) / 1000);\n  if (s < 60) return s + '\u79d2\u524d';\n  if (s < 3600) return Math.floor(s/60) + '\u5206\u524d';\n  if (s < 86400) return Math.floor(s/3600) + '\u6642\u9593\u524d';\n  return Math.floor(s/86400) + '\u65e5\u524d';\n}\n\n\n// ===== Unsplash \u753b\u50cf\u691c\u7d22 =====\nasync function fetchImages(query) {\n  try {\n    const kw = query.replace(/#/g,'').slice(0,30);\n    const r  = await fetch('/api/images?q=' + encodeURIComponent(kw));\n    if (!r.ok) return;\n    const {photos=[]} = await r.json();\n    const strip = document.getElementById('imgStrip');\n    const list  = document.getElementById('imgList');\n    const cred  = document.getElementById('imgCredit');\n    if (!photos.length) { strip.style.display='none'; adjustPanelPb(false); return; }\n    strip.style.display = '';\n    adjustPanelPb(true);\n    list.innerHTML = photos.map(p =>\n      `<img class=\"img-thumb\" src=\"${p.thumb}\" data-url=\"${p.url}\" data-credit=\"${esc(p.credit)}\" onclick=\"selImg(this)\" alt=\"${esc(p.alt)}\" loading=\"lazy\">`\n    ).join('');\n    cred.textContent = '';\n  } catch(e) { /* ignore */ }\n}\nfunction adjustPanelPb(imgVisible) {\n  // imgStrip\u8868\u793a\u4e2d\u306f\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306e\u4e0b\u90e8\u4f59\u767d\u3092\u5897\u3084\u3057\u3066\u96a0\u308c\u306a\u3044\u3088\u3046\u306b\u3059\u308b\n  document.querySelectorAll('.panel').forEach(p => {\n    p.style.paddingBottom = imgVisible ? '160px' : '88px';\n  });\n}\n\nfunction manualImgSearch() {\n  const ta = document.getElementById('postInput');\n  const q  = ta.value.trim() || user.interests[0] || 'nature';\n  fetchImages(q);\n}\n\nfunction selImg(el) {\n  document.querySelectorAll('.img-thumb').forEach(t => t.classList.remove('sel'));\n  if (selImgUrl === el.dataset.url) {\n    selImgUrl = '';\n    document.getElementById('imgCredit').textContent = '';\n  } else {\n    el.classList.add('sel');\n    selImgUrl = el.dataset.url;\n    document.getElementById('imgCredit').textContent =\n      el.dataset.credit ? 'Photo by ' + el.dataset.credit + ' on Unsplash' : '';\n  }\n}\n\n// ===== Firebase \u540c\u671f =====\nlet fbEnabled = false;\nasync function checkFirebase() {\n  try {\n    const r = await fetch('/api/health');\n    const d = await r.json();\n    fbEnabled = !!d.hasFirebase;\n    const bar = document.getElementById('syncBar');\n    if (fbEnabled) bar.style.display = 'flex';\n  } catch(e) {}\n}\nasync function fbSave() {\n  if (!fbEnabled || !user.id) return;\n  setSyncStatus('loading', '\u540c\u671f\u4e2d...');\n  try {\n    const payload = {user, mPosts, trends, notifs, pidCtr, curMode, unread};\n    const r = await fetch('/api/sync', {\n      method:'POST',\n      headers:{'Content-Type':'application/json','x-user-id': user.id.replace('@','')},\n      body: JSON.stringify(payload)\n    });\n    const d = await r.json();\n    setSyncStatus(d.ok ? 'ok' : 'err', d.ok ? '\u540c\u671f\u6e08\u307f' : '\u540c\u671f\u5931\u6557');\n  } catch(e) { setSyncStatus('err', '\u540c\u671f\u5931\u6557'); }\n}\nasync function fbLoad() {\n  if (!fbEnabled || !user.id) return null;\n  setSyncStatus('loading', '\u8aad\u307f\u8fbc\u307f\u4e2d...');\n  try {\n    const r = await fetch('/api/sync', {\n      headers:{'x-user-id': user.id.replace('@','')}\n    });\n    const d = await r.json();\n    if (d.ok && d.data) {\n      setSyncStatus('ok', '\u540c\u671f\u6e08\u307f');\n      return d.data;\n    }\n    setSyncStatus('err', '\u30c7\u30fc\u30bf\u306a\u3057');\n    return null;\n  } catch(e) { setSyncStatus('err', '\u540c\u671f\u5931\u6557'); return null; }\n}\nfunction setSyncStatus(status, txt) {\n  const dot = document.getElementById('syncDot');\n  const t   = document.getElementById('syncTxt');\n  dot.className = 'sync-dot ' + status;\n  t.textContent = txt;\n}\n\nconst TOPIC_TEMPLATES = {\n  '\\u97F3\\u697D': [\n    '\\u4ECA\\u65E5\\u304B\\u3051\\u305F\\u30A2\\u30EB\\u30D0\\u30E0\\u304C\\u826F\\u3059\\u304E\\u3066\\u5168\\u66F2\\u30EA\\u30D4\\u30FC\\u30C8\\u3057\\u305F\\u3002\\u6642\\u9593\\u6D88\\u3048\\u305F',\n    '\\u30A4\\u30E4\\u30DB\\u30F3\\u3053\\u3057\\u3066\\u901F\\u6B69\\u304D\\u3067\\u6B69\\u304F\\u6642\\u9593\\u304C\\u4E00\\u756A\\u597D\\u304D\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u30E9\\u30A4\\u30D6\\u914D\\u4FE1\\u3067\\u5076\\u7136\\u898B\\u3064\\u3051\\u305F\\u30A2\\u30FC\\u30C6\\u30A3\\u30B9\\u30C8\\u304C\\u3081\\u3063\\u3061\\u3083\\u3044\\u3044\\u3002\\u5168\\u30B9\\u30C8\\u30EA\\u30FC\\u30DF\\u30F3\\u30B0\\u3057\\u305F',\n    '\\u6DF1\\u591C\\u306B\\u30B8\\u30E3\\u30BA\\u3092\\u8074\\u304F\\u3068\\u8133\\u304C\\u6E96\\u5099\\u72B6\\u614B\\u306B\\u306A\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u6700\\u8FD1\\u30B7\\u30C6\\u30A3\\u30DD\\u30C3\\u30D7\\u306B\\u306F\\u307E\\u3063\\u3066\\u308B\\u3002\\u3042\\u306E\\u30B5\\u30A6\\u30F3\\u30C9\\u4E2D\\u6BD2\\u3059\\u308B',\n    '\\u30E9\\u30A4\\u30D6\\u4F1A\\u5834\\u3067\\u30A2\\u30FC\\u30C6\\u30A3\\u30B9\\u30C8\\u3068\\u76EE\\u304C\\u5408\\u3063\\u305F\\u3002\\u4EBA\\u751F\\u7D42\\u308F\\u3063\\u305F',\n    '\\u540C\\u3058\\u66F2\\u3092\\u4F55\\u5EA6\\u3082\\u8074\\u3044\\u3066\\u3082\\u98FD\\u304D\\u306A\\u3044\\u3002\\u3053\\u308C\\u304C\\u307B\\u3093\\u3082\\u306E\\u306E\\u5317\\u6975\\u661F\\u304B',\n    '\\u97F3\\u697D\\u304C\\u306A\\u3044\\u751F\\u6D3B\\u306F\\u60F3\\u50CF\\u3067\\u304D\\u306A\\u3044\\u3002\\u30A4\\u30E4\\u30DB\\u30F3\\u5FD8\\u308C\\u305F\\u6642\\u306E\\u7D76\\u671B\\u611F\\u305F\\u308B\\u3084',\n    '\\u5148\\u8F29\\u304C\\u545F\\u304B\\u306A\\u3044\\u306E\\u306B\\u6295\\u7A3F\\u3059\\u308B\\u4E26\\u3073\\u306B\\u597D\\u304D\\u306A\\u66F2\\u306E\\u540D\\u524D\\u66F8\\u3044\\u3066\\u307F\\u305F',\n    '\\u30AA\\u30FC\\u30C7\\u30A3\\u30AA\\u30A4\\u30F3\\u30BF\\u30FC\\u30D5\\u30A7\\u30FC\\u30B9\\u8CFC\\u5165\\u3057\\u305F\\u3089\\u97F3\\u8CEA\\u304C\\u5909\\u308F\\u3063\\u3066\\u751F\\u6D3B\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u30D7\\u30EC\\u30A4\\u30EA\\u30B9\\u30C8\\u3092\\u5B8C\\u74A7\\u306B\\u6574\\u7406\\u3057\\u305F\\u3002\\u3053\\u308C\\u3067\\u4ECA\\u65E5\\u3082\\u4E57\\u308A\\u5207\\u308C\\u308B',\n    '\\u30DF\\u30E5\\u30FC\\u30B8\\u30C3\\u30AF\\u30D0\\u30FC\\u3067\\u96A3\\u306E\\u4EBA\\u304C\\u30DE\\u30CB\\u30A2\\u30C3\\u30AF\\u3067\\u5168\\u529B\\u9032\\u3093\\u3060',\n    '\\u30B5\\u30D6\\u30B9\\u30AF\\u306E\\u97F3\\u697D\\u670D\\u52D9\\u306E\\u65B0\\u66F2\\u30EC\\u30B3\\u30E1\\u30F3\\u30C9\\u7CBE\\u5EA6\\u304C\\u9AD8\\u3059\\u304E\\u3066\\u6016\\u3044',\n    '\\u30C9\\u30E9\\u30E0\\u3092\\u53E9\\u304F\\u5F62\\u306E\\u30A8\\u30A2\\u30C9\\u30E9\\u30E0\\u3092\\u8CED\\u3051\\u306B\\u306F\\u307E\\u3063\\u3066\\u3044\\u308B\\u3002\\u8AB0\\u304B\\u4E00\\u7DD2\\u306B\\u8FBA\\u3081\\u3089\\u308C\\u308B\\u4EBA',\n    '\\u30A2\\u30B3\\u30FC\\u30B9\\u30C6\\u30A3\\u30C3\\u30AF\\u30EA\\u30D0\\u30FC\\u306E\\u97F3\\u30AB\\u30D0\\u30FC\\u52D5\\u753B\\u3092\\u898B\\u3066\\u304B\\u3089\\u59CB\\u307E\\u3063\\u305F\\u97F3\\u697D\\u3078\\u306E\\u8208\\u5473',\n    '\\u97F3\\u697D\\u306F\\u8A00\\u8449\\u3067\\u306F\\u8A00\\u3044\\u8868\\u305B\\u306A\\u3044\\u611F\\u60C5\\u3092\\u5C4A\\u3051\\u3066\\u304F\\u308C\\u308B\\u3002\\u305D\\u308C\\u304C\\u597D\\u304D',\n    '\\u65B0\\u3057\\u3044\\u30A4\\u30E4\\u30DB\\u30F3\\u306B\\u4E57\\u308A\\u63DB\\u3048\\u308B\\u305F\\u3073\\u306B\\u4E16\\u754C\\u304C\\u5909\\u308F\\u308B\\u306E\\u306F\\u306A\\u305C\\u306A\\u306E\\u304B',\n    '\\u30B3\\u30FC\\u30C9\\u3092\\u4E00\\u767A\\u8B19\\u3051\\u305F\\u3002\\u30AE\\u30BF\\u30FC\\u306F\\u7D9A\\u3051\\u3088\\u3046\\u304B\\u8FF7\\u3063\\u3066\\u308B',\n    '\\u751F\\u6F14\\u594F\\u3067\\u958B\\u59CB\\u4E8C\\u5206\\u3067\\u6CE3\\u3044\\u305F\\u3002\\u305D\\u306E\\u6F14\\u594F\\u800C\\u3002\\u4EBA\\u306E\\u611F\\u60C5\\u3092\\u52D5\\u304B\\u305B\\u308B\\u6280\\u8853\\u3063\\u3066\\u306A\\u3093\\u3060\\u308D\\u3046',\n    '\\u97F3\\u697D\\u3092\\u8074\\u304D\\u306A\\u304C\\u3089\\u4ED5\\u4E8B\\u3059\\u308B\\u3068\\u6355\\u308C\\u308B\\u30BF\\u30A4\\u30D7\\u3002\\u3053\\u308C\\u3060\\u3051\\u306F\\u8B1D\\u3081\\u3066\\u307B\\u3057\\u3044',\n    '\\u30D0\\u30F3\\u30C9\\u306E\\u6F14\\u594F\\u8996\\u8074\\u306E\\u3068\\u304D\\u306B\\u6D88\\u3048\\u308B\\u30A2\\u30CB\\u30E1\\u30FC\\u30B7\\u30E7\\u30F3\\u306B\\u6CE3\\u304B\\u3055\\u308C\\u305F',\n    '\\u30DE\\u30A4\\u30CA\\u30FC\\u30A2\\u30FC\\u30C6\\u30A3\\u30B9\\u30C8\\u304C\\u5927\\u30D2\\u30C3\\u30C8\\u3057\\u305F\\u3068\\u304D\\u306E\\u30D5\\u30A1\\u30F3\\u4E00\\u53F7\\u3068\\u3057\\u3066\\u306E\\u8A87\\u3089\\u3057\\u3055\\u304C\\u548C\\u3089\\u304E',\n    '\\u97F3\\u697D\\u7406\\u8AD6\\u3092\\u72EC\\u5B66\\u3057\\u3066\\u3044\\u308B\\u3002\\u8AB0\\u306B\\u3082\\u8A71\\u305B\\u306A\\u3044\\u30B3\\u30FC\\u30C9\\u9032\\u884C',\n    '\\u30AB\\u30D5\\u30A7\\u306E\\u30D0\\u30C3\\u30AF\\u30DF\\u30E5\\u30FC\\u30B8\\u30C3\\u30AF\\u306B\\u8033\\u3092\\u50BE\\u3051\\u305F\\u3044\\u5C40\\u9762',\n    '\\u30E9\\u30A4\\u30D6\\u306E\\u697D\\u5C4B\\u96F0\\u56F2\\u6C17\\u3063\\u3066\\u914D\\u4FE1\\u3067\\u306F\\u5C40\\u305E\\u306B\\u306B\\u4F1D\\u308F\\u3089\\u306A\\u3044\\u3002\\u73FE\\u5730\\u306E\\u5C71\\u3063\\u3066\\u3046\\u308C\\u3057\\u3044',\n    '\\u597D\\u304D\\u306A\\u30A2\\u30FC\\u30C6\\u30A3\\u30B9\\u30C8\\u306E\\u30C7\\u30D3\\u30E5\\u30FC\\u66F2\\u3092\\u767A\\u898B\\u3057\\u305F\\u3068\\u304D\\u306E\\u8208\\u596E\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u30B5\\u30A6\\u30F3\\u30C9\\u30C8\\u30E9\\u30C3\\u30AF\\u304C\\u826F\\u3059\\u304E\\u3066\\u30B2\\u30FC\\u30E0\\u306E\\u30B9\\u30C8\\u30FC\\u30EA\\u30FC\\u3088\\u308A\\u97F3\\u697D\\u306B\\u96C6\\u4E2D\\u3057\\u3066\\u3057\\u307E\\u3063\\u305F',\n    '\\u30DC\\u30FC\\u30AB\\u30EB\\u30C8\\u30EC\\u30FC\\u30CB\\u30F3\\u30B0\\u59CB\\u3081\\u305F\\u3002\\u8C4A\\u308A\\u3058\\u3083\\u306A\\u304F\\u306A\\u308A\\u305F\\u3044\\u3060\\u3051\\u3067\\u305D\\u3053\\u307E\\u3067\\u8003\\u3048\\u3066\\u306A\\u304B\\u3063\\u305F',\n    '\\u30D2\\u30FC\\u30EA\\u30F3\\u30B0\\u30DF\\u30E5\\u30FC\\u30B8\\u30C3\\u30AF\\u3063\\u3066\\u672C\\u5F53\\u306B\\u6C17\\u5206\\u5909\\u308F\\u308B\\u306E\\u304B\\u3044\\u307E\\u3060\\u306B\\u5C71\\u306E\\u4E2D',\n    '\\u30B9\\u30BF\\u30B8\\u30AA\\u30E2\\u30CB\\u30BF\\u30FC\\u8CFC\\u5165\\u8A08\\u753B\\u4E2D\\u3002\\u8150\\u3089\\u306A\\u3044\\u3067\\u6D3B\\u304B\\u3057\\u305F\\u3044',\n    '\\u671D\\u306E\\u30B7\\u30E3\\u30EF\\u30FC\\u4E2D\\u306B\\u6C17\\u6301\\u3061\\u3088\\u304F\\u6B4C\\u3048\\u305F\\u65E5\\u306F\\u4E00\\u65E5\\u8ABF\\u5B50\\u3044\\u3044',\n    '\\u6709\\u7DDA\\u3067\\u6D41\\u308C\\u3066\\u305F\\u66F2\\u304C\\u6C17\\u306B\\u306A\\u3063\\u3066Shazam\\u3067\\u8ABF\\u3079\\u305F\\u3089\\u81EA\\u5206\\u306E\\u597D\\u307F\\u3069\\u771F\\u3093\\u4E2D\\u3060\\u3063\\u305F',\n    '\\u97F3\\u697D\\u306E\\u597D\\u307F\\u304C\\u4F3C\\u3066\\u308B\\u4EBA\\u3068\\u4EF2\\u826F\\u304F\\u306A\\u308C\\u308B\\u78BA\\u7387\\u304C\\u4F53\\u611F\\u3067\\u9AD8\\u3044',\n    '\\u697D\\u5668\\u3092\\u5F3E\\u3051\\u308B\\u4EBA\\u3078\\u306E\\u61A7\\u308C\\u304C\\u5168\\u7136\\u6D88\\u3048\\u306A\\u3044\\u3002\\u4ECA\\u304B\\u3089\\u3067\\u3082\\u9045\\u304F\\u306A\\u3044\\u3088\\u306A',\n    '\\u30D5\\u30A7\\u30B9\\u306B\\u884C\\u304F\\u305F\\u3073\\u306B\\u77E5\\u3089\\u306A\\u3044\\u30A2\\u30FC\\u30C6\\u30A3\\u30B9\\u30C8\\u306B\\u51FA\\u4F1A\\u3048\\u3066\\u4E16\\u754C\\u304C\\u5E83\\u304C\\u308B\\u611F\\u3058\\u304C\\u3059\\u308B',\n    '\\u6B4C\\u8A5E\\u306E\\u610F\\u5473\\u3092\\u3061\\u3083\\u3093\\u3068\\u7406\\u89E3\\u3057\\u3066\\u304B\\u3089\\u8074\\u304F\\u3068\\u5168\\u7136\\u9055\\u3046\\u66F2\\u306B\\u8074\\u3053\\u3048\\u305F',\n    '\\u30E9\\u30A4\\u30D6\\u3067\\u96A3\\u306E\\u4EBA\\u3068\\u540C\\u3058\\u30BF\\u30A4\\u30DF\\u30F3\\u30B0\\u3067\\u76DB\\u308A\\u4E0A\\u304C\\u308C\\u308B\\u77AC\\u9593\\u304C\\u6700\\u9AD8',\n    '\\u97F3\\u697D\\u3092\\u8074\\u3044\\u3066\\u308B\\u3068\\u6614\\u306E\\u8A18\\u61B6\\u304C\\u9BAE\\u660E\\u306B\\u8607\\u308B\\u306E\\u304C\\u4E0D\\u601D\\u8B70',\n    '\\u597D\\u304D\\u306A\\u66F2\\u306E\\u30AB\\u30D0\\u30FC\\u3092\\u8074\\u3044\\u305F\\u3089\\u539F\\u66F2\\u3088\\u308A\\u597D\\u304D\\u306B\\u306A\\u3063\\u3066\\u3057\\u307E\\u3063\\u305F\\u3002\\u7F6A\\u60AA\\u611F\\u3042\\u308B',\n    '\\u30E9\\u30F3\\u30C0\\u30E0\\u518D\\u751F\\u3067\\u6D41\\u308C\\u3066\\u304D\\u305F\\u66F2\\u304C\\u4ECA\\u4E00\\u756A\\u597D\\u304D\\u306A\\u66F2\\u306B\\u306A\\u3063\\u305F\\u3002\\u3053\\u3046\\u3044\\u3046\\u51FA\\u4F1A\\u3044\\u5927\\u4E8B',\n    '\\u540C\\u3058\\u66F2\\u3067\\u3082\\u6C17\\u5206\\u306B\\u3088\\u3063\\u3066\\u9055\\u3046\\u90E8\\u5206\\u304C\\u523A\\u3055\\u308B\\u3002\\u97F3\\u697D\\u3063\\u3066\\u6DF1\\u3044',\n    '10\\u5E74\\u3076\\u308A\\u306B\\u8074\\u3044\\u305F\\u66F2\\u3067\\u5F53\\u6642\\u306E\\u611F\\u60C5\\u304C\\u305D\\u306E\\u307E\\u307E\\u623B\\u3063\\u3066\\u304D\\u305F',\n    '\\u30D0\\u30F3\\u30C9\\u306E\\u30E9\\u30A4\\u30D6\\u6620\\u50CF\\u3067\\u697D\\u5668\\u306E\\u639B\\u3051\\u5408\\u3044\\u306B\\u6C17\\u3065\\u3044\\u3066\\u304B\\u3089\\u4F55\\u5EA6\\u3082\\u898B\\u8FD4\\u3057\\u3066\\u3044\\u308B',\n    '\\u30B9\\u30BF\\u30B8\\u30AA\\u3067\\u9332\\u97F3\\u3057\\u305F\\u97F3\\u3068\\u751F\\u6F14\\u594F\\u306E\\u9055\\u3044\\u3092\\u521D\\u3081\\u3066\\u610F\\u8B58\\u3057\\u305F\\u65E5\\u304B\\u3089\\u8074\\u304D\\u65B9\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u97F3\\u697D\\u8074\\u304D\\u306A\\u304C\\u3089\\u6599\\u7406\\u3057\\u3066\\u305F\\u3089\\u7126\\u304C\\u3057\\u305F\\u3002\\u6CA1\\u982D\\u3057\\u3059\\u304E\\u3066\\u53CD\\u7701\\u3057\\u3066\\u306A\\u3044',\n    '\\u30A4\\u30E4\\u30DB\\u30F3\\u7247\\u8033\\u3060\\u3051\\u3064\\u3051\\u3066\\u308B\\u72B6\\u614B\\u304C\\u4E00\\u756A\\u534A\\u7AEF\\u3067\\u843D\\u3061\\u7740\\u304B\\u306A\\u3044',\n    '\\u597D\\u304D\\u306A\\u66F2\\u3092\\u4EBA\\u306B\\u8074\\u304B\\u305B\\u305F\\u3089\\u5FAE\\u5999\\u306A\\u53CD\\u5FDC\\u3055\\u308C\\u305F\\u3068\\u304D\\u306E\\u865A\\u7121\\u611F\\u3088',\n    '\\u30AB\\u30E9\\u30AA\\u30B1\\u3067\\u63A1\\u70B9\\u3057\\u305F\\u3089\\u4E88\\u60F3\\u5916\\u306B\\u9AD8\\u304F\\u3066\\u81EA\\u5206\\u304C\\u8B0E\\u306E\\u81EA\\u4FE1\\u3092\\u6301\\u3061\\u59CB\\u3081\\u305F',\n    '\\u901A\\u52E4\\u4E2D\\u306B\\u97F3\\u697D\\u8074\\u304D\\u306A\\u304C\\u3089\\u30CE\\u30EA\\u30CE\\u30EA\\u306B\\u306A\\u3063\\u3066\\u305F\\u306E\\u3092\\u898B\\u3089\\u308C\\u3066\\u305F\\u3089\\u3057\\u3044',\n    '\\u597D\\u304D\\u3059\\u304E\\u308B\\u66F2\\u3092\\u4ED6\\u4EBA\\u306B\\u6559\\u3048\\u305F\\u304F\\u306A\\u3044\\u6C17\\u6301\\u3061\\u3068\\u6559\\u3048\\u305F\\u3044\\u6C17\\u6301\\u3061\\u304C\\u6BCE\\u56DE\\u6226\\u3046',\n    '\\u60B2\\u3057\\u3044\\u6642\\u306B\\u60B2\\u3057\\u3044\\u97F3\\u697D\\u3092\\u8074\\u304F\\u884C\\u70BA\\u304C\\u5B9F\\u306F\\u7652\\u3057\\u306B\\u306A\\u308B\\u7406\\u7531\\u304C\\u308F\\u304B\\u3063\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u8A00\\u8449\\u306B\\u306A\\u3089\\u306A\\u3044\\u611F\\u60C5\\u3092\\u97F3\\u697D\\u304C\\u5168\\u90E8\\u4EE3\\u308F\\u308A\\u306B\\u8A00\\u3063\\u3066\\u304F\\u308C\\u308B\\u6642\\u304C\\u3042\\u308B',\n    '\\u97F3\\u697D\\u306E\\u597D\\u307F\\u3063\\u3066\\u7D50\\u5C40\\u305D\\u306E\\u4EBA\\u306E\\u4EBA\\u751F\\u89B3\\u304C\\u51FA\\u308B\\u3068\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u8074\\u304D\\u7D9A\\u3051\\u3066\\u304D\\u305F\\u97F3\\u697D\\u3067\\u81EA\\u5206\\u306E\\u6B74\\u53F2\\u3092\\u632F\\u308A\\u8FD4\\u308C\\u308B\\u306E\\u304C\\u597D\\u304D',\n    '\\u97F3\\u697D\\u304CBGM\\u3058\\u3083\\u306A\\u304F\\u3066\\u30E1\\u30A4\\u30F3\\u306B\\u306A\\u3063\\u305F\\u77AC\\u9593\\u3001\\u4EBA\\u751F\\u5909\\u308F\\u3063\\u305F\\u3068\\u601D\\u3046',\n    '\\u7121\\u97F3\\u3067\\u3044\\u3089\\u308C\\u306A\\u3044\\u6027\\u683C\\u306F\\u97F3\\u697D\\u4F9D\\u5B58\\u75C7\\u306A\\u306E\\u304B\\u611F\\u53D7\\u6027\\u304C\\u8C4A\\u304B\\u306A\\u306E\\u304B',\n    '\\u521D\\u3081\\u3066\\u30E9\\u30A4\\u30D6\\u3067\\u8074\\u3044\\u305F\\u6642\\u306E\\u611F\\u52D5\\u304C\\u97F3\\u6E90\\u3067\\u518D\\u73FE\\u3067\\u304D\\u306A\\u3044\\u306E\\u304C\\u611B\\u304A\\u3057\\u3044',\n    '\\u4F5C\\u3063\\u305F\\u4EBA\\u306E\\u611F\\u60C5\\u304C\\u97F3\\u306B\\u4E57\\u3063\\u3066\\u5C4A\\u304F\\u3001\\u305D\\u308C\\u304C\\u97F3\\u697D\\u306E\\u672C\\u8CEA\\u3060\\u3068\\u4FE1\\u3058\\u3066\\u3044\\u308B',\n    '\\u4E00\\u66F2\\u3067\\u5B8C\\u5168\\u306B\\u5225\\u4E16\\u754C\\u306B\\u9023\\u308C\\u3066\\u884C\\u304B\\u308C\\u308B\\u4F53\\u9A13\\u3001\\u3053\\u308C\\u4EE5\\u4E0A\\u306E\\u5A2F\\u697D\\u3042\\u308B\\u304B',\n    '\\u97F3\\u697D\\u3092\\u5206\\u6790\\u3057\\u3066\\u8074\\u3051\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F\\u3089\\u697D\\u3057\\u3055\\u304C\\u4E8C\\u500D\\u306B\\u306A\\u3063\\u305F',\n    '\\u97F3\\u697D\\u4EF2\\u9593\\u306E\\u5B58\\u5728\\u304C\\u306A\\u3093\\u3060\\u304B\\u3093\\u3060\\u4EBA\\u751F\\u3092\\u8C4A\\u304B\\u306B\\u3057\\u3066\\u304F\\u308C\\u3066\\u3044\\u308B',\n    '\\u751F\\u6F14\\u594F\\u3092\\u89B3\\u305F\\u5F8C\\u306F\\u9332\\u97F3\\u3055\\u308C\\u305F\\u97F3\\u697D\\u3078\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5909\\u308F\\u308B\\u3002\\u3069\\u3061\\u3089\\u3082\\u597D\\u304D',\n    '\\u97F3\\u697D\\u306E\\u3042\\u308B\\u751F\\u6D3B\\u3068\\u306A\\u3044\\u751F\\u6D3B\\u3092\\u6BD4\\u3079\\u305F\\u3089\\u524D\\u8005\\u304C\\u5727\\u5012\\u7684\\u306B\\u8C4A\\u304B\\u3060\\u3063\\u305F',\n    '\\u6B4C\\u8A5E\\u304C\\u523A\\u3055\\u308A\\u3059\\u304E\\u3066\\u4E00\\u65E5\\u4E2D\\u305D\\u306E\\u8A00\\u8449\\u304C\\u982D\\u304B\\u3089\\u96E2\\u308C\\u306A\\u3044\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u4F5C\\u66F2\\u8005\\u3068\\u6F14\\u594F\\u8005\\u3068\\u8074\\u8846\\u306E\\u4E09\\u8005\\u304C\\u63C3\\u3063\\u3066\\u521D\\u3081\\u3066\\u97F3\\u697D\\u304C\\u5B8C\\u6210\\u3059\\u308B\\u3068\\u601D\\u3046',\n    '\\u97F3\\u697D\\u306E\\u8DA3\\u5473\\u304C\\u5909\\u308F\\u308B\\u305F\\u3073\\u306B\\u81EA\\u5206\\u304C\\u5C11\\u3057\\u6210\\u9577\\u3057\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u97F3\\u697D\\u306B\\u6551\\u308F\\u308C\\u305F\\u3053\\u3068\\u304C\\u4E00\\u5EA6\\u3084\\u4E8C\\u5EA6\\u3058\\u3083\\u306A\\u3044\\u304B\\u3089\\u597D\\u304D\\u3067\\u3044\\u308B\\u3093\\u3060\\u3068\\u601D\\u3046',\n    '\\u30D5\\u30A7\\u30B9\\u306E\\u524D\\u5F8C\\u3067\\u8074\\u304F\\u540C\\u3058\\u30A2\\u30FC\\u30C6\\u30A3\\u30B9\\u30C8\\u306E\\u66F2\\u304C\\u5168\\u7136\\u9055\\u3046\\u8074\\u3053\\u3048\\u65B9\\u3092\\u3059\\u308B',\n    '\\u6700\\u521D\\u306F\\u5168\\u7136\\u523A\\u3055\\u3089\\u306A\\u304B\\u3063\\u305F\\u66F2\\u304C\\u4F55\\u304B\\u306E\\u62CD\\u5B50\\u306B\\u6025\\u306B\\u597D\\u304D\\u306B\\u306A\\u308B\\u73FE\\u8C61'\n  ],\n  '\\u6620\\u753B': [\n    '\\u660E\\u65E5\\u516C\\u958B\\u306E\\u6620\\u753B\\u306E\\u4E88\\u544A\\u7DE8\\u3067\\u3082\\u3046\\u6CE3\\u304D\\u305D\\u3046\\u306B\\u306A\\u3063\\u305F\\u3002\\u672C\\u7DE8\\u5927\\u4E08\\u592B\\u304B',\n    '\\u6620\\u753B\\u9928\\u3067\\u96A3\\u306E\\u4EBA\\u304C\\u3081\\u3063\\u3061\\u3083\\u6CE3\\u3044\\u3066\\u3066\\u3053\\u3063\\u3061\\u307E\\u3067\\u3082\\u3089\\u3044\\u6CE3\\u304D\\u3057\\u305F',\n    '\\u767A\\u97F3\\u5B57\\u5E55\\u8AAD\\u3080\\u306E\\u9045\\u3059\\u304E\\u3066\\u753B\\u9762\\u898B\\u9003\\u3059\\u306E\\u3069\\u3046\\u306B\\u304B\\u3057\\u305F\\u3044',\n    '\\u540C\\u3058\\u6620\\u753B\\u3092\\u4E09\\u56DE\\u898B\\u308B\\u3068\\u6BCE\\u56DE\\u9055\\u3046\\u30B7\\u30FC\\u30F3\\u3067\\u6CE3\\u3051\\u308B\\u3002\\u308A\\u3044\\u3061\\u304C\\u6C17\\u5408\\u3044\\u3068\\u8A00\\u308F\\u308C\\u308B',\n    '\\u30B5\\u30D6\\u30B9\\u30AF\\u306E\\u6620\\u753B\\u6570\\u304C\\u591A\\u3059\\u304E\\u3066\\u982D\\u304C\\u6D88\\u5316\\u3067\\u304D\\u3066\\u3044\\u306A\\u3044',\n    '\\u540D\\u4F5C\\u6620\\u753B\\u3092\\u521D\\u3081\\u3066\\u5927\\u753B\\u9762\\u3067\\u898B\\u305F\\u3089\\u304A\\u91D1\\u8FD4\\u3063\\u3066\\u304D\\u305F\\u6C17\\u5206\\u306B\\u306A\\u3063\\u305F',\n    '\\u30A8\\u30F3\\u30C9\\u30ED\\u30FC\\u30EB\\u5F8C\\u306E\\u9699\\u9593\\u30B7\\u30FC\\u30F3\\u898B\\u9003\\u3057\\u305F\\u3002\\u3042\\u308C\\u9023\\u308C\\u3066\\u884C\\u304B\\u308C\\u3066\\u3057\\u307E\\u3063\\u305F',\n    '\\u30C9\\u30AD\\u30E5\\u30E1\\u30F3\\u30BF\\u30EA\\u30FC\\u3063\\u3066\\u304D\\u307F\\u6620\\u753B\\u3060\\u3088\\u306A\\u3002\\u3042\\u306E\\u74B0\\u5883\\u554F\\u984C\\u306E\\u3084\\u3064\\u898B\\u305F\\u3089\\u97F3\\u697D\\u304C\\u826F\\u3059\\u304E\\u305F\\u3002',\n    '\\u6620\\u753B\\u3092\\u898B\\u306A\\u304C\\u3089\\u98DF\\u3079\\u308B\\u30DD\\u30C3\\u30D7\\u30B3\\u30FC\\u30F3\\u306E\\u5E78\\u798F\\u611F\\u306F\\u521D\\u65E5\\u3068\\u7B49\\u3057\\u3044',\n    '\\u8B1B\\u8A55\\u306F\\u4F4E\\u304B\\u3063\\u305F\\u304C\\u500B\\u4EBA\\u7684\\u306B\\u306F\\u3053\\u308C\\u304C\\u3042\\u308B',\n    '\\u56FD\\u5185\\u516C\\u958B\\u3055\\u308C\\u308B\\u524D\\u306B\\u6D77\\u5916\\u6F0F\\u308C\\u3067\\u898B\\u3066\\u3057\\u307E\\u3063\\u305F\\u3002\\u3053\\u306E\\u7F6A\\u60AA\\u611F',\n    '\\u30A2\\u30AF\\u30B7\\u30E7\\u30F3\\u6620\\u753B\\u306E\\u69D8\\u5F0F\\u7F8E\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u82E6\\u624B\\u306A\\u30B7\\u30FC\\u30F3\\u3082\\u30A2\\u30FC\\u30C8\\u3068\\u601D\\u3063\\u3066\\u898B\\u3066\\u3057\\u307E\\u3046',\n    '\\u90F7\\u753B\\u5EA7\\u5E2D\\u306E\\u30EA\\u30AF\\u30E9\\u30A4\\u30CB\\u30F3\\u30B0\\u3092\\u4F7F\\u3063\\u305F\\u3089\\u6620\\u753B\\u9928\\u306B\\u884C\\u3051\\u306A\\u304F\\u306A\\u308A\\u305D\\u3046\\u3067\\u6012\\u3057\\u3044',\n    '\\u5145\\u4FA1\\u9152\\u5C4B\\u306E\\u3088\\u3046\\u306A\\u30E9\\u30A4\\u30F3\\u30CA\\u30C3\\u30D7\\u3067\\u6620\\u753B\\u3092\\u898B\\u308B\\u6587\\u5316\\u304C\\u5168\\u56FD\\u306B\\u5E83\\u304C\\u308C\\u3070\\u3044\\u3044\\u306E\\u306B',\n    '\\u6620\\u753B\\u8A55\\u8AD6\\u5BB6\\u306E\\u9AD8\\u8A55\\u4FA1\\u3068\\u4E00\\u822C\\u4EBA\\u306E\\u4E0A\\u6620\\u6210\\u7E3E\\u306E\\u4E56\\u96E2\\u304C\\u6700\\u8FD1\\u6C17\\u306B\\u306A\\u308B',\n    '\\u6620\\u753B\\u304C\\u5F97\\u610F\\u306A\\u30B5\\u30C8\\u30EA\\u767A\\u898B\\u304C\\u5F97\\u610F\\u3002\\u3053\\u308C\\u30E9\\u30A4\\u30D5\\u30EF\\u30FC\\u30AF\\u3068\\u3057\\u3066\\u89AA\\u7570\\u306A\\u884C\\u52D5\\u306B\\u306A\\u308B',\n    '\\u30BB\\u30EA\\u306E\\u30D7\\u30ED\\u30B8\\u30A7\\u30AF\\u30BF\\u30FC\\u3067\\u89AA\\u53CB\\u306E\\u5BB6\\u306B\\u6620\\u753B\\u4E0A\\u6620\\u4F1A\\u3092\\u958B\\u3044\\u305F\\u8A08\\u753B\\u304C\\u3042\\u308B',\n    '\\u4E2D\\u5B66\\u306E\\u3068\\u304D\\u306B\\u898B\\u305F\\u6620\\u753B\\u306E\\u7D9A\\u7DE8\\u304C\\u5C71\\u5E74\\u5F8C\\u306B\\u5236\\u4F5C\\u3055\\u308C\\u308B\\u3068\\u304D\\u306E\\u5FC3\\u5883\\u3063\\u3066\\u3069\\u3046\\u5C45\\u305F\\u308C\\u3070',\n    '\\u6620\\u753B\\u914D\\u4FE1\\u30B5\\u30FC\\u30D3\\u30B9\\u306E\\u30AB\\u30BF\\u30ED\\u30B0\\u3092\\u898B\\u307E\\u308F\\u3059\\u6642\\u9593\\u306E\\u65B9\\u304C\\u672C\\u7DE8\\u3088\\u308A\\u9577\\u3044\\u3053\\u3068\\u306B\\u6C17\\u3065\\u3044\\u305F',\n    '\\u5916\\u56FD\\u8A9E\\u5B66\\u7FD2\\u306E\\u52D5\\u6A5F\\u306B\\u6620\\u753B\\u3092\\u5B57\\u5E55\\u306A\\u3057\\u3067\\u6FC3\\u6307\\u3059\\u308B\\u8A08\\u753B\\u3002\\u4E09\\u65E5\\u3067\\u6295\\u3052\\u51FA\\u3057\\u305F',\n    '\\u6620\\u753B\\u9928\\u306E\\u30DD\\u30C3\\u30D7\\u30B3\\u30FC\\u30F3\\u306E\\u4FA1\\u6570\\u8A2D\\u5B9A\\u304C\\u4E0D\\u6B63\\u3060\\u3068\\u6D17\\u306E\\u4E2D\\u3067\\u601D\\u3044\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u590F\\u306E\\u6620\\u753B\\u9928\\u306E\\u51B7\\u623F\\u304C\\u5F37\\u3059\\u304E\\u3066\\u5E38\\u306B\\u6BDB\\u5E03\\u3092\\u5E2F\\u3093\\u3067\\u3044\\u308B\\u3002\\u3053\\u308C\\u304C\\u98DF\\u3044\\u5DEE',\n    '\\u6620\\u753B\\u5185\\u306E\\u9AD8\\u81E8\\u983C\\u307F\\u306E\\u53F0\\u8A5E\\u3092\\u65E5\\u5E38\\u4F1A\\u8A71\\u3067\\u4F7F\\u3044\\u305F\\u3044\\u3002\\u3067\\u3082\\u6BCE\\u56DE\\u3059\\u3079\\u308A\\u306E\\u3082\\u3042\\u308C',\n    '\\u518D\\u9023\\u6620\\u753B\\u304C\\u4E00\\u4F5C\\u76EE\\u3092\\u8D85\\u3048\\u308B\\u5C71\\u306F\\u7A00\\u3060\\u306A\\u3068\\u601D\\u3063\\u305F\\u3089\\u5148\\u9031\\u306E\\u304C\\u3089\\u304C\\u99D0\\u3057\\u304B\\u3063\\u305F',\n    '\\u30B7\\u30CD\\u30B3\\u30F3\\u30D7\\u30EC\\u30C3\\u30AF\\u30B9\\u306E\\u4E16\\u754C\\u884C\\u304C\\u767A\\u751F\\u3059\\u308B\\u307E\\u3055\\u306B\\u5834\\u6240\\u304C\\u591A\\u304F\\u3042\\u308B',\n    '\\u6620\\u753B\\u6E21\\u308A\\u306E\\u539F\\u4F5C\\u3092\\u5FC5\\u305A\\u8AAD\\u3080\\u6D3E\\u3067\\u3059\\u304C\\u4ECA\\u56DE\\u306F\\u5148\\u306B\\u6620\\u753B\\u3092\\u898B\\u3066\\u3057\\u307E\\u3063\\u305F',\n    '\\u6620\\u753B\\u9928\\u306E\\u30DD\\u30C3\\u30D7\\u30B3\\u30FC\\u30F3\\u306E\\u306C\\u308B\\u3075\\u308B\\u98DF\\u611F\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u793E\\u4F1A\\u7684\\u306B\\u554F\\u984C\\u304C\\u3042\\u308B\\u304B\\u3082',\n    '\\u590F\\u306E\\u6620\\u753B\\u9928\\u306E\\u51B7\\u623F\\u304C\\u5F37\\u3059\\u304E\\u3066\\u5E38\\u306B\\u6BDB\\u5E03\\u3092\\u6301\\u3093\\u3067\\u3044\\u308B\\u3002\\u3053\\u308C\\u304C\\u98DF\\u3044\\u5DEE',\n    '\\u6620\\u753B\\u5185\\u306B\\u9AD8\\u983C\\u307F\\u306E\\u53F0\\u8A5E\\u3092\\u65E5\\u5E38\\u4F1A\\u8A71\\u3067\\u4F7F\\u3044\\u305F\\u3044\\u3002\\u3067\\u3082\\u6BCE\\u56DE\\u3059\\u3079\\u308A\\u306E\\u3082\\u3042\\u308C',\n    '\\u30A2\\u30AB\\u30C7\\u30DF\\u30FC\\u8CDE\\u5F8C\\u306B\\u6700\\u521D\\u304B\\u3089\\u898B\\u305F\\u306E\\u304C\\u3082\\u3046\\u5341\\u5E74\\u4EE5\\u4E0A\\u524D\\u3068\\u306F\\u3002\\u6642\\u9593\\u7D4C\\u3064\\u306E\\u306F\\u65E9\\u3044',\n    '\\u6620\\u753B\\u306E\\u30BF\\u30A4\\u30C8\\u30EB\\u3092\\u5FD8\\u308C\\u3066\\u3057\\u307E\\u3063\\u3066\\u5185\\u5BB9\\u3060\\u3051\\u899A\\u3048\\u3066\\u308B\\u72B6\\u614B\\u304C\\u4E00\\u756A\\u56F0\\u308B',\n    '\\u6620\\u753B\\u3092\\u89B3\\u305F\\u5F8C\\u306B\\u539F\\u4F5C\\u5C0F\\u8AAC\\u3092\\u8AAD\\u3080\\u3068\\u9055\\u3046\\u767A\\u898B\\u304C\\u3042\\u3063\\u3066\\u4E8C\\u5EA6\\u697D\\u3057\\u3081\\u308B',\n    '\\u6620\\u753B\\u597D\\u304D\\u306A\\u4EBA\\u3068\\u8A71\\u3059\\u3068\\u5171\\u901A\\u306E\\u8A00\\u8A9E\\u3067\\u76DB\\u308A\\u4E0A\\u304C\\u308C\\u308B\\u304B\\u3089\\u597D\\u304D',\n    '\\u6620\\u753B\\u9928\\u306E\\u4E88\\u544A\\u7DE8\\u30BF\\u30A4\\u30E0\\u304C\\u5B9F\\u306F\\u304B\\u306A\\u308A\\u597D\\u304D\\u306A\\u6642\\u9593',\n    '\\u540D\\u4F5C\\u3060\\u3068\\u77E5\\u308A\\u306A\\u304C\\u3089\\u672A\\u89B3\\u306E\\u307E\\u307E\\u306B\\u3057\\u3066\\u308B\\u4F5C\\u54C1\\u304C\\u7A4D\\u307F\\u91CD\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u540C\\u3058\\u6620\\u753B\\u3092\\u4E00\\u4EBA\\u3067\\u89B3\\u308B\\u306E\\u3068\\u8AB0\\u304B\\u3068\\u89B3\\u308B\\u306E\\u3067\\u306F\\u5168\\u304F\\u9055\\u3046\\u4F53\\u9A13\\u306B\\u306A\\u308B',\n    '\\u6620\\u753B\\u306E\\u30E9\\u30B9\\u30C8\\u30B7\\u30FC\\u30F3\\u3060\\u3051\\u5148\\u306B\\u8ABF\\u3079\\u305F\\u304F\\u306A\\u308B\\u885D\\u52D5\\u3068\\u95D8\\u3063\\u3066\\u3044\\u308B',\n    '\\u6620\\u753B\\u3092\\u89B3\\u7D42\\u308F\\u3063\\u305F\\u3042\\u3068\\u3057\\u3070\\u3089\\u304F\\u305D\\u306E\\u4E16\\u754C\\u304B\\u3089\\u623B\\u308C\\u306A\\u3044\\u611F\\u899A\\u304C\\u597D\\u304D',\n    '\\u4F4E\\u4E88\\u7B97\\u6620\\u753B\\u306A\\u306E\\u306B\\u5B8C\\u6210\\u5EA6\\u304C\\u9AD8\\u304F\\u3066\\u5927\\u4F5C\\u3088\\u308A\\u611F\\u52D5\\u3057\\u305F\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u6620\\u753B\\u306E\\u5C0F\\u9053\\u5177\\u306B\\u3053\\u3053\\u307E\\u3067\\u610F\\u5473\\u304C\\u3042\\u308B\\u3068\\u306F\\u601D\\u308F\\u306A\\u304B\\u3063\\u305F\\u3002\\u4E8C\\u9031\\u76EE\\u3067\\u6C17\\u3065\\u3044\\u305F',\n    '\\u4E3B\\u4EBA\\u516C\\u3088\\u308A\\u8107\\u5F79\\u306E\\u65B9\\u304C\\u9B45\\u529B\\u7684\\u306A\\u6620\\u753B\\u306B\\u51FA\\u4F1A\\u3063\\u305F\\u6642\\u306E\\u559C\\u3073',\n    '\\u6620\\u753B\\u97F3\\u697D\\u3060\\u3051\\u8074\\u3044\\u3066\\u305F\\u3089\\u6620\\u753B\\u306E\\u5834\\u9762\\u304C\\u6620\\u50CF\\u3068\\u3057\\u3066\\u6D6E\\u304B\\u3093\\u3067\\u304D\\u305F',\n    '\\u3042\\u306E\\u76E3\\u7763\\u306E\\u65B0\\u4F5C\\u3060\\u304B\\u3089\\u7D76\\u5BFE\\u89B3\\u3088\\u3046\\u3068\\u6C7A\\u3081\\u3066\\u308B\\u4F5C\\u54C1\\u304C\\u3044\\u304F\\u3064\\u304B\\u3042\\u308B',\n    '\\u6620\\u753B\\u306E\\u539F\\u984C\\u3068\\u90A6\\u984C\\u304C\\u5168\\u7136\\u9055\\u3046\\u610F\\u5473\\u306E\\u6642\\u306E\\u6238\\u60D1\\u3044\\u3068\\u767A\\u898B',\n    '\\u6620\\u753B\\u9928\\u3067\\u30B9\\u30DE\\u30DB\\u3092\\u898B\\u3066\\u308B\\u4EBA\\u304C\\u8A31\\u305B\\u306A\\u3044\\u611F\\u60C5\\u306E\\u5F37\\u3055\\u3092\\u81EA\\u899A\\u3057\\u305F',\n    '\\u30DB\\u30E9\\u30FC\\u6620\\u753B\\u306E\\u6016\\u304F\\u306A\\u3044\\u3068\\u3053\\u308D\\u3067\\u7B11\\u3063\\u3066\\u3057\\u307E\\u3044\\u96A3\\u306E\\u4EBA\\u306B\\u767D\\u3044\\u76EE\\u3067\\u898B\\u3089\\u308C\\u305F',\n    '\\u4E8C\\u6642\\u9593\\u534A\\u306E\\u6620\\u753B\\u3092\\u89B3\\u308B\\u4F53\\u529B\\u3068\\u96C6\\u4E2D\\u529B\\u304C\\u5E74\\u3005\\u843D\\u3061\\u3066\\u3044\\u308B\\u5371\\u6A5F\\u611F',\n    '\\u6620\\u753B\\u306E\\u9014\\u4E2D\\u3067\\u30C8\\u30A4\\u30EC\\u306B\\u884C\\u304F\\u30BF\\u30A4\\u30DF\\u30F3\\u30B0\\u3092\\u6C38\\u9060\\u306B\\u8A08\\u308C\\u306A\\u3044\\u554F\\u984C',\n    '\\u6620\\u753B\\u8A55\\u8AD6\\u5BB6\\u306E\\u8A00\\u8449\\u96E3\\u3057\\u3059\\u304E\\u3066\\u6700\\u5F8C\\u307E\\u3067\\u8AAD\\u3093\\u3060\\u3053\\u3068\\u304C\\u306A\\u3044',\n    '\\u6620\\u753B\\u306E\\u30C1\\u30B1\\u30C3\\u30C8\\u4EE3\\u304C\\u9AD8\\u304F\\u306A\\u3063\\u3066\\u89B3\\u306B\\u884C\\u304F\\u4F5C\\u54C1\\u3092\\u53B3\\u9078\\u3059\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u6620\\u753B\\u306F\\u73FE\\u5B9F\\u3067\\u306F\\u4F53\\u9A13\\u3067\\u304D\\u306A\\u3044\\u4EBA\\u751F\\u3092\\u7591\\u4F3C\\u4F53\\u9A13\\u3055\\u305B\\u3066\\u304F\\u308C\\u308B\\u6700\\u5F37\\u306E\\u5A2F\\u697D',\n    '\\u6620\\u753B\\u3067\\u6CE3\\u3051\\u308B\\u4EBA\\u3068\\u6CE3\\u3051\\u306A\\u3044\\u4EBA\\u3067\\u4EBA\\u751F\\u306E\\u611F\\u53D7\\u6027\\u306E\\u91CF\\u304C\\u9055\\u3046\\u6C17\\u304C\\u3059\\u308B',\n    '\\u6620\\u753B\\u3067\\u4FA1\\u5024\\u89B3\\u304C\\u5909\\u308F\\u3063\\u305F\\u7D4C\\u9A13\\u304C\\u4ECA\\u306E\\u81EA\\u5206\\u3092\\u4F5C\\u3063\\u3066\\u3044\\u308B\\u90E8\\u5206\\u304C\\u3042\\u308B',\n    '\\u30D5\\u30A3\\u30AF\\u30B7\\u30E7\\u30F3\\u306A\\u306E\\u306B\\u672C\\u5F53\\u306B\\u5B58\\u5728\\u3057\\u305F\\u4EBA\\u3088\\u308A\\u9BAE\\u660E\\u306B\\u8A18\\u61B6\\u306B\\u6B8B\\u308B\\u30AD\\u30E3\\u30E9\\u304C\\u3044\\u308B',\n    '\\u6620\\u753B\\u306E\\u6279\\u8A55\\u3092\\u8AAD\\u3093\\u3067\\u304B\\u3089\\u89B3\\u308B\\u304B\\u89B3\\u3066\\u304B\\u3089\\u8AAD\\u3080\\u304B\\u3067\\u4F53\\u9A13\\u304C\\u5909\\u308F\\u308B',\n    '\\u6620\\u753B\\u9928\\u306E\\u6697\\u95C7\\u306E\\u4E2D\\u3067\\u3057\\u304B\\u4F53\\u9A13\\u3067\\u304D\\u306A\\u3044\\u6CA1\\u5165\\u611F\\u306F\\u5BB6\\u3067\\u306F\\u7D76\\u5BFE\\u306B\\u518D\\u73FE\\u3067\\u304D\\u306A\\u3044',\n    '\\u6620\\u753B\\u304C\\u4F1D\\u3048\\u305F\\u3044\\u30E1\\u30C3\\u30BB\\u30FC\\u30B8\\u3092\\u53D7\\u3051\\u53D6\\u3063\\u305F\\u77AC\\u9593\\u306E\\u9CE5\\u808C\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u30BB\\u30EA\\u30D5\\u306A\\u3057\\u5834\\u9762\\u3067\\u611F\\u60C5\\u304C\\u6700\\u9AD8\\u6F6E\\u306B\\u306A\\u308B\\u6620\\u753B\\u304C\\u6700\\u3082\\u5DE7\\u307F\\u3060\\u3068\\u601D\\u3046',\n    '\\u6620\\u753B\\u306E\\u4E16\\u754C\\u89B3\\u306B\\u5171\\u611F\\u3067\\u304D\\u308B\\u4EBA\\u3068\\u53CB\\u9054\\u306B\\u306A\\u308C\\u308B\\u6C17\\u304C\\u3057\\u3066\\u3044\\u308B',\n    '\\u540C\\u3058\\u6620\\u753B\\u3092\\u9055\\u3046\\u5E74\\u9F62\\u3067\\u89B3\\u308B\\u3068\\u89E3\\u91C8\\u304C\\u5909\\u308F\\u308B\\u3002\\u3053\\u308C\\u304C\\u6620\\u753B\\u306E\\u5BFF\\u547D\\u306E\\u9577\\u3055',\n    '\\u6620\\u753B\\u306F\\u76E3\\u7763\\u306E\\u4E16\\u754C\\u306E\\u898B\\u65B9\\u3092\\u501F\\u308A\\u3066\\u81EA\\u5206\\u306E\\u8996\\u91CE\\u3092\\u5E83\\u3052\\u308B\\u884C\\u70BA\\u3060\\u3068\\u601D\\u3046',\n    '\\u6620\\u753B\\u304B\\u3089\\u5B66\\u3093\\u3060\\u3053\\u3068\\u304C\\u4ED5\\u4E8B\\u3084\\u4EBA\\u9593\\u95A2\\u4FC2\\u306B\\u6D3B\\u304D\\u3066\\u3044\\u308B\\u3068\\u611F\\u3058\\u308B',\n    '\\u8A18\\u61B6\\u306B\\u6B8B\\u308B\\u6620\\u753B\\u306E\\u30EF\\u30F3\\u30B7\\u30FC\\u30F3\\u306F\\u6642\\u9593\\u304C\\u7D4C\\u3063\\u3066\\u3082\\u8272\\u892A\\u305B\\u306A\\u3044',\n    '\\u6620\\u753B\\u306E\\u4F59\\u97FB\\u3092\\u3072\\u3068\\u308A\\u3067\\u565B\\u307F\\u7DE0\\u3081\\u308B\\u6642\\u9593\\u304C\\u89B3\\u8CDE\\u4F53\\u9A13\\u306E\\u5927\\u4E8B\\u306A\\u4E00\\u90E8',\n    '\\u6620\\u753B\\u3092\\u89B3\\u305F\\u6570\\u3060\\u3051\\u4EBA\\u751F\\u306E\\u89E3\\u50CF\\u5EA6\\u304C\\u4E0A\\u304C\\u308B\\u3068\\u672C\\u6C17\\u3067\\u4FE1\\u3058\\u3066\\u3044\\u308B',\n    '\\u540C\\u3058\\u6620\\u753B\\u3067\\u3082\\u89B3\\u308B\\u4EBA\\u306B\\u3088\\u3063\\u3066\\u5168\\u304F\\u9055\\u3046\\u89E3\\u91C8\\u306B\\u306A\\u308B\\u3002\\u305D\\u308C\\u304C\\u9762\\u767D\\u3044',\n    '\\u6620\\u753B\\u306E\\u30AD\\u30E3\\u30E9\\u30AF\\u30BF\\u30FC\\u306B\\u611F\\u60C5\\u79FB\\u5165\\u3067\\u304D\\u305F\\u6642\\u304C\\u4E00\\u756A\\u4F5C\\u54C1\\u304C\\u597D\\u304D\\u306B\\u306A\\u308B\\u77AC\\u9593',\n    '\\u6620\\u753B\\u3063\\u3066\\u88FD\\u4F5C\\u8005\\u306E\\u60F3\\u3044\\u304C\\u6642\\u4EE3\\u3092\\u8D85\\u3048\\u3066\\u5C4A\\u304F\\u624B\\u7D19\\u307F\\u305F\\u3044\\u306A\\u3082\\u306E\\u3060\\u3068\\u601D\\u3046',\n    '\\u5B50\\u4F9B\\u306E\\u9803\\u306B\\u89B3\\u305F\\u6620\\u753B\\u304C\\u5927\\u4EBA\\u306B\\u306A\\u3063\\u3066\\u5225\\u306E\\u610F\\u5473\\u3067\\u523A\\u3055\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B'\n  ],\n  '\\u30B2\\u30FC\\u30E0': [\n    '\\u6628\\u591C\\u307E\\u305F\\u5BDD\\u308B\\u306E\\u3092\\u5FD8\\u308C\\u3066\\u30B2\\u30FC\\u30E0\\u3057\\u3066\\u305F\\u3002\\u6C17\\u3065\\u3044\\u305F\\u3089\\u5916\\u304C\\u660E\\u308B\\u304F\\u306A\\u3063\\u3066\\u305F',\n    '\\u9031\\u9593\\u5F85\\u3061\\u306B\\u5F85\\u3063\\u305F\\u65B0\\u4F5C\\u30B2\\u30FC\\u30E0\\u304C\\u671F\\u5F85\\u306E\\u5341\\u500D\\u3060\\u3063\\u305F\\u3002\\u3053\\u308C\\u304C\\u30B2\\u30FC\\u30DE\\u30FC\\u306E\\u5E78\\u798F',\n    '\\u30AA\\u30F3\\u30E9\\u30A4\\u30F3\\u306E\\u30D5\\u30EC\\u30F3\\u30C9\\u3068\\u4E00\\u7DD2\\u306B\\u30AF\\u30EA\\u30A2\\u3057\\u305F\\u3068\\u304D\\u306E\\u672C\\u7269\\u306E\\u9054\\u6210\\u611F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30B5\\u30A6\\u30F3\\u30C9\\u30C8\\u30E9\\u30C3\\u30AF\\u3060\\u3051\\u3067\\u611F\\u52D5\\u3057\\u3066\\u6CE3\\u3044\\u305F\\u3002\\u4F5C\\u66F2\\u5BB6\\u306E\\u5929\\u624D',\n    '\\u30EB\\u30FC\\u30C8\\u3092\\u5909\\u3048\\u305F\\u3089\\u4E00\\u767A\\u3067\\u30AF\\u30EA\\u30A2\\u3067\\u304D\\u305F\\u3002\\u9577\\u6642\\u9593\\u8CA0\\u3051\\u3066\\u305F\\u306E\\u306F\\u4E00\\u4F53\\u4F55\\u3060\\u3063\\u305F\\u3093\\u3060',\n    '\\u30B2\\u30FC\\u30E0\\u5185\\u306E\\u30E1\\u30A4\\u30F3\\u30AD\\u30E3\\u30E9\\u304C\\u30B9\\u30D4\\u30F3\\u30AA\\u30D5\\u3057\\u305F\\u30B2\\u30FC\\u30E0\\u306E\\u30C8\\u30EC\\u30FC\\u30E9\\u30FC\\u3092\\u898B\\u3066\\u65E9\\u901F\\u4E88\\u7D04\\u3057\\u305F',\n    '\\u5C0F\\u5B66\\u751F\\u306E\\u3053\\u308D\\u306B\\u306F\\u307E\\u3063\\u305F\\u30B7\\u30EA\\u30FC\\u30BA\\u306E\\u30EA\\u30E1\\u30A4\\u30AF\\u304C\\u51FA\\u308B\\u3068\\u805E\\u3044\\u3066\\u9234\\u7A3F\\u304C\\u6CE3\\u3044\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30AD\\u30E3\\u30E9\\u30AF\\u30BF\\u30FC\\u306B\\u672C\\u6C17\\u3067\\u611F\\u60C5\\u79FB\\u5165\\u3059\\u308B\\u81EA\\u5206\\u306E\\u5FC3\\u304C\\u30D4\\u30E5\\u30A2',\n    '\\u30E9\\u30F3\\u30AD\\u30F3\\u30B0\\u30E2\\u30FC\\u30C9\\u304C\\u304A\\u3082\\u3057\\u308D\\u304F\\u3066\\u30AB\\u30B8\\u30E5\\u30A2\\u30EB\\u30DE\\u30C3\\u30C1\\u3060\\u3051\\u306E\\u306F\\u305A\\u304C\\u6DF1\\u591C\\u307E\\u3067\\u3084\\u3063\\u3066\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u3053\\u3068\\u3092\\u8003\\u3048\\u306A\\u304C\\u3089\\u5BDD\\u308C\\u306A\\u304F\\u306A\\u308B\\u6C17\\u6301\\u3061\\u308F\\u304B\\u308B\\u4EBA\\u3044\\u308B\\uFF1F',\n    '\\u30B2\\u30FC\\u30E0\\u5185\\u306E\\u5B8C\\u5168\\u7121\\u6B20\\u306A\\u5546\\u5E97\\u4E3B\\u306B\\u306A\\u308C\\u308B\\u30B3\\u30F3\\u30C6\\u30F3\\u30C4\\u304C\\u524D\\u304B\\u3089\\u597D\\u304D\\u3060\\u3063\\u305F',\n    '\\u306E\\u3093\\u3073\\u308A\\u30B2\\u30FC\\u30E0\\u3092\\u4ED5\\u4E8B\\u306E\\u5408\\u9593\\u306B\\u3084\\u3063\\u3066\\u3044\\u305F\\u3089\\u518D\\u901A\\u52E4\\u3057\\u305F\\u3044\\u3068\\u601D\\u3046\\u6C17\\u6301\\u3061\\u306B\\u306A\\u3063\\u305F',\n    '\\u6700\\u65B0\\u4F5C\\u306E\\u30B0\\u30E9\\u30D5\\u30A3\\u30C3\\u30AF\\u8996\\u3066\\u3044\\u308B\\u3060\\u3051\\u3067\\u6E80\\u8DB3\\u3059\\u308B\\u6709\\u69D8\\u304C\\u8208\\u5473\\u6DF1\\u3044',\n    '\\u30A4\\u30F3\\u30C7\\u30A3\\u30FC\\u30B2\\u30FC\\u30E0\\u306E\\u9B45\\u529B\\u306B\\u6C17\\u3065\\u3044\\u305F\\u306E\\u306F\\u3064\\u3044\\u6700\\u8FD1\\u306E\\u3053\\u3068\\u3060\\u3063\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u304C\\u4E0A\\u624B\\u3044\\u4EBA\\u306B\\u90E8\\u5C4B\\u306E\\u30A4\\u30F3\\u30C6\\u30EA\\u30A2\\u3092\\u4EFB\\u305B\\u305F\\u3044\\u5922\\u304C\\u3042\\u308B',\n    '\\u30B5\\u30D6\\u30B9\\u30AF\\u306E\\u30B2\\u30FC\\u30E0\\u30D1\\u30B9\\u306E\\u30B3\\u30B9\\u30D1\\u6BD4\\u8F03\\u304C\\u8DA3\\u5473\\u306E\\u4E00\\u3064\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u5185\\u306E\\u97F3\\u697D\\u3060\\u3051\\u3067\\u5225\\u9014\\u8CFC\\u5165\\u3092\\u691C\\u8A0E\\u3057\\u3066\\u3044\\u308B\\u3002\\u30D5\\u30EB\\u30A2\\u30EB\\u30D0\\u30E0\\u3082\\u51FA\\u3057\\u3066\\u307B\\u3057\\u3044',\n    '\\u30B2\\u30FC\\u30E0\\u304C\\u4E0B\\u624B\\u306A\\u306E\\u306B\\u697D\\u3057\\u3093\\u3067\\u3044\\u305F\\u3089\\u6C17\\u3065\\u3044\\u305F\\u3089\\u4E0A\\u624B\\u304F\\u306A\\u3063\\u3066\\u3044\\u305F',\n    '\\u73FE\\u5B9F\\u9003\\u907F\\u306E\\u305F\\u3081\\u306B\\u30B2\\u30FC\\u30E0\\u3059\\u308B\\u306E\\u304B\\u30B2\\u30FC\\u30E0\\u304C\\u73FE\\u5B9F\\u306B\\u306A\\u308B\\u306E\\u304B\\u3044\\u307E\\u3060\\u306B\\u5C71\\u306E\\u4E2D',\n    '\\u96FB\\u6C60\\u304C\\u5207\\u308C\\u305F\\u305B\\u3044\\u3067\\u30BB\\u30FC\\u30D6\\u3067\\u304D\\u305A\\u306B\\u4E00\\u6D41\\u30A2\\u30A4\\u30C6\\u30E0\\u3092\\u843D\\u3068\\u3057\\u305F\\u3002\\u3053\\u306E\\u60B2\\u3057\\u3055',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u96E3\\u6613\\u5EA6\\u8A2D\\u5B9A\\u3092\\u96E3\\u3057\\u3044\\u306B\\u3057\\u305F\\u3089\\u305F\\u307E\\u305F\\u307E\\u30C1\\u30E3\\u30EC\\u30F3\\u30B8\\u597D\\u304D\\u306B\\u306A\\u3063\\u3066\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u5185\\u306E\\u30B7\\u30CA\\u30EA\\u30AA\\u30E9\\u30A4\\u30BF\\u30FC\\u306B\\u306A\\u308A\\u305F\\u3044\\u3068\\u5C11\\u5E74\\u671F\\u306B\\u601D\\u3063\\u305F\\u3053\\u3068\\u3092\\u601D\\u3044\\u51FA\\u3057\\u305F',\n    '\\u305D\\u306E\\u30B2\\u30FC\\u30E0\\u3092\\u30AF\\u30EA\\u30A2\\u3059\\u308B\\u307E\\u3067\\u6B21\\u306E\\u30B2\\u30FC\\u30E0\\u306B\\u79FB\\u3089\\u306A\\u3044\\u3068\\u3044\\u3046\\u30DE\\u30A4\\u30EB\\u30FC\\u30EB',\n    '\\u30C8\\u30ED\\u30D5\\u30A3\\u30FC\\u30B3\\u30F3\\u30D7\\u30EA\\u30FC\\u30C8\\u3057\\u305F\\u3068\\u304D\\u306E\\u6E80\\u8DB3\\u611F\\u306F\\u4ED6\\u306B\\u4EE3\\u3048\\u304C\\u305F\\u3044',\n    '\\u30B2\\u30FC\\u30E0\\u5185\\u306E\\u30B9\\u30AF\\u30EA\\u30FC\\u30F3\\u30B7\\u30E7\\u30C3\\u30C8\\u3092\\u64AE\\u308A\\u3059\\u304E\\u3066\\u30B9\\u30C8\\u30EC\\u30FC\\u30B8\\u304C\\u5168\\u90E8\\u305D\\u308C\\u306B\\u306A\\u3063\\u305F',\n    '\\u96EA\\u306E\\u65E5\\u306F\\u5BB6\\u3067\\u30B2\\u30FC\\u30E0\\u3059\\u308B\\u306E\\u304C\\u6700\\u9AD8\\u3068\\u3044\\u3046\\u9244\\u677F\\u306E\\u6CD5\\u5247',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30A8\\u30F3\\u30C7\\u30A3\\u30F3\\u30B0\\u3067\\u6CE3\\u3044\\u305F\\u3053\\u3068\\u3092\\u5BDD\\u308B\\u524D\\u306B\\u601D\\u3044\\u51FA\\u3057\\u3066\\u307E\\u305F\\u6CE3\\u3044\\u305F',\n    '\\u30AC\\u30C1\\u30E3\\u7206\\u6B7B\\u3057\\u305F\\u3002\\u8CA1\\u5E03\\u306B\\u512A\\u3057\\u304F\\u3057\\u3066\\u3044\\u305F\\u306E\\u306B\\u306A\\u305C\\u3053\\u3046\\u306A\\u3063\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u4E16\\u754C\\u89B3\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u5C0F\\u8AAC\\u306B\\u306A\\u3063\\u3066\\u307B\\u3057\\u3044\\u3068\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u304C\\u4E0A\\u624B\\u3044\\u4EBA\\u306F\\u306A\\u305C\\u304B\\u4ED5\\u4E8B\\u3082\\u3067\\u304D\\u308B\\u6C17\\u304C\\u3057\\u3066\\u3044\\u308B\\u3002\\u6839\\u62E0\\u306F\\u306A\\u3044\\u3051\\u3069',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u4E16\\u754C\\u89B3\\u306B\\u5F15\\u304D\\u8FBC\\u307E\\u308C\\u3059\\u304E\\u3066\\u73FE\\u5B9F\\u306B\\u623B\\u308B\\u306E\\u306B\\u6642\\u9593\\u304C\\u304B\\u304B\\u3063\\u305F',\n    '\\u30AA\\u30F3\\u30E9\\u30A4\\u30F3\\u3067\\u521D\\u5BFE\\u9762\\u306E\\u4EBA\\u3068\\u5354\\u529B\\u3057\\u3066\\u30AF\\u30EA\\u30A2\\u3057\\u305F\\u9054\\u6210\\u611F\\u306F\\u7279\\u5225',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u96E3\\u3057\\u3044\\u30DC\\u30B9\\u3092\\u5012\\u3057\\u305F\\u77AC\\u9593\\u304C\\u4EBA\\u751F\\u3067\\u4E00\\u756A\\u30C6\\u30F3\\u30B7\\u30E7\\u30F3\\u304C\\u4E0A\\u304C\\u308B\\u6642',\n    '\\u5B50\\u4F9B\\u306E\\u9803\\u306B\\u30AF\\u30EA\\u30A2\\u3067\\u304D\\u306A\\u304B\\u3063\\u305F\\u30B2\\u30FC\\u30E0\\u3092\\u5927\\u4EBA\\u306B\\u306A\\u3063\\u3066\\u653B\\u7565\\u3057\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u306EBGM\\u3092\\u8074\\u304F\\u3060\\u3051\\u3067\\u5F53\\u6642\\u306E\\u30EF\\u30AF\\u30EF\\u30AF\\u611F\\u304C\\u8607\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u3067\\u57F9\\u3063\\u305F\\u6226\\u7565\\u7684\\u601D\\u8003\\u304C\\u5B9F\\u751F\\u6D3B\\u3067\\u5F79\\u7ACB\\u3063\\u3066\\u3044\\u308B\\u3068\\u5B9F\\u611F\\u3059\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30AD\\u30E3\\u30E9\\u30AF\\u30BF\\u30FC\\u306E\\u6210\\u9577\\u306B\\u81EA\\u5206\\u306E\\u6210\\u9577\\u3092\\u91CD\\u306D\\u3066\\u3057\\u307E\\u3046',\n    '\\u30B7\\u30EA\\u30FC\\u30BA\\u6700\\u65B0\\u4F5C\\u304C\\u51FA\\u308B\\u305F\\u3073\\u306B\\u30B7\\u30EA\\u30FC\\u30BA\\u5168\\u4F5C\\u3084\\u308A\\u76F4\\u3057\\u305F\\u304F\\u306A\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u3067\\u5931\\u6557\\u3092\\u7E70\\u308A\\u8FD4\\u3057\\u306A\\u304C\\u3089\\u4E0A\\u9054\\u3059\\u308B\\u904E\\u7A0B\\u304C\\u697D\\u3057\\u3044',\n    '\\u30A4\\u30F3\\u30C7\\u30A3\\u30FC\\u30B2\\u30FC\\u30E0\\u306E\\u500B\\u6027\\u7684\\u306A\\u30A2\\u30A4\\u30C7\\u30A2\\u306B\\u5927\\u624B\\u30B9\\u30BF\\u30B8\\u30AA\\u304C\\u53CA\\u3070\\u306A\\u3044\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u5B9F\\u6CC1\\u8005\\u306E\\u53CD\\u5FDC\\u3092\\u898B\\u3066\\u304B\\u3089\\u81EA\\u5206\\u3067\\u30D7\\u30EC\\u30A4\\u3059\\u308B\\u3068\\u697D\\u3057\\u3055\\u304C\\u500D\\u306B\\u306A\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30E9\\u30B9\\u30DC\\u30B9\\u3092\\u5012\\u3057\\u305F\\u5F8C\\u306E\\u9054\\u6210\\u611F\\u3068\\u55AA\\u5931\\u611F\\u304C\\u540C\\u6642\\u306B\\u304F\\u308B',\n    '\\u4E00\\u5468\\u76EE\\u306F\\u653B\\u7565\\u30B5\\u30A4\\u30C8\\u3092\\u898B\\u306A\\u3044\\u3067\\u30D7\\u30EC\\u30A4\\u3059\\u308B\\u3068\\u3044\\u3046\\u30DE\\u30A4\\u30EB\\u30FC\\u30EB\\u3092\\u5B88\\u308A\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u8A2D\\u5B9A\\u8CC7\\u6599\\u96C6\\u3092\\u8AAD\\u3080\\u306E\\u304C\\u6620\\u753B\\u306E\\u30E1\\u30A4\\u30AD\\u30F3\\u30B0\\u3092\\u898B\\u308B\\u3088\\u308A\\u597D\\u304D\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u30B2\\u30FC\\u30E0\\u30AD\\u30E3\\u30E9\\u306E\\u8A95\\u751F\\u65E5\\u3092\\u3061\\u3083\\u3093\\u3068\\u899A\\u3048\\u3066\\u3044\\u308B\\u81EA\\u5206\\u306E\\u8133\\u306E\\u512A\\u5148\\u9806\\u4F4D',\n    '\\u30B2\\u30FC\\u30E0\\u304C\\u82E6\\u624B\\u306A\\u4EBA\\u306B\\u597D\\u304D\\u306A\\u4F5C\\u54C1\\u3092\\u5E03\\u6559\\u3057\\u3066\\u4E00\\u7DD2\\u306B\\u697D\\u3057\\u307F\\u305F\\u3044\\u6C17\\u6301\\u3061',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u767A\\u58F2\\u65E5\\u306B\\u6709\\u7D66\\u3092\\u53D6\\u308B\\u3053\\u3068\\u306B\\u7F6A\\u60AA\\u611F\\u304C\\u306A\\u3044',\n    '\\u6700\\u8FD1\\u306E\\u30B2\\u30FC\\u30E0\\u3088\\u308A\\u6614\\u306E\\u540D\\u4F5C\\u306E\\u65B9\\u304C\\u904A\\u3073\\u7D9A\\u3051\\u3066\\u3057\\u307E\\u3046\\u306E\\u306F\\u306A\\u305C',\n    '\\u30B2\\u30FC\\u30E0\\u3067\\u77E5\\u308A\\u5408\\u3063\\u305F\\u53CB\\u9054\\u304C\\u4EBA\\u751F\\u306E\\u53CB\\u306B\\u306A\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30A8\\u30F3\\u30C7\\u30A3\\u30F3\\u30B0\\u5F8C\\u306B\\u30B9\\u30BF\\u30C3\\u30D5\\u30ED\\u30FC\\u30EB\\u3092\\u6700\\u5F8C\\u307E\\u3067\\u898B\\u308B\\u306E\\u306F\\u793C\\u5100',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u97F3\\u697D\\u304C\\u306A\\u3051\\u308C\\u3070\\u534A\\u5206\\u3082\\u611F\\u52D5\\u3067\\u304D\\u306A\\u304B\\u3063\\u305F\\u3068\\u601D\\u3046\\u4F5C\\u54C1\\u304C\\u3042\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u30AD\\u30E3\\u30E9\\u306B\\u611F\\u60C5\\u79FB\\u5165\\u3057\\u3059\\u304E\\u3066\\u30D0\\u30C3\\u30C9\\u30A8\\u30F3\\u30C9\\u3092\\u4F55\\u5EA6\\u3082\\u56DE\\u907F\\u3057\\u3066\\u3057\\u307E\\u3046',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30B9\\u30C8\\u30FC\\u30EA\\u30FC\\u304C\\u6620\\u753B\\u3088\\u308A\\u611F\\u52D5\\u7684\\u306A\\u3053\\u3068\\u304C\\u3042\\u308B\\u6642\\u4EE3\\u306B\\u306A\\u3063\\u305F',\n    '\\u9031\\u672B\\u306E\\u30B2\\u30FC\\u30E0\\u6642\\u9593\\u306E\\u305F\\u3081\\u306B\\u5E73\\u65E5\\u3092\\u9811\\u5F35\\u308C\\u3066\\u3044\\u308B\\u306E\\u306F\\u4E8B\\u5B9F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u64CD\\u4F5C\\u3092\\u899A\\u3048\\u308B\\u901F\\u3055\\u304C\\u82E5\\u3044\\u9803\\u3088\\u308A\\u9045\\u304F\\u306A\\u3063\\u3066\\u3044\\u308B\\u81EA\\u899A\\u304C\\u3042\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u4E16\\u754C\\u89B3\\u3092\\u73FE\\u5B9F\\u306B\\u6301\\u3061\\u8FBC\\u307F\\u305F\\u3044\\u6B32\\u6C42\\u306F\\u8AB0\\u3067\\u3082\\u4E00\\u5EA6\\u306F\\u6301\\u3064\\u306F\\u305A',\n    '\\u30B2\\u30FC\\u30E0\\u3067\\u5B66\\u3093\\u3060\\u30C1\\u30FC\\u30E0\\u30EF\\u30FC\\u30AF\\u306F\\u5B9F\\u969B\\u306E\\u4ED5\\u4E8B\\u3067\\u3082\\u6D3B\\u304D\\u3066\\u3044\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306F\\u73FE\\u5B9F\\u306E\\u7DF4\\u7FD2\\u5834\\u3067\\u3082\\u3042\\u308B\\u3068\\u672C\\u6C17\\u3067\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u304A\\u6C17\\u306B\\u5165\\u308A\\u306E\\u30B2\\u30FC\\u30E0\\u3092\\u53CB\\u4EBA\\u306B\\u5E03\\u6559\\u3057\\u3066\\u4E00\\u7DD2\\u306B\\u697D\\u3057\\u3081\\u305F\\u6642\\u306E\\u5E78\\u798F\\u611F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u4E16\\u754C\\u304C\\u8C4A\\u304B\\u3059\\u304E\\u3066\\u73FE\\u5B9F\\u304C\\u7269\\u8DB3\\u308A\\u306A\\u304F\\u611F\\u3058\\u308B\\u77AC\\u9593\\u304C\\u3042\\u308B',\n    '\\u5B50\\u4F9B\\u306E\\u9803\\u61A7\\u308C\\u3060\\u3063\\u305F\\u30B2\\u30FC\\u30E0\\u30AF\\u30EA\\u30A8\\u30A4\\u30BF\\u30FC\\u306B\\u306A\\u308A\\u305F\\u304B\\u3063\\u305F\\u5922\\u3092\\u4ECA\\u3067\\u3082\\u6301\\u3063\\u3066\\u3044\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30A2\\u30C3\\u30D7\\u30C7\\u30FC\\u30C8\\u3067\\u6539\\u5584\\u3055\\u308C\\u305F\\u30B7\\u30B9\\u30C6\\u30E0\\u306B\\u611F\\u8B1D\\u3059\\u308B\\u65E5\\u304C\\u5897\\u3048\\u305F',\n    '\\u5EC3\\u8AB2\\u91D1\\u3059\\u308B\\u6C17\\u306F\\u306A\\u3044\\u304C\\u6708\\u6570\\u5343\\u5186\\u306F\\u5168\\u7136\\u3044\\u3044\\u3068\\u601D\\u3048\\u308B\\u30B2\\u30FC\\u30E0\\u306B\\u51FA\\u4F1A\\u3048\\u305F',\n    '\\u30B2\\u30FC\\u30E0\\u30B3\\u30F3\\u30C8\\u30ED\\u30FC\\u30E9\\u30FC\\u306E\\u611F\\u89E6\\u304C\\u624B\\u306B\\u99B4\\u67D3\\u3093\\u3060\\u6642\\u306E\\u5B89\\u5FC3\\u611F',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u96E3\\u6613\\u5EA6\\u8A2D\\u5B9A\\u3067\\u81EA\\u5206\\u306E\\u4ECA\\u65E5\\u306E\\u30B3\\u30F3\\u30C7\\u30A3\\u30B7\\u30E7\\u30F3\\u304C\\u5206\\u304B\\u308B',\n    '\\u597D\\u304D\\u306A\\u30B2\\u30FC\\u30E0\\u306E\\u8A71\\u984C\\u306B\\u306A\\u308B\\u3068\\u5225\\u4EBA\\u306E\\u3088\\u3046\\u306B\\u8A9E\\u308A\\u51FA\\u3059\\u81EA\\u899A\\u304C\\u3042\\u308B',\n    '\\u30B2\\u30FC\\u30E0\\u3067\\u611F\\u60C5\\u79FB\\u5165\\u3057\\u305F\\u30AD\\u30E3\\u30E9\\u304C\\u6B7B\\u306C\\u5834\\u9762\\u306F\\u73FE\\u5B9F\\u306E\\u60B2\\u3057\\u307F\\u3068\\u540C\\u3058\\u304F\\u3089\\u3044\\u8F9B\\u3044',\n    '\\u30B2\\u30FC\\u30E0\\u306B\\u8CBB\\u3084\\u3057\\u305F\\u6642\\u9593\\u3092\\u5F8C\\u6094\\u3057\\u305F\\u3053\\u3068\\u304C\\u4E00\\u5EA6\\u3082\\u306A\\u3044\\u306E\\u304C\\u7B54\\u3048\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u30B2\\u30FC\\u30E0\\u306E\\u30BB\\u30FC\\u30D6\\u30DD\\u30A4\\u30F3\\u30C8\\u304C\\u4EBA\\u751F\\u306B\\u3082\\u3042\\u308C\\u3070\\u3068\\u601D\\u3063\\u305F\\u8A66\\u7DF4\\u306E\\u6642'\n  ],\n  '\\u6599\\u7406': [\n    '\\u4ECA\\u65E5\\u521D\\u3081\\u3066\\u30AB\\u30EB\\u30DC\\u30CA\\u30FC\\u30E9\\u3092\\u4F5C\\u3063\\u305F\\u3002\\u30C1\\u30FC\\u30BA\\u304C\\u3068\\u308D\\u3068\\u308D\\u3067\\u7F8E\\u5473\\u3057\\u3059\\u304E\\u3066\\u611F\\u52D5\\u3057\\u305F',\n    '\\u30EC\\u30B7\\u30D4\\u901A\\u308A\\u306B\\u4F5C\\u3063\\u305F\\u306E\\u306B\\u306A\\u305C\\u304B\\u540C\\u3058\\u5473\\u306B\\u306A\\u3089\\u306A\\u3044\\u3002\\u8ABF\\u7406\\u306E\\u30D7\\u30ED\\u3063\\u3066\\u3059\\u3054\\u3044',\n    '\\u30A4\\u30F3\\u30B9\\u30BF\\u306E\\u6599\\u7406\\u753B\\u50CF\\u3092\\u898B\\u3066\\u3044\\u305F\\u3089\\u30AB\\u30ED\\u30EA\\u30FC\\u8D85\\u904E\\u3057\\u305F\\u3002\\u8996\\u899A\\u6E80\\u8DB3\\u3063\\u3066\\u3053\\u308C\\u304B',\n    '\\u30BF\\u30A4\\u30DF\\u30F3\\u30B0\\u3088\\u304F\\u5168\\u90E8\\u306E\\u6599\\u7406\\u304C\\u30C6\\u30FC\\u30D6\\u30EB\\u306B\\u4E26\\u3093\\u3060\\u6642\\u306E\\u9054\\u6210\\u611F\\u306F\\u6700\\u9AD8',\n    '\\u30B9\\u30D1\\u30A4\\u30B9\\u306E\\u9999\\u308A\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u30A8\\u30B9\\u30CB\\u30C3\\u30AF\\u6599\\u7406\\u306B\\u306F\\u307E\\u3063\\u3066\\u3044\\u308B',\n    '\\u5305\\u4E01\\u30B9\\u30AD\\u30EB\\u3092\\u78E8\\u3044\\u305F\\u3089\\u6599\\u7406\\u304C\\u697D\\u3057\\u304F\\u306A\\u3063\\u3066\\u304D\\u305F',\n    '\\u305D\\u3089\\u8C46\\u8150\\u3092\\u81EA\\u5206\\u3067\\u4F5C\\u308B\\u3068\\u3053\\u3093\\u306A\\u306B\\u9055\\u3046\\u306E\\u304B\\u3068\\u611F\\u52D5\\u3057\\u305F\\u3002\\u8CB7\\u308F\\u306A\\u304F\\u3066\\u3088\\u304B\\u3063\\u305F',\n    '\\u5E02\\u5834\\u306E\\u304A\\u3058\\u3055\\u3093\\u306B\\u30D1\\u30B9\\u30BF\\u306E\\u8339\\u3067\\u65B9\\u3092\\u6559\\u3048\\u3066\\u3082\\u3089\\u3063\\u305F\\u3002\\u4EBA\\u306E\\u7E01\\u304C\\u5927\\u5207\\u3060\\u3068\\u601D\\u3063\\u305F',\n    '\\u30A8\\u30A2\\u30D5\\u30E9\\u30A4\\u3092\\u8CFC\\u5165\\u3057\\u305F\\u3089\\u6599\\u7406\\u304C\\u697D\\u3057\\u304F\\u306A\\u308A\\u3059\\u304E\\u3066\\u6BCE\\u65E5\\u6599\\u7406\\u3057\\u3066\\u3044\\u308B',\n    '\\u8D85\\u76EE\\u7389\\u713C\\u304D\\u3092\\u4F5C\\u3063\\u305F\\u3089\\u9EC4\\u8EAB\\u304C\\u3068\\u308D\\u3068\\u308D\\u306B\\u306A\\u3063\\u3066\\u6210\\u529F\\u3002\\u30C6\\u30F3\\u30B7\\u30E7\\u30F3\\u304C\\u4E0A\\u304C\\u3063\\u305F',\n    '\\u9752\\u83DC\\u306B\\u4F59\\u3063\\u305F\\u91CE\\u83DC\\u3092\\u30A4\\u30BF\\u30EA\\u30A2\\u30F3\\u306B\\u4ED5\\u4E0A\\u3052\\u308B\\u6280\\u8853\\u304C\\u8EAB\\u306B\\u3064\\u3044\\u305F',\n    '\\u597D\\u304D\\u306A\\u30EC\\u30B9\\u30C8\\u30E9\\u30F3\\u306E\\u5473\\u3092\\u8AD6\\u7406\\u7684\\u306B\\u5206\\u6790\\u3057\\u3066\\u518D\\u73FE\\u3057\\u3088\\u3046\\u3068\\u3059\\u308B\\u7656\\u304C\\u3042\\u308B',\n    '\\u9AD8\\u6821\\u4EE5\\u6765\\u305A\\u3063\\u3068\\u4F5C\\u308A\\u7D9A\\u3051\\u3066\\u3044\\u308B\\u307F\\u305D\\u6C41\\u3092\\u5931\\u6557\\u3057\\u305F\\u3053\\u3068\\u304C\\u4E00\\u5EA6\\u3082\\u306A\\u3044',\n    '\\u304A\\u306B\\u304E\\u308A\\u306E\\u5177\\u6750\\u3092\\u6642\\u9593\\u3092\\u304B\\u3051\\u3066\\u9078\\u3093\\u3067\\u3044\\u308B\\u3002\\u305D\\u308C\\u304C\\u5E78\\u798F',\n    '\\u8ABF\\u7406\\u306F\\u5316\\u5B66\\u3060\\u3068\\u8A00\\u3046\\u4EBA\\u306E\\u610F\\u5473\\u304C\\u3084\\u3063\\u3068\\u308F\\u304B\\u3063\\u305F',\n    '\\u6599\\u7406\\u914D\\u4FE1\\u3092\\u898B\\u306A\\u304C\\u3089\\u98DF\\u3079\\u308B\\u306E\\u304C\\u81F3\\u798F\\u306E\\u6642\\u9593',\n    '\\u7BC0\\u7D04\\u98DF\\u6750\\u3067\\u4F5C\\u3063\\u305F\\u306E\\u306B\\u601D\\u3044\\u304C\\u3051\\u305A\\u7F8E\\u5473\\u3057\\u3044\\u3082\\u306E\\u304C\\u3067\\u304D\\u308B\\u559C\\u3073',\n    '\\u9B5A\\u306E\\u634C\\u304D\\u65B9\\u3092YouTube\\u3067\\u5B66\\u3093\\u3060\\u3089\\u6599\\u7406\\u306E\\u5E45\\u304C\\u5E83\\u304C\\u3063\\u305F',\n    '\\u7D99\\u7D9A\\u7684\\u306B\\u4F5C\\u308A\\u7D9A\\u3051\\u3066\\u3044\\u308B\\u6599\\u7406\\u304C\\u3084\\u3063\\u3068\\u304A\\u5E97\\u306E\\u5473\\u306B\\u8FD1\\u3065\\u3044\\u3066\\u304D\\u305F',\n    '\\u97F3\\u697D\\u3092\\u8074\\u304D\\u306A\\u304C\\u3089\\u6599\\u7406\\u3059\\u308B\\u6642\\u9593\\u3068\\u305D\\u3046\\u3067\\u306A\\u3044\\u6642\\u9593\\u3067\\u306F\\u5168\\u7136\\u9055\\u3046',\n    '\\u8CA0\\u3051\\u3066\\u308F\\u304B\\u3063\\u3066\\u308B\\u30C0\\u30A4\\u30A8\\u30C3\\u30C8\\u4E2D\\u306B\\u304A\\u3044\\u3057\\u305D\\u3046\\u306A\\u6599\\u7406\\u306E\\u5199\\u771F\\u3092\\u898B\\u3066\\u3057\\u307E\\u3063\\u305F',\n    '\\u98DF\\u3079\\u308B\\u3053\\u3068\\u304C\\u597D\\u304D\\u306A\\u4EBA\\u3068\\u4F5C\\u308B\\u3053\\u3068\\u304C\\u597D\\u304D\\u306A\\u4EBA\\u3067\\u306F\\u6599\\u7406\\u3078\\u306E\\u5411\\u304D\\u5408\\u3044\\u65B9\\u304C\\u9055\\u3046',\n    '\\u65EC\\u306E\\u98DF\\u6750\\u3092\\u4F7F\\u3063\\u305F\\u6599\\u7406\\u304C\\u4E00\\u756A\\u7F8E\\u5473\\u3057\\u3044\\u3068\\u5B9F\\u611F\\u3057\\u305F',\n    '\\u4F59\\u308A\\u7269\\u3067\\u3067\\u304D\\u305F\\u5373\\u8208\\u6599\\u7406\\u304C\\u306A\\u305C\\u304B\\u4E00\\u756A\\u7F8E\\u5473\\u3057\\u3044',\n    '\\u591C\\u4E2D\\u306B\\u6599\\u7406\\u3092\\u3059\\u308B\\u3068\\u671D\\u304C\\u6765\\u308B\\u306E\\u304C\\u308F\\u304B\\u3063\\u3066\\u3044\\u3066\\u3082\\u3084\\u3081\\u3089\\u308C\\u306A\\u3044',\n    '\\u6599\\u7406\\u306E\\u5931\\u6557\\u304B\\u3089\\u5B66\\u3076\\u3053\\u3068\\u306E\\u65B9\\u304C\\u6210\\u529F\\u3088\\u308A\\u591A\\u3044\\u6C17\\u304C\\u3057\\u3066\\u3044\\u308B',\n    '\\u304A\\u6C17\\u306B\\u5165\\u308A\\u306E\\u8ABF\\u5473\\u6599\\u3092\\u898B\\u3064\\u3051\\u305F\\u6642\\u306E\\u559C\\u3073\\u306F\\u683C\\u5225',\n    '\\u76DB\\u308A\\u4ED8\\u3051\\u3092\\u5DE5\\u592B\\u3057\\u305F\\u3089\\u5BB6\\u65CF\\u306E\\u53CD\\u5FDC\\u304C\\u5168\\u7136\\u9055\\u3063\\u305F',\n    '\\u304A\\u5F01\\u5F53\\u3092\\u4F5C\\u308B\\u7FD2\\u6163\\u304C\\u3064\\u3044\\u3066\\u304B\\u3089\\u98DF\\u3078\\u306E\\u610F\\u8B58\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u6599\\u7406\\u3092\\u4F5C\\u308B\\u5074\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u5916\\u98DF\\u306E\\u4FA1\\u5024\\u89B3\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u51B7\\u8535\\u5EAB\\u306E\\u6B8B\\u308A\\u7269\\u3067\\u306A\\u3093\\u3068\\u304B\\u4E00\\u54C1\\u4F5C\\u308C\\u305F\\u6642\\u306E\\u9054\\u6210\\u611F',\n    '\\u6599\\u7406\\u3057\\u3066\\u3044\\u308B\\u6642\\u9593\\u306F\\u96D1\\u5FF5\\u304C\\u6D88\\u3048\\u3066\\u552F\\u4E00\\u7121\\u5FC3\\u306B\\u306A\\u308C\\u308B\\u6642\\u9593',\n    '\\u5931\\u6557\\u3057\\u305F\\u6599\\u7406\\u3067\\u3082\\u81EA\\u5206\\u3067\\u4F5C\\u3063\\u305F\\u3082\\u306E\\u304C\\u4E00\\u756A\\u7F8E\\u5473\\u3057\\u304F\\u611F\\u3058\\u308B\\u8B0E',\n    '\\u30EC\\u30B7\\u30D4\\u3092\\u899A\\u3048\\u305F\\u3089\\u6B21\\u306F\\u5206\\u91CF\\u3092\\u611F\\u899A\\u3067\\u4F5C\\u308C\\u308B\\u3088\\u3046\\u306B\\u306A\\u308A\\u305F\\u3044',\n    '\\u6599\\u7406\\u4E0A\\u624B\\u306A\\u4EBA\\u306E\\u624B\\u969B\\u306E\\u826F\\u3055\\u3092\\u898B\\u3066\\u3044\\u308B\\u3060\\u3051\\u3067\\u5E78\\u305B\\u306A\\u6C17\\u6301\\u3061\\u306B\\u306A\\u308B',\n    '\\u6599\\u7406\\u4E2D\\u306E\\u826F\\u3044\\u9999\\u308A\\u304C\\u5BB6\\u5168\\u4F53\\u306B\\u5E83\\u304C\\u308B\\u77AC\\u9593\\u304C\\u597D\\u304D',\n    '\\u98DF\\u3079\\u308B\\u4EBA\\u306E\\u9854\\u3092\\u601D\\u3044\\u6D6E\\u304B\\u3079\\u306A\\u304C\\u3089\\u6599\\u7406\\u3059\\u308B\\u3068\\u3055\\u3089\\u306B\\u7F8E\\u5473\\u3057\\u304F\\u306A\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u65EC\\u306E\\u98DF\\u6750\\u3092\\u4F7F\\u3063\\u305F\\u6599\\u7406\\u306E\\u7F8E\\u5473\\u3057\\u3055\\u306B\\u5B63\\u7BC0\\u611F\\u3092\\u611F\\u3058\\u308B',\n    '\\u65B0\\u3057\\u3044\\u8ABF\\u5473\\u6599\\u3092\\u8A66\\u3057\\u3066\\u4E16\\u754C\\u304C\\u5E83\\u304C\\u3063\\u305F\\u3068\\u611F\\u3058\\u305F\\u4F53\\u9A13',\n    '\\u5BB6\\u65CF\\u306E\\u30EA\\u30AF\\u30A8\\u30B9\\u30C8\\u6599\\u7406\\u3092\\u4F5C\\u308C\\u305F\\u6642\\u306E\\u6E80\\u8DB3\\u611F\\u306F\\u683C\\u5225',\n    '\\u6599\\u7406\\u306F\\u6BCE\\u65E5\\u306E\\u7FA9\\u52D9\\u3058\\u3083\\u306A\\u304F\\u3066\\u5275\\u9020\\u306E\\u6642\\u9593\\u3060\\u3068\\u601D\\u3044\\u59CB\\u3081\\u3066\\u304B\\u3089\\u697D\\u3057\\u304F\\u306A\\u3063\\u305F',\n    '\\u6599\\u7406\\u756A\\u7D44\\u3092\\u898B\\u308B\\u3060\\u3051\\u3067\\u4F5C\\u3063\\u305F\\u6C17\\u306B\\u306A\\u3063\\u3066\\u3057\\u307E\\u3046\\u8B0E\\u306E\\u6E80\\u8DB3\\u611F',\n    '\\u5E02\\u8CA9\\u306E\\u6599\\u7406\\u30AD\\u30C3\\u30C8\\u306B\\u7F6A\\u60AA\\u611F\\u3092\\u611F\\u3058\\u308B\\u6C17\\u6301\\u3061\\u3068\\u4FBF\\u5229\\u3055\\u306E\\u845B\\u85E4',\n    '\\u540C\\u3058\\u30EC\\u30B7\\u30D4\\u3067\\u3082\\u5FAE\\u5999\\u306B\\u9055\\u3046\\u6BCE\\u56DE\\u306E\\u5473\\u304C\\u624B\\u4F5C\\u308A\\u306E\\u826F\\u3055\\u3060\\u3068\\u601D\\u3046',\n    '\\u6599\\u7406\\u306E\\u30B3\\u30C4\\u3092\\u5B66\\u3076\\u307B\\u3069\\u6599\\u7406\\u306E\\u5965\\u6DF1\\u3055\\u306B\\u9A5A\\u304F\\u65E5\\u3005',\n    '\\u98DF\\u6750\\u306E\\u4E0B\\u51E6\\u7406\\u304C\\u5B9F\\u306F\\u6599\\u7406\\u306E8\\u5272\\u3092\\u6C7A\\u3081\\u308B\\u3068\\u77E5\\u3063\\u3066\\u304B\\u3089\\u5909\\u308F\\u3063\\u305F',\n    '\\u6599\\u7406\\u306E\\u5DE5\\u7A0B\\u3092\\u8AAC\\u660E\\u3067\\u304D\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u683C\\u6BB5\\u306B\\u4E0A\\u624B\\u304F\\u306A\\u3063\\u305F',\n    '\\u597D\\u304D\\u306A\\u6599\\u7406\\u4EBA\\u306EYouTube\\u3092\\u898B\\u3066\\u3044\\u305F\\u3089\\u6599\\u7406\\u54F2\\u5B66\\u307E\\u3067\\u5B66\\u3093\\u3067\\u3044\\u305F',\n    '\\u540C\\u3058\\u98DF\\u6750\\u3067\\u3082\\u5207\\u308A\\u65B9\\u4E00\\u3064\\u3067\\u98DF\\u611F\\u304C\\u5909\\u308F\\u308B\\u767A\\u898B\\u306F\\u4F55\\u5EA6\\u3057\\u3066\\u3082\\u9762\\u767D\\u3044',\n    '\\u6599\\u7406\\u3092\\u4EBA\\u306B\\u632F\\u308B\\u821E\\u3048\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u4EBA\\u9593\\u95A2\\u4FC2\\u304C\\u8C4A\\u304B\\u306B\\u306A\\u3063\\u305F',\n    '\\u98DF\\u4E8B\\u306E\\u6642\\u9593\\u3092\\u5927\\u5207\\u306B\\u3059\\u308B\\u3068\\u4EBA\\u751F\\u5168\\u4F53\\u306E\\u8CEA\\u304C\\u4E0A\\u304C\\u308B\\u5B9F\\u611F\\u304C\\u3042\\u308B',\n    '\\u4F5C\\u308B\\u306E\\u304C\\u9762\\u5012\\u306A\\u6599\\u7406\\u307B\\u3069\\u98DF\\u3079\\u305F\\u6642\\u306E\\u6E80\\u8DB3\\u611F\\u304C\\u9AD8\\u3044\\u6CD5\\u5247',\n    '\\u6599\\u7406\\u3092\\u697D\\u3057\\u3080\\u30B3\\u30C4\\u306F\\u5B8C\\u74A7\\u3092\\u6C42\\u3081\\u306A\\u3044\\u3053\\u3068\\u3060\\u3068\\u6C17\\u3065\\u304F\\u306E\\u306B\\u6642\\u9593\\u304C\\u304B\\u304B\\u3063\\u305F',\n    '\\u6804\\u990A\\u30D0\\u30E9\\u30F3\\u30B9\\u3092\\u610F\\u8B58\\u3057\\u59CB\\u3081\\u3066\\u304B\\u3089\\u4F53\\u306E\\u8ABF\\u5B50\\u304C\\u5909\\u308F\\u3063\\u3066\\u304D\\u305F',\n    '\\u6599\\u7406\\u306E\\u77E5\\u8B58\\u304C\\u5897\\u3048\\u308B\\u3068\\u5916\\u98DF\\u3067\\u30B7\\u30A7\\u30D5\\u306E\\u8155\\u304C\\u898B\\u3048\\u3066\\u304F\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u98DF\\u6750\\u3092\\u5927\\u5207\\u306B\\u4F7F\\u3044\\u5207\\u308B\\u6599\\u7406\\u304C\\u7FD2\\u6163\\u306B\\u306A\\u3063\\u305F\\u3089\\u98DF\\u8CBB\\u304C\\u6E1B\\u3063\\u305F',\n    '\\u6599\\u7406\\u3092\\u30AE\\u30D5\\u30C8\\u3068\\u3057\\u3066\\u6E21\\u305B\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u4EBA\\u9593\\u95A2\\u4FC2\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u4F5C\\u308C\\u308B\\u6599\\u7406\\u304C\\u5897\\u3048\\u308B\\u305F\\u3073\\u306B\\u5C11\\u3057\\u81EA\\u4FE1\\u304C\\u3064\\u304F\\u4E0D\\u601D\\u8B70\\u306A\\u4F53\\u9A13',\n    '\\u6599\\u7406\\u306B\\u306F\\u7B54\\u3048\\u304C\\u306A\\u3044\\u3002\\u305D\\u308C\\u304C\\u5275\\u9020\\u7684\\u3067\\u597D\\u304D\\u306A\\u7406\\u7531\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u4E01\\u5BE7\\u306B\\u4F5C\\u3063\\u305F\\u6599\\u7406\\u3092\\u7F8E\\u5473\\u3057\\u305D\\u3046\\u306B\\u98DF\\u3079\\u3066\\u3082\\u3089\\u3048\\u305F\\u6642\\u304C\\u4E00\\u756A\\u5B09\\u3057\\u3044',\n    '\\u6599\\u7406\\u306E\\u8155\\u3088\\u308A\\u9078\\u6750\\u306E\\u76EE\\u304C\\u4E0A\\u304C\\u3063\\u3066\\u304D\\u305F\\u65B9\\u304C\\u9577\\u304F\\u7D9A\\u3051\\u3089\\u308C\\u308B',\n    '\\u540C\\u3058\\u7A7A\\u9593\\u3067\\u6599\\u7406\\u3057\\u306A\\u304C\\u3089\\u8A71\\u3059\\u6642\\u9593\\u304C\\u4E00\\u756A\\u81EA\\u7136\\u306B\\u8A9E\\u308C\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u6599\\u7406\\u306E\\u30EC\\u30D1\\u30FC\\u30C8\\u30EA\\u30FC\\u304C\\u5897\\u3048\\u308B\\u307B\\u3069\\u65E5\\u5E38\\u304C\\u8C4A\\u304B\\u306B\\u306A\\u3063\\u3066\\u3044\\u304F',\n    '\\u98DF\\u3079\\u7269\\u3078\\u306E\\u611F\\u8B1D\\u304C\\u6599\\u7406\\u3092\\u3059\\u308B\\u3053\\u3068\\u3067\\u6DF1\\u307E\\u3063\\u305F',\n    '\\u6599\\u7406\\u3057\\u306A\\u304C\\u3089\\u8074\\u304F\\u97F3\\u697D\\u306E\\u30D7\\u30EC\\u30A4\\u30EA\\u30B9\\u30C8\\u304C\\u3042\\u3063\\u3066\\u81F3\\u798F\\u306E\\u6642\\u9593\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u6599\\u7406\\u306F\\u611B\\u60C5\\u8868\\u73FE\\u306E\\u4E00\\u3064\\u3060\\u3068\\u601D\\u3046\\u3002\\u7F8E\\u5473\\u3057\\u3044\\u3068\\u8A00\\u308F\\u308C\\u308B\\u305F\\u3073\\u306B\\u5B9F\\u611F\\u3059\\u308B',\n    '\\u6599\\u7406\\u5931\\u6557\\u3057\\u305F\\u65E5\\u307B\\u3069\\u306A\\u305C\\u304B\\u6B21\\u3078\\u306E\\u610F\\u6B32\\u304C\\u6E67\\u304F\\u4E0D\\u601D\\u8B70',\n    '\\u6599\\u7406\\u3092\\u901A\\u3058\\u3066\\u6587\\u5316\\u306E\\u9055\\u3044\\u3084\\u6B74\\u53F2\\u3092\\u611F\\u3058\\u308B\\u3053\\u3068\\u304C\\u3067\\u304D\\u308B'\n  ],\n  '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC': [\n    'AI\\u304C\\u66F8\\u3044\\u305F\\u30B3\\u30FC\\u30C9\\u3092AI\\u306B\\u30EC\\u30D3\\u30E5\\u30FC\\u3055\\u305B\\u308B\\u6642\\u4EE3\\u304C\\u6765\\u305F\\u3002\\u305D\\u308C\\u3067\\u3044\\u3044\\u306E\\u304B',\n    '\\u65B0\\u3057\\u3044\\u30AC\\u30B8\\u30A7\\u30C3\\u30C8\\u3092\\u8CFC\\u5165\\u3057\\u305F\\u3089\\u5148\\u5BDD\\u30EA\\u30B0\\u308C\\u304C\\u9B45\\u529B\\u7684\\u3067\\u4EE5\\u524D\\u306E\\u6A5F\\u5668\\u306B\\u623B\\u308C\\u306A\\u304F\\u306A\\u3063\\u305F',\n    '\\u30BF\\u30A4\\u30D4\\u30F3\\u30B0\\u30B9\\u30D4\\u30FC\\u30C9\\u304C\\u4E0A\\u304C\\u3063\\u305F\\u308F\\u3051\\u3058\\u3083\\u306A\\u3044\\u3051\\u3069\\u8D85\\u96C6\\u4E2D\\u3057\\u305F\\u6642\\u306E\\u30D1\\u30D5\\u30A9\\u30FC\\u30DE\\u30F3\\u30B9\\u304C\\u597D\\u304D',\n    '\\u5C0E\\u5165\\u3057\\u305F\\u7BA1\\u7406\\u30C4\\u30FC\\u30EB\\u304C\\u9010\\u3005\\u306B\\u30AB\\u30B9\\u30BF\\u30DE\\u30A4\\u30BA\\u3055\\u308C\\u3066\\u6700\\u7D42\\u7684\\u306B\\u81EA\\u4F5C\\u306E\\u30C4\\u30FC\\u30EB\\u304C\\u5B8C\\u6210\\u3057\\u305F',\n    '\\u30AF\\u30E9\\u30A6\\u30C9\\u4FDD\\u5B58\\u306E\\u6708\\u984D\\u3092\\u78BA\\u8A8D\\u3057\\u305F\\u3089\\u60F3\\u50CF\\u4EE5\\u4E0A\\u306E\\u91D1\\u984D\\u306B\\u306A\\u3063\\u3066\\u3044\\u305F\\u3002\\u53CD\\u7701\\u3057\\u305F',\n    'VR\\u30B4\\u30FC\\u30B0\\u30EB\\u3092\\u521D\\u3081\\u3066\\u3064\\u3051\\u305F\\u3068\\u304D\\u306E\\u3042\\u306E\\u8131\\u529B\\u611F\\u3092\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u30D5\\u30A9\\u30F3\\u30C8\\u5909\\u306E\\u8A18\\u4E8B\\u3092\\u8AAD\\u3093\\u3067\\u304B\\u3089\\u81EA\\u5206\\u306E\\u4F7F\\u3063\\u3066\\u308B\\u30D5\\u30A9\\u30F3\\u30C8\\u306E\\u6B74\\u53F2\\u3092\\u793A\\u3063\\u305F',\n    '\\u30D7\\u30ED\\u30B0\\u30E9\\u30DF\\u30F3\\u30B0\\u306E\\u7279\\u5B9A\\u306E\\u30A8\\u30E9\\u30FC\\u6587\\u3092\\u76F4\\u3057\\u306A\\u304C\\u3089\\u308F\\u304B\\u3063\\u305F\\u3068\\u304D\\u306E\\u5FEB\\u611F',\n    '\\u6A5F\\u68B0\\u5B66\\u7FD2\\u306E\\u6982\\u5FF5\\u3092\\u52C9\\u5F37\\u3057\\u59CB\\u3081\\u305F\\u3089\\u305D\\u308C\\u3084\\u3063\\u3066\\u308B\\u3093\\u3060\\u3063\\u3066\\u308F\\u304B\\u308B\\u3053\\u3068\\u304C\\u6C7A\\u307E\\u3063\\u305F',\n    '\\u30D0\\u30C3\\u30C6\\u30EA\\u30FC\\u30CE\\u30FC\\u30C8\\u306E\\u4F1A\\u8B70\\u4E2D\\u306B\\u5F37\\u5236\\u585E\\u308A\\u5C40\\u9762\\u304C\\u3042\\u308A\\u3059\\u304E\\u3066\\u30E2\\u30D0\\u30A4\\u30EB\\u30D0\\u30C3\\u30C6\\u30EA\\u30FC\\u304C\\u6025\\u3092\\u8981\\u3059',\n    '\\u30E9\\u30BA\\u30D1\\u30A4\\u3067\\u81EA\\u4F5C\\u30C4\\u30FC\\u30EB\\u3092\\u4F5C\\u3063\\u305F\\u65E5\\u304B\\u3089\\u6B62\\u307E\\u3089\\u306A\\u304F\\u306A\\u3063\\u305F\\u3002\\u3053\\u308C\\u304C\\u30D5\\u30ED\\u30FC\\u72B6\\u614B',\n    '\\u30A8\\u30E9\\u30FC\\u30E1\\u30C3\\u30BB\\u30FC\\u30B8\\u3092\\u52A9\\u3051\\u306B\\u6C42\\u3081\\u305F\\u3089\\u65E2\\u306B\\u89E3\\u6C7A\\u3055\\u308C\\u3066\\u3044\\u305F\\u3002\\u898F\\u6A21\\u304C\\u5927\\u304D\\u3044\\u30A2\\u30C3\\u30D7\\u30C7\\u30FC\\u30C8\\u3060\\u3063\\u305F',\n    '\\u6280\\u8853\\u7E4B\\u304C\\u308A\\u306E\\u4EBA\\u3068\\u8A71\\u3059\\u3068\\u99D2\\u304C\\u6D88\\u3048\\u308B\\u3002\\u540C\\u3058\\u8A00\\u8A9E\\u3067\\u8A71\\u305B\\u308B\\u5B89\\u5FC3\\u611F',\n    '\\u30BF\\u30A4\\u30E0\\u30E9\\u30D7\\u30B9\\u6625\\u306E\\u4E00\\u4E16\\u4EE3\\u524D\\u306E\\u30B7\\u30EA\\u30B3\\u30F3\\u30D0\\u30EC\\u30FC\\u306E\\u6620\\u50CF\\u3092\\u898B\\u305F\\u3089\\u30AD\\u30C3\\u30AF\\u30DC\\u30FC\\u30C9\\u3060\\u3051\\u3067\\u5358\\u72EC\\u3067\\u6765\\u305F\\u6642\\u4EE3\\u3092\\u7FA8\\u3080',\n    '\\u30C8\\u30E9\\u30C3\\u30AF\\u30D1\\u30C3\\u30C9\\u3092\\u4F7F\\u3044\\u3053\\u306A\\u305B\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F\\u306E\\u3067\\u8D85\\u96C6\\u4E2D\\u3057\\u305F\\u3044\\u3002\\u6A5F\\u5668\\u30A2\\u30C3\\u30D7\\u30C7\\u30FC\\u30C8\\u306E\\u5DE7\\u5999',\n    '\\u30CF\\u30FC\\u30C9\\u30A6\\u30A7\\u30A2\\u306E\\u9032\\u5316\\u30B9\\u30D4\\u30FC\\u30C9\\u3068\\u30BD\\u30D5\\u30C8\\u30A6\\u30A7\\u30A2\\u306E\\u8907\\u96D1\\u5316\\u30B9\\u30D4\\u30FC\\u30C9\\u304C\\u30C8\\u30EC\\u30FC\\u30C9\\u30AA\\u30D5\\u3057\\u3066\\u3044\\u308B\\u306E\\u304B\\u4E0D\\u601D\\u8B70',\n    '\\u30A4\\u30F3\\u30BF\\u30FC\\u30CD\\u30C3\\u30C8\\u306E\\u30B5\\u30FC\\u30D3\\u30B9\\u306B\\u500B\\u4EBA\\u60C5\\u5831\\u3092\\u5B88\\u308B\\u306E\\u304C\\u30E9\\u30A4\\u30D5\\u30EF\\u30FC\\u30AF\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B\\u5B64\\u72FC\\u30DE\\u30F3',\n    '\\u30B3\\u30FC\\u30C9\\u30EC\\u30D3\\u30E5\\u30FC\\u306E\\u793A\\u5506\\u306B\\u5875\\u308B\\u4FFA\\u306E\\u30B9\\u30BF\\u30A4\\u30EB\\u304C\\u3069\\u3046\\u3044\\u3046\\u308F\\u3051\\u304B\\u4E00\\u5185\\u67D0\\u5E83\\u308A\\u304C\\u8A00\\u8A9E\\u5316\\u3055\\u308C\\u3066\\u3044\\u308B\\u3088\\u3046\\u306B\\u611F\\u3058\\u308B',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3092\\u5B66\\u3076\\u3053\\u3068\\u3068\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3092\\u4F7F\\u3046\\u3053\\u3068\\u306E\\u9593\\u306E\\u671B\\u3093\\u3060\\u8DDD\\u96E2\\u3092\\u57CB\\u3081\\u308B\\u65B9\\u6CD5\\u3092\\u80AF\\u6C42\\u3057\\u3066\\u3044\\u308B',\n    '\\u5F85\\u6A5F\\u6642\\u9593\\u306B\\u30C9\\u30AD\\u30E5\\u30E1\\u30F3\\u30C8\\u8AAD\\u3080\\u7FD2\\u6163\\u3092\\u4ED5\\u4E8B\\u3067\\u3082\\u751F\\u304B\\u305B\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    'API\\u8A2D\\u8A08\\u306E\\u30A8\\u30EC\\u30AC\\u30F3\\u30C8\\u3055\\u304C\\u78BA\\u304B\\u306B\\u5B58\\u5728\\u3059\\u308B\\u3053\\u3068\\u3092\\u5B9F\\u611F\\u3057\\u305F\\u306E\\u304C\\u6614\\u5929',\n    '\\u30D7\\u30ED\\u30B0\\u30E9\\u30DE\\u30FC\\u306E\\u59CB\\u6696\\u677E\\u304C\\u30C7\\u30D0\\u30C3\\u30B0\\u4E2D\\u306B\\u4E00\\u76EE\\u5C71\\u5E83\\u3067\\u6FC3\\u304F\\u306A\\u308B\\u30E0\\u30FC\\u30C9\\u5909\\u5316\\u3092\\u8A18\\u9332\\u3057\\u305F\\u3044',\n    '\\u30B7\\u30A7\\u30EB\\u30B9\\u30AF\\u30EA\\u30D7\\u30C8\\u3067\\u4F5C\\u696D\\u5B8C\\u5168\\u81EA\\u52D5\\u5316\\u3067\\u304D\\u305F\\u6642\\u306E\\u71C3\\u3048\\u308B\\u610F\\u5473\\u3067\\u306E\\u3084\\u308A\\u5C71\\u611F\\u3002\\u3053\\u308C\\u304C\\u597D\\u304D',\n    'OSS \\u306E\\u30B3\\u30F3\\u30C8\\u30EA\\u30D3\\u30E5\\u30FC\\u30BF\\u30FC\\u306B\\u306A\\u308A\\u305F\\u3044\\u3068\\u601D\\u3044\\u3064\\u3064\\u30B3\\u30FC\\u30C9\\u3092\\u8AAD\\u3093\\u3067\\u3044\\u308B\\u3060\\u3051\\u306E\\u6BCE\\u65E5',\n    '\\u6A5F\\u68B0\\u3078\\u306E\\u8981\\u6C42\\u5B9A\\u7FA9\\u304C\\u4E00\\u756A\\u96E3\\u3057\\u3044\\u3068\\u3044\\u3046\\u5207\\u6563\\u306A\\u771F\\u7406\\u306B\\u6C17\\u3065\\u3044\\u305F\\u306E\\u304C\\u6614\\u5929',\n    '\\u30E9\\u30A4\\u30D6\\u30E9\\u30EA\\u306E\\u30A2\\u30C3\\u30D7\\u30C7\\u30FC\\u30C8\\u304C\\u3042\\u308B\\u305F\\u3073\\u30C1\\u30A7\\u30F3\\u30B8\\u30ED\\u30B0\\u3092\\u8AAD\\u3080\\u7FD2\\u6163\\u304C\\u5C71\\u306E\\u6210\\u9577\\u306B\\u7E4B\\u304C\\u3063\\u3066\\u3044\\u308B\\u5B9F\\u611F',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u306F\\u9053\\u5177\\u306B\\u904E\\u304E\\u306A\\u3044\\u3068\\u8AAC\\u304F\\u4EBA\\u3068\\u9053\\u5177\\u3053\\u305D\\u304C\\u76EE\\u7684\\u3060\\u3068\\u8AAC\\u304F\\u4EBA\\u304C\\u6C38\\u9060\\u306B\\u5BFE\\u8A71\\u3067\\u304D\\u305A\\u6C17\\u308C\\u9061\\u3044',\n    '\\u30B9\\u30BF\\u30FC\\u30C8\\u30A2\\u30C3\\u30D7\\u306E\\u30D4\\u30C3\\u30C1\\u30B3\\u30F3\\u3092\\u6EFE\\u3063\\u305F\\u3089\\u547D\\u4EE4\\u6587\\u3067\\u8AB0\\u3067\\u3082\\u4F5C\\u308C\\u308B\\u6642\\u4EE3\\u3060\\u3063\\u305F\\u3068\\u6539\\u3081\\u3066\\u601D\\u3063\\u305F',\n    '\\u65B0\\u3057\\u3044\\u30C4\\u30FC\\u30EB\\u3092\\u4F7F\\u3044\\u3053\\u306A\\u305B\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F\\u77AC\\u9593\\u306E\\u77E5\\u7684\\u5FEB\\u611F',\n    '\\u6280\\u8853\\u306E\\u9032\\u5316\\u30B9\\u30D4\\u30FC\\u30C9\\u306B\\u8FFD\\u3044\\u3064\\u304F\\u306E\\u304C\\u5927\\u5909\\u3060\\u3051\\u3069\\u697D\\u3057\\u3044',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3067\\u8AB0\\u304B\\u306E\\u751F\\u6D3B\\u304C\\u4FBF\\u5229\\u306B\\u306A\\u308B\\u77AC\\u9593\\u306B\\u7ACB\\u3061\\u4F1A\\u3048\\u308B\\u4ED5\\u4E8B\\u3078\\u306E\\u61A7\\u308C',\n    '\\u30D7\\u30ED\\u30B0\\u30E9\\u30E0\\u304C\\u610F\\u56F3\\u901A\\u308A\\u306B\\u52D5\\u3044\\u305F\\u6642\\u306E\\u9054\\u6210\\u611F\\u306F\\u4F55\\u306B\\u3082\\u4EE3\\u3048\\u3089\\u308C\\u306A\\u3044',\n    'IT\\u30EA\\u30C6\\u30E9\\u30B7\\u30FC\\u306E\\u5DEE\\u304C\\u4EBA\\u751F\\u306E\\u8CEA\\u306E\\u5DEE\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B\\u3068\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u30C7\\u30B8\\u30BF\\u30EB\\u3068\\u30A2\\u30CA\\u30ED\\u30B0\\u306E\\u30D9\\u30B9\\u30C8\\u30D0\\u30E9\\u30F3\\u30B9\\u3092\\u63A2\\u3057\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3092\\u6279\\u5224\\u3059\\u308B\\u4EBA\\u3068\\u4EAB\\u53D7\\u3059\\u308B\\u4EBA\\u306E\\u5DEE\\u306F\\u4F7F\\u3044\\u65B9\\u306E\\u77E5\\u8B58\\u3060\\u3051',\n    '\\u65B0\\u3057\\u3044\\u30C7\\u30D0\\u30A4\\u30B9\\u3092\\u958B\\u5C01\\u3059\\u308B\\u6642\\u306E\\u9AD8\\u63DA\\u611F\\u306F\\u4F55\\u5EA6\\u7D4C\\u9A13\\u3057\\u3066\\u3082\\u5909\\u308F\\u3089\\u306A\\u3044',\n    '\\u81EA\\u52D5\\u5316\\u3067\\u304D\\u305F\\u4F5C\\u696D\\u304C\\u5897\\u3048\\u308B\\u307B\\u3069\\u672C\\u5F53\\u306B\\u3084\\u308A\\u305F\\u3044\\u3053\\u3068\\u306B\\u96C6\\u4E2D\\u3067\\u304D\\u308B',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u306F\\u4F7F\\u3044\\u3053\\u306A\\u3059\\u4EBA\\u3068\\u4F7F\\u308F\\u308C\\u308B\\u4EBA\\u3067\\u5927\\u304D\\u306A\\u5DEE\\u304C\\u751F\\u307E\\u308C\\u308B',\n    '\\u30BB\\u30AD\\u30E5\\u30EA\\u30C6\\u30A3\\u306E\\u610F\\u8B58\\u304C\\u4F4E\\u3044\\u4EBA\\u3092\\u898B\\u308B\\u305F\\u3073\\u306B\\u4F1D\\u3048\\u65B9\\u3092\\u8003\\u3048\\u308B',\n    '\\u30D7\\u30ED\\u30B0\\u30E9\\u30DF\\u30F3\\u30B0\\u3092\\u5B66\\u3093\\u3067\\u4E16\\u754C\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5909\\u308F\\u3063\\u305F\\u306E\\u306F\\u672C\\u5F53',\n    'AI\\u306E\\u9032\\u5316\\u3092\\u898B\\u3066\\u3044\\u308B\\u30685\\u5E74\\u5F8C\\u306E\\u81EA\\u5206\\u306E\\u4ED5\\u4E8B\\u304C\\u60F3\\u50CF\\u3067\\u304D\\u306A\\u304F\\u306A\\u3063\\u3066\\u304D\\u305F',\n    '\\u6280\\u8853\\u7684\\u306A\\u554F\\u984C\\u3092\\u89E3\\u6C7A\\u3057\\u305F\\u6642\\u306E\\u5145\\u5B9F\\u611F\\u304C\\u4ED5\\u4E8B\\u3092\\u7D9A\\u3051\\u308B\\u539F\\u52D5\\u529B',\n    '\\u30C9\\u30AD\\u30E5\\u30E1\\u30F3\\u30C8\\u3092\\u3061\\u3083\\u3093\\u3068\\u8AAD\\u3080\\u7FD2\\u6163\\u304C\\u3064\\u3044\\u3066\\u304B\\u3089\\u4F5C\\u696D\\u52B9\\u7387\\u304C\\u4E0A\\u304C\\u3063\\u305F',\n    '\\u30AA\\u30FC\\u30D7\\u30F3\\u30BD\\u30FC\\u30B9\\u306E\\u6587\\u5316\\u304C\\u6280\\u8853\\u306E\\u6C11\\u4E3B\\u5316\\u3092\\u63A8\\u3057\\u9032\\u3081\\u3066\\u304D\\u305F\\u4E8B\\u5B9F',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3078\\u306E\\u82E6\\u624B\\u610F\\u8B58\\u306F\\u307B\\u3068\\u3093\\u3069\\u6163\\u308C\\u306E\\u554F\\u984C\\u3060\\u3068\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u65B0\\u3057\\u3044\\u6280\\u8853\\u3092\\u8A66\\u3059\\u6642\\u9593\\u304C\\u9031\\u306B\\u4E00\\u5EA6\\u3042\\u308B\\u3060\\u3051\\u3067\\u4ED5\\u4E8B\\u3078\\u306E\\u30E2\\u30C1\\u30D9\\u304C\\u9055\\u3046',\n    '\\u30A8\\u30E9\\u30FC\\u3068\\u5411\\u304D\\u5408\\u3046\\u529B\\u304C\\u30D7\\u30ED\\u30B0\\u30E9\\u30DE\\u30FC\\u306E\\u771F\\u306E\\u5B9F\\u529B\\u3060\\u3068\\u611F\\u3058\\u3066\\u3044\\u308B',\n    '\\u30AF\\u30E9\\u30A6\\u30C9\\u30B5\\u30FC\\u30D3\\u30B9\\u3067\\u4E16\\u754C\\u4E2D\\u306E\\u4EBA\\u3068\\u540C\\u3058\\u30C4\\u30FC\\u30EB\\u304C\\u4F7F\\u3048\\u308B\\u6642\\u4EE3\\u306E\\u6069\\u6075',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u306F\\u9053\\u5177\\u306B\\u904E\\u304E\\u306A\\u3044\\u304C\\u305D\\u306E\\u9053\\u5177\\u306E\\u9078\\u3073\\u65B9\\u3067\\u4EBA\\u751F\\u304C\\u5909\\u308F\\u308B',\n    '\\u30B3\\u30FC\\u30C9\\u306E\\u30EA\\u30FC\\u30C0\\u30D6\\u30EB\\u3055\\u3078\\u306E\\u3053\\u3060\\u308F\\u308A\\u304C\\u8077\\u4EBA\\u6C17\\u8CEA\\u3060\\u3068\\u8A00\\u308F\\u308C\\u305F',\n    '\\u6280\\u8853\\u66F8\\u3092\\u4E00\\u518A\\u8AAD\\u307F\\u7D42\\u3048\\u308B\\u559C\\u3073\\u304C\\u3042\\u308B\\u3002\\u77E5\\u8B58\\u306E\\u4F53\\u7CFB\\u5316\\u304C\\u597D\\u304D',\n    '\\u30C7\\u30D0\\u30C3\\u30B0\\u306F\\u554F\\u984C\\u89E3\\u6C7A\\u80FD\\u529B\\u306E\\u30C8\\u30EC\\u30FC\\u30CB\\u30F3\\u30B0\\u3060\\u3068\\u8003\\u3048\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u30C1\\u30FC\\u30E0\\u958B\\u767A\\u3067\\u5B66\\u3093\\u3060\\u30B3\\u30DF\\u30E5\\u30CB\\u30B1\\u30FC\\u30B7\\u30E7\\u30F3\\u529B\\u304C\\u6700\\u3082\\u5927\\u5207\\u306A\\u30B9\\u30AD\\u30EB\\u3060\\u3063\\u305F',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3092\\u5B66\\u3076\\u3053\\u3068\\u3067\\u4E16\\u754C\\u4E2D\\u306E\\u4EBA\\u3005\\u3068\\u7E4B\\u304C\\u308C\\u308B\\u53EF\\u80FD\\u6027\\u304C\\u5E83\\u304C\\u308B',\n    '\\u81EA\\u5206\\u304C\\u4F5C\\u3063\\u305F\\u3082\\u306E\\u304C\\u8AB0\\u304B\\u306B\\u4F7F\\u308F\\u308C\\u3066\\u3044\\u308B\\u5B9F\\u611F\\u304C\\u6700\\u9AD8\\u306E\\u30E2\\u30C1\\u30D9\\u30FC\\u30B7\\u30E7\\u30F3',\n    '\\u6280\\u8853\\u306E\\u672C\\u8CEA\\u3092\\u7406\\u89E3\\u3059\\u308B\\u3068\\u8868\\u9762\\u7684\\u306A\\u5909\\u5316\\u306B\\u52D5\\u3058\\u306A\\u304F\\u306A\\u308B',\n    '\\u526F\\u696D\\u3067\\u6280\\u8853\\u3092\\u6D3B\\u304B\\u305B\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u8996\\u91CE\\u304C\\u5E83\\u304C\\u3063\\u305F',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u30EA\\u30C6\\u30E9\\u30B7\\u30FC\\u306F\\u73FE\\u4EE3\\u306E\\u8AAD\\u307F\\u66F8\\u304D\\u3060\\u3068\\u78BA\\u4FE1\\u3057\\u3066\\u3044\\u308B',\n    '\\u30B3\\u30FC\\u30C9\\u3092\\u66F8\\u3044\\u3066\\u3044\\u308B\\u3068\\u6642\\u9593\\u304C\\u6EB6\\u3051\\u308B\\u611F\\u899A\\u306F\\u30D5\\u30ED\\u30FC\\u72B6\\u614B\\u3068\\u547C\\u3070\\u308C\\u308B\\u3082\\u306E',\n    '\\u6280\\u8853\\u7CFB\\u306E\\u30B3\\u30DF\\u30E5\\u30CB\\u30C6\\u30A3\\u3067\\u77E5\\u308A\\u5408\\u3063\\u305F\\u4EBA\\u304C\\u4ED5\\u4E8B\\u3088\\u308A\\u5927\\u4E8B\\u306A\\u5B58\\u5728\\u306B\\u306A\\u3063\\u305F',\n    '\\u5B8C\\u74A7\\u306A\\u30B7\\u30B9\\u30C6\\u30E0\\u306A\\u3069\\u5B58\\u5728\\u3057\\u306A\\u3044\\u3002\\u6539\\u5584\\u3057\\u7D9A\\u3051\\u308B\\u3053\\u3068\\u304C\\u6280\\u8853\\u8005\\u306E\\u4ED5\\u4E8B',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3067\\u751F\\u6D3B\\u306E\\u8CEA\\u304C\\u4E0A\\u304C\\u3063\\u305F\\u4F53\\u9A13\\u3092\\u8AB0\\u304B\\u306B\\u4F1D\\u3048\\u305F\\u304F\\u306A\\u308B',\n    '\\u30E6\\u30FC\\u30B6\\u30FC\\u76EE\\u7DDA\\u3067\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3092\\u8A9E\\u308C\\u308B\\u4EBA\\u304C\\u672C\\u5F53\\u306B\\u512A\\u79C0\\u3060\\u3068\\u601D\\u3046',\n    '\\u6280\\u8853\\u7684\\u306A\\u8CA0\\u50B5\\u3092\\u8FD4\\u6E08\\u3059\\u308B\\u5730\\u9053\\u306A\\u4F5C\\u696D\\u3053\\u305D\\u304C\\u54C1\\u8CEA\\u3092\\u4FDD\\u3064',\n    '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC\\u3078\\u306E\\u597D\\u5947\\u5FC3\\u304C\\u3042\\u308B\\u9650\\u308A\\u6210\\u9577\\u3057\\u7D9A\\u3051\\u3089\\u308C\\u308B\\u3068\\u4FE1\\u3058\\u3066\\u3044\\u308B',\n    '\\u65B0\\u3057\\u3044\\u30D7\\u30ED\\u30B0\\u30E9\\u30DF\\u30F3\\u30B0\\u8A00\\u8A9E\\u3092\\u5B66\\u3076\\u305F\\u3073\\u306B\\u601D\\u8003\\u306E\\u5E45\\u304C\\u5E83\\u304C\\u308B',\n    '\\u6280\\u8853\\u306F\\u624B\\u6BB5\\u3060\\u304C\\u3001\\u305D\\u306E\\u5148\\u306B\\u3042\\u308B\\u4EBA\\u9593\\u306E\\u5E78\\u798F\\u304C\\u76EE\\u7684\\u3060\\u3068\\u3044\\u3046\\u3053\\u3068\\u3092\\u5FD8\\u308C\\u306A\\u3044'\n  ],\n  '\\u8AAD\\u66F8': [\n    '\\u8AAD\\u307F\\u305F\\u304B\\u3063\\u305F\\u672C\\u304C\\u673A\\u306E\\u4E0A\\u306B\\u30BF\\u30EF\\u30FC\\u3092\\u5F62\\u6210\\u3057\\u59CB\\u3081\\u305F\\u3002\\u661F5\\u518A\\u3067\\u5C11\\u3057\\u843D\\u3061\\u7740\\u3044\\u3066\\u304D\\u305F',\n    '\\u56F3\\u66F8\\u9928\\u306E\\u9759\\u5BC2\\u306A\\u8056\\u5802\\u611F\\u3092\\u7F8E\\u8853\\u9928\\u3088\\u308A\\u597D\\u304D\\u306A\\u81EA\\u5206\\u304C\\u3044\\u308B',\n    '\\u672C\\u306E\\u30B7\\u30EA\\u30FC\\u30BA\\u3092\\u767A\\u524D\\u8AAD\\u3080\\u304B\\u767A\\u5F8C\\u304B\\u3067\\u6C38\\u9060\\u306B\\u5FF5\\u306B\\u8FEB\\u3089\\u308C\\u308B\\u304C\\u4ECA\\u65E5\\u3082\\u767A\\u524D\\u8AAD\\u3093\\u3067\\u3057\\u307E\\u3063\\u305F',\n    '\\u96FB\\u5B50\\u66F8\\u7C4D\\u306B\\u79FB\\u884C\\u3057\\u3088\\u3046\\u3068\\u3057\\u305F\\u3051\\u3069\\u7D19\\u306E\\u672C\\u3092\\u30DE\\u30FC\\u30AF\\u3059\\u308B\\u6210\\u308F\\u308A\\u306B\\u6C17\\u6301\\u3061\\u304C\\u3042\\u308A\\u5C40\\u9762',\n    '\\u597D\\u304D\\u306A\\u4F5C\\u5BB6\\u306E\\u7CBE\\u795E\\u304C\\u524D\\u4F5C\\u3068\\u671F\\u3092\\u8D8A\\u3048\\u3066\\u3064\\u306A\\u304C\\u3063\\u305F\\u3068\\u6C17\\u3065\\u3044\\u305F\\u6642\\u306E\\u9023\\u7D9A\\u611F',\n    '\\u6DF1\\u591C\\u306B\\u8AAD\\u3093\\u3060\\u5C0F\\u8AAC\\u306E\\u7D50\\u672B\\u304C\\u80AF\\u5B9A\\u3068\\u8AE6\\u306E\\u5883\\u969B\\u3067\\u9001\\u308C\\u307E\\u3057\\u305F\\u3002\\u8FD4\\u5374\\u305F',\n    '\\u4F5C\\u5BB6\\u306E\\u5C0F\\u8AAC\\u3068\\u8A55\\u8AD6\\u306E\\u9928\\u306E\\u5185\\u5BB9\\u304C\\u3053\\u3093\\u306A\\u306B\\u9055\\u3046\\u306E\\u304B\\u3068\\u9A5A\\u304D\\u3001\\u5C71\\u306E\\u4E2D\\u3067\\u81EA\\u5206\\u306E\\u611F\\u6027\\u3092\\u5225\\u533A\\u5225\\u3067\\u304D\\u3066\\u3044\\u308B',\n    '\\u6700\\u5F8C\\u306E\\u30DA\\u30FC\\u30B8\\u3092\\u8AAD\\u307F\\u7D42\\u308F\\u3063\\u305F\\u5F8C\\u3057\\u3070\\u3089\\u304F\\u4F55\\u3082\\u3067\\u304D\\u306A\\u304F\\u306A\\u308B\\u3042\\u306E\\u611F\\u899A\\u304C\\u597D\\u304D',\n    '\\u57FA\\u672C\\u7684\\u306B\\u672C\\u3068\\u4E00\\u5C71\\u5BDD\\u308B\\u751F\\u6D3B\\u3092\\u3057\\u3066\\u3044\\u308B\\u305F\\u3081\\u5B8C\\u5168\\u306B\\u8A55\\u4FA1\\u304C\\u3067\\u304D\\u305F\\u3053\\u3068\\u304C\\u306A\\u3044',\n    '\\u8AAD\\u307F\\u304B\\u3051\\u306E\\u672C\\u304C\\u5E38\\u6642\\u4E09\\u518A\\u4E26\\u884C\\u3057\\u3066\\u3044\\u308B\\u30E9\\u30A4\\u30D5\\u30B9\\u30BF\\u30A4\\u30EB\\u304C\\u6301\\u7D9A\\u3057\\u3066\\u4E09\\u5E74\\u76EE\\u3092\\u8FCE\\u3048\\u305F',\n    '\\u307E\\u3048\\u304C\\u304D\\u306E\\u672C\\u304C\\u3042\\u307E\\u308A\\u306B\\u3082\\u9762\\u767D\\u304F\\u3066\\u8EAB\\u8FD1\\u306A\\u4EBA\\u5168\\u54E1\\u306B\\u5B66\\u5206\\u3057\\u305F\\u3044',\n    '\\u4EA4\\u901A\\u6A5F\\u95A2\\u306E\\u8AAD\\u66F8\\u304C\\u5965\\u6DF1\\u3044\\u3068\\u601D\\u3044\\u304C\\u3051\\u305A\\u9996\\u5D29\\u3082\\u5C45\\u76F8\\u3082\\u5148\\u8F29\\u3082\\u5168\\u90E8\\u5FD8\\u308C\\u308B',\n    '\\u672C\\u3092\\u8B72\\u308B\\u3053\\u3068\\u306E\\u3067\\u304D\\u306A\\u3044\\u4EBA\\u9593\\u3060\\u3068\\u611F\\u3058\\u305F\\u3053\\u3068\\u304C\\u4E00\\u5EA6\\u3082\\u306A\\u3044\\u4E8B\\u5B9F\\u306B\\u6C17\\u3065\\u3044\\u305F',\n    '\\u8AAD\\u307F\\u305F\\u3044\\u672C\\u306E\\u7D22\\u5F15\\u3092\\u4F5C\\u3063\\u3066\\u3044\\u305F\\u3089\\u5149\\u523B\\u30CE\\u30FC\\u30C8\\u304C\\u4E00\\u518A\\u5C4A\\u3044\\u305F\\u3002\\u904E\\u53BB\\u306E\\u81EA\\u5206\\u5F37\\u3059\\u304E',\n    '\\u672C\\u5C4B\\u3067\\u30B3\\u30FC\\u30D2\\u30FC\\u3092\\u98F2\\u307F\\u306A\\u304C\\u3089\\u8AAD\\u3080\\u6642\\u9593\\u3092\\u751F\\u6D3B\\u306E\\u5E78\\u798F\\u306E\\u512A\\u5148\\u9806\\u4F4D\\u306B\\u5165\\u308C\\u3066\\u3044\\u308B',\n    '\\u540C\\u3058\\u672C\\u3092\\u5341\\u5E74\\u30B5\\u30A4\\u30AF\\u30EB\\u3067\\u8AAD\\u307F\\u76F4\\u3059\\u3053\\u3068\\u3082\\u6BCE\\u56DE\\u65B0\\u3057\\u3044\\u767A\\u898B\\u304C\\u3042\\u308B\\u4E8B\\u5B9F',\n    '\\u4E00\\u5272\\u306E\\u6587\\u304C\\u4F55\\u5E74\\u3082\\u7D4C\\u3063\\u3066\\u304B\\u3089\\u8EAB\\u306B\\u67D3\\u307E\\u308B\\u611F\\u899A\\u304C\\u597D\\u304D\\u3067\\u8AAD\\u66F8\\u3092\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u672C\\u306E\\u8AAD\\u307F\\u65B9\\u3092\\u77E5\\u308A\\u305F\\u3044\\u3002\\u30E1\\u30E2\\u3092\\u53D6\\u308A\\u306A\\u304C\\u3089\\u8AAD\\u3080\\u4EBA\\u3068\\u9808\\u5C71\\u30E1\\u30E2\\u306A\\u3057\\u8AAD\\u3080\\u4EBA\\u3001\\u3069\\u3061\\u3089\\u304C\\u7C8B\\u8AAC',\n    '\\u8AAD\\u3093\\u3067\\u3044\\u308B\\u3068\\u606F\\u3092\\u5410\\u3044\\u3066\\u8A00\\u8449\\u306E\\u6D77\\u306B\\u6D6E\\u304B\\u3093\\u3067\\u3044\\u308B\\u611F\\u899A\\u3002\\u3053\\u308C\\u304C\\u8AAD\\u66F8\\u3092\\u6B62\\u3081\\u3089\\u308C\\u306A\\u3044\\u7406\\u7531',\n    '\\u8AAD\\u307F\\u305F\\u3044\\u672C\\u306F\\u5C71\\u307B\\u3069\\u3042\\u308B\\u306E\\u306B\\u8AAD\\u3080\\u6642\\u9593\\u306F\\u6709\\u9650\\u3067\\u3059\\u3002\\u3053\\u306E\\u30B8\\u30EC\\u30F3\\u30DE\\u304C\\u4EBA\\u751F\\u306E\\u8133\\u308C\\u306E\\u30B8\\u30EC\\u30F3\\u30DE',\n    '\\u53E4\\u5178\\u3092\\u8AAD\\u3080\\u306E\\u304C\\u597D\\u304D\\u306A\\u306E\\u306F\\u4EBA\\u9593\\u306E\\u5FC3\\u7406\\u304C\\u6570\\u5343\\u5E74\\u5185\\u304B\\u308F\\u3063\\u3066\\u3044\\u306A\\u3044\\u3053\\u3068\\u3092\\u78BA\\u8A8D\\u3057\\u305F\\u3044\\u304B\\u3089',\n    '\\u6700\\u8FD1\\u3001\\u300E\\u30D5\\u30A1\\u30B9\\u30C8\\u300F\\u3067\\u306F\\u306A\\u304F\\u300E\\u30B9\\u30ED\\u30FC\\u300F\\u8AAD\\u66F8\\u3092\\u8A66\\u307F\\u3066\\u3044\\u308B\\u3002\\u4E00\\u5C71\\u3067\\u4E00\\u9031\\u9593\\u3092\\u304B\\u3051\\u308B\\u76EE\\u6A19',\n    '\\u672C\\u4E00\\u518A\\u3067\\u4EBA\\u751F\\u304C\\u5909\\u308F\\u308B\\u7D4C\\u9A13\\u3092\\u3001\\u6700\\u521D\\u306B\\u3057\\u305F\\u6B73\\u306B\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u597D\\u304D\\u306A\\u4F5C\\u5BB6\\u306E\\u5168\\u4F5C\\u54C1\\u5236\\u8987\\u3057\\u305F\\u3044\\u5C71\\u304C\\u3042\\u308A\\u3001\\u305D\\u308C\\u3060\\u3051\\u3067\\u5E74\\u5358\\u4F4D\\u306E\\u8AAD\\u66F8\\u8A08\\u753B\\u304C\\u767A\\u751F\\u3059\\u308B\\u9192\\u3081\\u306A\\u8DA3\\u5473',\n    '\\u672C\\u306E\\u85E4\\u3092\\u82B8\\u304C\\u308B\\u5302\\u3044\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u30E9\\u30A4\\u30D6\\u30E9\\u30EA\\u30FC\\u306B\\u5E38\\u99D0\\u3057\\u305F\\u3044',\n    '\\u305F\\u307E\\u305F\\u307E\\u9078\\u3093\\u3060\\u672C\\u304C\\u4EBA\\u751F\\u3092\\u5909\\u3048\\u308B\\u7A0B\\u306E\\u540D\\u4F5C\\u3060\\u3063\\u305F\\u6642\\u306E\\u9060\\u3044\\u76EE',\n    '\\u672C\\u4E00\\u518A\\u3067\\u4EBA\\u751F\\u304C\\u5909\\u308F\\u308B\\u7D4C\\u9A13\\u3092\\u3001\\u6700\\u521D\\u306B\\u3057\\u305F\\u6B73\\u306B\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u597D\\u304D\\u306A\\u4F5C\\u5BB6\\u306E\\u5168\\u4F5C\\u54C1\\u5236\\u8987\\u3057\\u305F\\u3044\\u5C71\\u304C\\u3042\\u308A\\u3001\\u305D\\u308C\\u3060\\u3051\\u3067\\u5E74\\u5358\\u4F4D\\u306E\\u8AAD\\u66F8\\u8A08\\u753B\\u304C\\u767A\\u751F\\u3059\\u308B\\u9192\\u3081\\u306A\\u8DA3\\u5473',\n    '\\u8AAD\\u3093\\u3067\\u3044\\u308B\\u3068\\u606F\\u3092\\u5410\\u3044\\u3066\\u8A00\\u8449\\u306E\\u6D77\\u306B\\u6D6E\\u304B\\u3093\\u3067\\u3044\\u308B\\u611F\\u899A\\u3002\\u3053\\u308C\\u304C\\u8AAD\\u66F8\\u3092\\u6B62\\u3081\\u3089\\u308C\\u306A\\u3044\\u7406\\u7531',\n    '\\u8AAD\\u66F8\\u4E2D\\u306B\\u7DDA\\u3092\\u5F15\\u304D\\u305F\\u3044\\u8A00\\u8449\\u306B\\u51FA\\u4F1A\\u3048\\u305F\\u6642\\u306E\\u559C\\u3073\\u304C\\u8AAD\\u66F8\\u3092\\u7D9A\\u3051\\u308B\\u7406\\u7531',\n    '\\u672C\\u3092\\u8AAD\\u3080\\u6642\\u9593\\u304C\\u4E00\\u65E5\\u306E\\u4E2D\\u3067\\u4E00\\u756A\\u81EA\\u5206\\u3089\\u3057\\u304F\\u3044\\u3089\\u308C\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u8AAD\\u3093\\u3067\\u3044\\u305F\\u672C\\u304C\\u6025\\u306B\\u73FE\\u5B9F\\u3068\\u30EA\\u30F3\\u30AF\\u3057\\u305F\\u77AC\\u9593\\u306E\\u5947\\u5999\\u306A\\u9AD8\\u63DA\\u611F',\n    '\\u8457\\u8005\\u306E\\u601D\\u8003\\u304C\\u81EA\\u5206\\u306E\\u4E2D\\u306B\\u5165\\u3063\\u3066\\u304F\\u308B\\u611F\\u899A\\u304C\\u8AAD\\u66F8\\u306E\\u918D\\u9190\\u5473',\n    '\\u56F3\\u66F8\\u9928\\u306E\\u7A7A\\u9593\\u81EA\\u4F53\\u304C\\u597D\\u304D\\u3067\\u4F55\\u3082\\u501F\\u308A\\u306A\\u304F\\u3066\\u3082\\u884C\\u304D\\u305F\\u304F\\u306A\\u308B',\n    '\\u672C\\u3092\\u8AAD\\u3080\\u7FD2\\u6163\\u304C\\u3064\\u3044\\u3066\\u304B\\u3089\\u8A9E\\u5F59\\u304C\\u5897\\u3048\\u305F\\u5B9F\\u611F\\u304C\\u3042\\u308B',\n    '\\u672C\\u5C4B\\u3067\\u30B8\\u30E3\\u30B1\\u8CB7\\u3044\\u3057\\u305F\\u672C\\u304C\\u540D\\u4F5C\\u3060\\u3063\\u305F\\u6642\\u306E\\u6E80\\u8DB3\\u611F',\n    '\\u53CB\\u4EBA\\u306B\\u52E7\\u3081\\u305F\\u672C\\u3092\\u8AAD\\u3093\\u3067\\u3082\\u3089\\u3048\\u3066\\u611F\\u60F3\\u3092\\u8A71\\u3057\\u5408\\u3048\\u308B\\u5E78\\u798F',\n    '\\u8AAD\\u66F8\\u30CE\\u30FC\\u30C8\\u3092\\u3064\\u3051\\u59CB\\u3081\\u3066\\u304B\\u3089\\u5185\\u5BB9\\u304C\\u683C\\u6BB5\\u306B\\u8EAB\\u306B\\u3064\\u304F\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u7FFB\\u8A33\\u3055\\u308C\\u305F\\u672C\\u3092\\u8AAD\\u3093\\u3067\\u7FFB\\u8A33\\u8005\\u306E\\u5049\\u5927\\u3055\\u3092\\u611F\\u3058\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u672C\\u306E\\u4E2D\\u306E\\u8A00\\u8449\\u304C\\u4F55\\u5E74\\u3082\\u7D4C\\u3063\\u3066\\u304B\\u3089\\u7A81\\u7136\\u610F\\u5473\\u3092\\u6301\\u3061\\u59CB\\u3081\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u6D3B\\u5B57\\u3092\\u8AAD\\u3080\\u884C\\u70BA\\u81EA\\u4F53\\u304C\\u8133\\u3078\\u306E\\u826F\\u3044\\u523A\\u6FC0\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u8AAD\\u3093\\u3067\\u3044\\u308B\\u9014\\u4E2D\\u3067\\u6B21\\u306E\\u30DA\\u30FC\\u30B8\\u3092\\u3081\\u304F\\u308B\\u306E\\u304C\\u60DC\\u3057\\u304F\\u306A\\u308B\\u4F5C\\u54C1',\n    '\\u672C\\u3092\\u8AAD\\u3080\\u524D\\u3068\\u5F8C\\u3067\\u540C\\u3058\\u3082\\u306E\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5909\\u308F\\u308B\\u4F53\\u9A13',\n    '\\u30AA\\u30FC\\u30C7\\u30A3\\u30AA\\u30D6\\u30C3\\u30AF\\u3067\\u8AAD\\u66F8\\u306E\\u6982\\u5FF5\\u304C\\u5909\\u308F\\u3063\\u305F\\u4EBA\\u3068\\u5909\\u308F\\u3089\\u306A\\u304B\\u3063\\u305F\\u4EBA\\u306E\\u6E9D',\n    '\\u672C\\u5C4B\\u3055\\u3093\\u3068\\u3044\\u3046\\u5834\\u6240\\u304C\\u6C38\\u9060\\u306B\\u306A\\u304F\\u306A\\u3089\\u306A\\u3044\\u3067\\u307B\\u3057\\u3044',\n    '\\u4F5C\\u5BB6\\u306E\\u79C1\\u751F\\u6D3B\\u304C\\u4F5C\\u54C1\\u306B\\u6EF2\\u307F\\u51FA\\u3066\\u3044\\u308B\\u306E\\u3092\\u767A\\u898B\\u3059\\u308B\\u697D\\u3057\\u3055',\n    '\\u672C\\u306E\\u4E16\\u754C\\u89B3\\u306B\\u6D78\\u308A\\u3059\\u304E\\u3066\\u73FE\\u5B9F\\u306E\\u6642\\u9593\\u611F\\u899A\\u304C\\u72C2\\u3046\\u8AAD\\u66F8',\n    '\\u5B50\\u4F9B\\u306B\\u8AAD\\u307F\\u805E\\u304B\\u305B\\u3092\\u3057\\u306A\\u304C\\u3089\\u81EA\\u5206\\u306E\\u65B9\\u304C\\u5922\\u4E2D\\u306B\\u306A\\u308B\\u77AC\\u9593',\n    '\\u672C\\u68DA\\u3092\\u898B\\u308B\\u3068\\u81EA\\u5206\\u306E\\u4EBA\\u751F\\u306E\\u6B74\\u53F2\\u304C\\u898B\\u3048\\u3066\\u304F\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u672C\\u3092\\u901A\\u3058\\u3066\\u4F1A\\u3063\\u305F\\u3053\\u3068\\u306E\\u306A\\u3044\\u4EBA\\u3068\\u5BFE\\u8A71\\u3067\\u304D\\u308B\\u4E0D\\u601D\\u8B70\\u306A\\u559C\\u3073',\n    '\\u597D\\u304D\\u306A\\u4F5C\\u5BB6\\u306E\\u65B0\\u4F5C\\u304C\\u51FA\\u308B\\u6642\\u306E\\u671F\\u5F85\\u611F\\u306F\\u4ED6\\u306B\\u4EE3\\u3048\\u304C\\u305F\\u3044',\n    '\\u7269\\u8A9E\\u306E\\u7D50\\u672B\\u304C\\u5206\\u304B\\u3063\\u3066\\u3044\\u3066\\u3082\\u4F55\\u5EA6\\u3082\\u8AAD\\u307F\\u8FD4\\u3057\\u305F\\u304F\\u306A\\u308B\\u4F5C\\u54C1\\u304C\\u3042\\u308B',\n    '\\u8AAD\\u66F8\\u306E\\u901F\\u5EA6\\u3088\\u308A\\u6DF1\\u5EA6\\u3092\\u5927\\u5207\\u306B\\u3057\\u305F\\u65B9\\u304C\\u6B8B\\u308B\\u3082\\u306E\\u304C\\u591A\\u3044',\n    '\\u672C\\u3092\\u8AAD\\u3080\\u3053\\u3068\\u306F\\u5B64\\u72EC\\u3067\\u306F\\u306A\\u304F\\u6700\\u9AD8\\u306E\\u30B3\\u30DF\\u30E5\\u30CB\\u30B1\\u30FC\\u30B7\\u30E7\\u30F3\\u3060\\u3068\\u601D\\u3046',\n    '\\u540C\\u3058\\u672C\\u3092\\u7570\\u306A\\u308B\\u5E74\\u4EE3\\u3067\\u8AAD\\u3080\\u3068\\u5225\\u306E\\u672C\\u306E\\u3088\\u3046\\u306B\\u611F\\u3058\\u308B\\u9762\\u767D\\u3055',\n    '\\u8AAD\\u66F8\\u306F\\u81EA\\u5206\\u306E\\u4E2D\\u306B\\u7121\\u9650\\u306E\\u5F15\\u304D\\u51FA\\u3057\\u3092\\u4F5C\\u3063\\u3066\\u3044\\u304F\\u4F5C\\u696D\\u3060\\u3068\\u601D\\u3046',\n    '\\u96FB\\u5B50\\u66F8\\u7C4D\\u3068\\u7D19\\u306E\\u672C\\u306E\\u4F7F\\u3044\\u5206\\u3051\\u304C\\u7FD2\\u6163\\u5316\\u3057\\u3066\\u6700\\u9069\\u89E3\\u3092\\u898B\\u3064\\u3051\\u305F',\n    '\\u672C\\u306E\\u5E2F\\u30B3\\u30D4\\u30FC\\u3060\\u3051\\u3067\\u8AAD\\u307F\\u305F\\u3044\\u6C17\\u6301\\u3061\\u306B\\u3055\\u305B\\u3089\\u308C\\u308B\\u6280\\u8853\\u304C\\u51C4\\u3044',\n    '\\u8AAD\\u66F8\\u4E2D\\u306B\\u4F5C\\u8005\\u3068\\u540C\\u3058\\u7D50\\u8AD6\\u306B\\u9054\\u3057\\u305F\\u6642\\u306E\\u77E5\\u7684\\u306A\\u5171\\u9CF4\\u611F',\n    '\\u96E3\\u3057\\u3044\\u672C\\u3092\\u8AE6\\u3081\\u305A\\u306B\\u8AAD\\u307F\\u5207\\u3063\\u305F\\u9054\\u6210\\u611F\\u306F\\u767B\\u5C71\\u306B\\u4F3C\\u3066\\u3044\\u308B',\n    '\\u672C\\u306E\\u767B\\u5834\\u4EBA\\u7269\\u306E\\u65B9\\u304C\\u5B9F\\u5728\\u306E\\u4EBA\\u9593\\u3088\\u308A\\u6DF1\\u304F\\u77E5\\u3063\\u3066\\u3044\\u308B\\u9006\\u8EE2\\u73FE\\u8C61',\n    '\\u672C\\u3067\\u5B66\\u3093\\u3060\\u3053\\u3068\\u3092\\u4EBA\\u306B\\u8A71\\u3057\\u3066\\u307F\\u308B\\u3068\\u7406\\u89E3\\u306E\\u6DF1\\u3055\\u304C\\u5206\\u304B\\u308B',\n    '\\u7A4D\\u3093\\u8AAD\\u304C\\u6D88\\u3048\\u306A\\u3044\\u554F\\u984C\\u3092\\u89E3\\u6C7A\\u3059\\u308B\\u3088\\u308A\\u7A4D\\u3093\\u8AAD\\u306E\\u4FA1\\u5024\\u3092\\u8A8D\\u3081\\u308B\\u3053\\u3068\\u306B\\u3057\\u305F',\n    '\\u672C\\u3068\\u306E\\u51FA\\u4F1A\\u3044\\u306B\\u5076\\u7136\\u306F\\u306A\\u304F\\u5FC5\\u7136\\u3060\\u3068\\u4FE1\\u3058\\u305F\\u304F\\u306A\\u308B\\u4F53\\u9A13\\u304C\\u7D9A\\u304F',\n    '\\u671D\\u8AAD\\u66F8\\u3068\\u591C\\u8AAD\\u66F8\\u3067\\u306F\\u982D\\u3078\\u306E\\u5165\\u308A\\u65B9\\u304C\\u5168\\u7136\\u9055\\u3046\\u3053\\u3068\\u306B\\u6C17\\u3065\\u3044\\u305F',\n    '\\u8AAD\\u66F8\\u306E\\u697D\\u3057\\u3055\\u3092\\u77E5\\u3063\\u3066\\u304B\\u3089\\u6687\\u3068\\u3044\\u3046\\u611F\\u899A\\u304C\\u306A\\u304F\\u306A\\u3063\\u305F',\n    '\\u4F5C\\u8005\\u304C\\u4F55\\u5E74\\u3082\\u304B\\u3051\\u3066\\u66F8\\u3044\\u305F\\u672C\\u3092\\u6570\\u6642\\u9593\\u3067\\u8AAD\\u3081\\u308B\\u5947\\u8DE1\\u306B\\u611F\\u8B1D\\u3057\\u3066\\u3044\\u308B'\n  ],\n  '\\u65C5\\u884C': [\n    '\\u5148\\u9031\\u6B7B\\u306C\\u307B\\u3069\\u6B69\\u3044\\u305F\\u65C5\\u884C\\u3067\\u3001\\u8DB3\\u306E\\u7B4B\\u8089\\u75DB\\u304C\\u6C17\\u6301\\u3061\\u3088\\u304F\\u6B8B\\u3063\\u3066\\u3044\\u308B',\n    '\\u65C5\\u306E\\u9014\\u4E2D\\u3067\\u5076\\u7136\\u5165\\u3063\\u305F\\u5730\\u5143\\u98DF\\u5802\\u304C\\u4EBA\\u751F\\u306E\\u8A18\\u61B6\\u306B\\u523B\\u307E\\u308C\\u305F',\n    '\\u6700\\u8FD1\\u65E5\\u5E38\\u3092\\u96E2\\u308C\\u305F\\u3044\\u6C17\\u6301\\u3061\\u304C\\u5F37\\u3059\\u304E\\u3066\\u30D1\\u30C3\\u30AF\\u30C4\\u30A2\\u30FC\\u3092\\u8ABF\\u3079\\u3066\\u3044\\u308B',\n    '\\u95A2\\u897F\\u306E\\u5C0F\\u3055\\u306A\\u8DEF\\u5730\\u3067\\u898B\\u3064\\u3051\\u305F\\u96A0\\u308C\\u5BB6\\u30AB\\u30D5\\u30A7\\u304C\\u5E38\\u9023\\u306B\\u306A\\u308A\\u305F\\u3044\\u304A\\u5E97\\u306B\\u306A\\u3063\\u305F',\n    '\\u6C34\\u5E73\\u7DDA\\u5411\\u3053\\u3046\\u306B\\u5C71\\u304C\\u898B\\u3048\\u308B\\u5929\\u6C17\\u306E\\u65E5\\u306B\\u6D77\\u8FBA\\u3092\\u6563\\u6B69\\u3059\\u308B\\u6642\\u9593\\u304C\\u597D\\u304D',\n    '\\u521D\\u3081\\u3066\\u8A2A\\u308C\\u305F\\u56FD\\u306B\\u7740\\u3044\\u305F\\u77AC\\u9593\\u3001\\u6C17\\u5019\\u306E\\u9055\\u3044\\u3067\\u4E94\\u611F\\u304C\\u5225\\u306E\\u4F55\\u304B\\u306B\\u63A5\\u7D9A\\u3055\\u308C\\u305F\\u611F\\u899A',\n    '\\u4E00\\u4EBA\\u65C5\\u306E\\u6700\\u521D\\u306E\\u4E00\\u6B69\\u3092\\u8E0F\\u307F\\u51FA\\u3057\\u305F\\u65E5\\u304B\\u3089\\u65C5\\u306E\\u610F\\u5473\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u65C5\\u5148\\u3067\\u5076\\u7136\\u65E7\\u53CB\\u306B\\u4F1A\\u3063\\u305F\\u3002\\u4E16\\u754C\\u306F\\u7E4B\\u304C\\u3063\\u3066\\u3044\\u308B\\u3093\\u3060\\u306A\\u3068\\u601D\\u3063\\u305F',\n    '\\u5BBF\\u3092\\u6C7A\\u3081\\u306A\\u3044\\u3067\\u8857\\u3092\\u6B69\\u3044\\u3066\\u3044\\u305F\\u3089\\u305D\\u306E\\u90FD\\u5E02\\u306E\\u672C\\u5F53\\u306E\\u9854\\u304C\\u898B\\u3048\\u305F',\n    '\\u65C5\\u884C\\u306B\\u51FA\\u308B\\u305F\\u3073\\u306B\\u611F\\u3058\\u308B\\u3001\\u8A00\\u8449\\u306E\\u554F\\u984C\\u3067\\u306F\\u306A\\u304F\\u671F\\u5F85\\u5024\\u306E\\u554F\\u984C\\u306E\\u5B9F\\u611F',\n    '\\u65C5\\u5148\\u3067\\u306E\\u5915\\u66AE\\u308C\\u3060\\u3051\\u306F\\u305D\\u306E\\u5834\\u306B\\u8DB3\\u304C\\u5411\\u3044\\u305F\\u3002\\u5E74\\u5185\\u306B\\u307E\\u305F\\u8A2A\\u308C\\u305F\\u3044',\n    '\\u65C5\\u306E\\u9014\\u4E2D\\u3067\\u5927\\u96E8\\u306B\\u9047\\u3063\\u305F\\u65E5\\u306B\\u8A2A\\u306D\\u305F\\u9152\\u5834\\u3067\\u5F85\\u3063\\u305F\\u5730\\u5143\\u306E\\u96E8\\u306E\\u5EC9\\u304C\\u6700\\u9AD8\\u3060\\u3063\\u305F',\n    '\\u65C5\\u304C\\u597D\\u304D\\u306A\\u7406\\u7531\\u306E\\u6700\\u5927\\u306F\\u3001\\u5168\\u90E8\\u5FD8\\u308C\\u3066\\u3057\\u307E\\u3046\\u6642\\u9593\\u304C\\u3042\\u308B\\u3053\\u3068',\n    '\\u6D77\\u5916\\u3067\\u8A00\\u8449\\u304C\\u901A\\u3058\\u306A\\u304F\\u3066\\u3082\\u6C17\\u6301\\u3061\\u304C\\u4F1D\\u308F\\u3063\\u305F\\u6642\\u306E\\u611F\\u52D5\\u306F\\u683C\\u5225',\n    '\\u65C5\\u5148\\u3067\\u51FA\\u4F1A\\u3063\\u305F\\u4EBA\\u3068\\u306E\\u7E01\\u304C\\u305D\\u306E\\u5F8C\\u3082\\u7D9A\\u3044\\u3066\\u3044\\u308B\\u5947\\u8DE1',\n    '\\u65C5\\u306E\\u8A08\\u753B\\u3092\\u7ACB\\u3066\\u3066\\u3044\\u308B\\u6642\\u9593\\u304C\\u65C5\\u672C\\u756A\\u3068\\u540C\\u3058\\u304F\\u3089\\u3044\\u697D\\u3057\\u3044',\n    '\\u5E30\\u5B85\\u3057\\u305F\\u7FCC\\u65E5\\u306E\\u65E5\\u5E38\\u306E\\u3042\\u308A\\u304C\\u305F\\u3055\\u3092\\u65C5\\u304B\\u3089\\u5B66\\u3093\\u3067\\u3044\\u308B',\n    '\\u65C5\\u5148\\u3067\\u5730\\u5143\\u306E\\u5E02\\u5834\\u3092\\u6B69\\u304F\\u306E\\u304C\\u4E00\\u756A\\u305D\\u306E\\u571F\\u5730\\u3092\\u7406\\u89E3\\u3067\\u304D\\u308B\\u65B9\\u6CD5\\u3060\\u3068\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u65C5\\u306E\\u8377\\u7269\\u3092\\u6700\\u5C0F\\u9650\\u306B\\u3067\\u304D\\u305F\\u6642\\u306E\\u9054\\u6210\\u611F\\u304C\\u3042\\u308B',\n    '\\u65C5\\u3067\\u5931\\u6557\\u3057\\u305F\\u7D4C\\u9A13\\u306E\\u65B9\\u304C\\u6210\\u529F\\u4F53\\u9A13\\u3088\\u308A\\u8A18\\u61B6\\u306B\\u6B8B\\u3063\\u3066\\u3044\\u308B',\n    '\\u56FD\\u5185\\u65C5\\u884C\\u306E\\u9B45\\u529B\\u3092\\u518D\\u767A\\u898B\\u3057\\u305F\\u306E\\u306F\\u6D77\\u5916\\u65C5\\u884C\\u3092\\u3057\\u3066\\u304B\\u3089\\u3060\\u3063\\u305F',\n    '\\u4E00\\u4EBA\\u65C5\\u3068\\u8907\\u6570\\u4EBA\\u65C5\\u884C\\u3067\\u306F\\u540C\\u3058\\u5834\\u6240\\u3067\\u3082\\u5168\\u304F\\u9055\\u3046\\u4F53\\u9A13\\u306B\\u306A\\u308B',\n    '\\u65C5\\u5148\\u3067\\u8AAD\\u3080\\u672C\\u306F\\u65E5\\u5E38\\u3067\\u8AAD\\u3080\\u3088\\u308A\\u6DF1\\u304F\\u5165\\u3063\\u3066\\u304F\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u304A\\u571F\\u7523\\u3092\\u9078\\u3076\\u6642\\u9593\\u3067\\u305D\\u306E\\u571F\\u5730\\u3078\\u306E\\u7406\\u89E3\\u304C\\u6DF1\\u307E\\u3063\\u3066\\u3044\\u304F',\n    '\\u79FB\\u52D5\\u4E2D\\u306E\\u666F\\u8272\\u3092\\u773A\\u3081\\u308B\\u6642\\u9593\\u304C\\u65C5\\u306E\\u4E2D\\u3067\\u4E00\\u756A\\u597D\\u304D\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u65C5\\u884C\\u5F8C\\u306E\\u5199\\u771F\\u6574\\u7406\\u304C\\u3082\\u3046\\u4E00\\u3064\\u306E\\u65C5\\u306E\\u3088\\u3046\\u306A\\u697D\\u3057\\u3055\\u304C\\u3042\\u308B',\n    '\\u540C\\u3058\\u5834\\u6240\\u306B\\u4F55\\u5EA6\\u3082\\u884C\\u304F\\u3053\\u3068\\u3067\\u6C17\\u3065\\u304F\\u5909\\u5316\\u3068\\u5909\\u308F\\u3089\\u306A\\u3044\\u3082\\u306E\\u304C\\u3042\\u308B',\n    '\\u65C5\\u5148\\u3067\\u898B\\u305F\\u5915\\u65E5\\u306E\\u7F8E\\u3057\\u3055\\u3092\\u8A00\\u8449\\u3067\\u8868\\u73FE\\u3067\\u304D\\u306A\\u304B\\u3063\\u305F',\n    '\\u65C5\\u306B\\u51FA\\u308B\\u3068\\u81EA\\u5206\\u306E\\u3053\\u3068\\u304C\\u5C11\\u3057\\u5BA2\\u89B3\\u7684\\u306B\\u898B\\u3048\\u308B\\u3088\\u3046\\u306B\\u306A\\u308B',\n    '\\u6B21\\u306E\\u65C5\\u5148\\u3092\\u307C\\u3093\\u3084\\u308A\\u8003\\u3048\\u3066\\u3044\\u308B\\u6642\\u9593\\u304C\\u5E78\\u305B',\n    '\\u65C5\\u884C\\u304B\\u3089\\u5E30\\u3063\\u305F\\u3042\\u3068\\u306E\\u6570\\u65E5\\u9593\\u304C\\u4E00\\u756A\\u751F\\u7523\\u7684\\u306B\\u306A\\u308B\\u8B0E\\u306E\\u6CD5\\u5247',\n    '\\u65C5\\u5148\\u3067\\u5730\\u5143\\u306E\\u4EBA\\u306B\\u8A71\\u3057\\u304B\\u3051\\u3066\\u3082\\u3089\\u3048\\u305F\\u6642\\u306E\\u6E29\\u304B\\u3055\\u3092\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u65C5\\u884C\\u306E\\u6E96\\u5099\\u671F\\u9593\\u304C\\u5B9F\\u306F\\u65C5\\u672C\\u756A\\u3068\\u540C\\u3058\\u304F\\u3089\\u3044\\u697D\\u3057\\u3044',\n    '\\u306F\\u3058\\u3081\\u3066\\u8A2A\\u308C\\u305F\\u56FD\\u306E\\u7A7A\\u6E2F\\u306B\\u964D\\u308A\\u7ACB\\u3063\\u305F\\u77AC\\u9593\\u306E\\u611F\\u899A\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u65C5\\u3067\\u98DF\\u3079\\u305F\\u5730\\u5143\\u6599\\u7406\\u306E\\u5473\\u304C\\u8A18\\u61B6\\u306E\\u4E2D\\u3067\\u8F1D\\u304D\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u65C5\\u5148\\u3067\\u8FF7\\u5B50\\u306B\\u306A\\u3063\\u3066\\u898B\\u3064\\u3051\\u305F\\u9053\\u304C\\u4E00\\u756A\\u306E\\u601D\\u3044\\u51FA\\u306B\\u306A\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u65C5\\u306F\\u81EA\\u5206\\u306E\\u4FA1\\u5024\\u89B3\\u3092\\u8A66\\u3055\\u308C\\u308B\\u5834\\u6240\\u3067\\u3082\\u3042\\u308B\\u3068\\u6C17\\u3065\\u3044\\u305F',\n    '\\u65C5\\u306E\\u5931\\u6557\\u8AC7\\u304C\\u5F8C\\u304B\\u3089\\u4E00\\u756A\\u9762\\u767D\\u3044\\u8A71\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u65C5\\u884C\\u4E2D\\u306B\\u64AE\\u3063\\u305F\\u5199\\u771F\\u3088\\u308A\\u8A18\\u61B6\\u306B\\u6B8B\\u3063\\u3066\\u3044\\u308B\\u5834\\u9762\\u306E\\u65B9\\u304C\\u591A\\u3044',\n    '\\u65C5\\u5148\\u306E\\u30DB\\u30C6\\u30EB\\u3067\\u671D\\u76EE\\u899A\\u3081\\u308B\\u6642\\u306E\\u611F\\u899A\\u304C\\u597D\\u304D\\u3059\\u304E\\u308B',\n    '\\u65C5\\u3067\\u51FA\\u4F1A\\u3063\\u305F\\u4EBA\\u306E\\u3053\\u3068\\u3092\\u4ECA\\u3067\\u3082\\u3075\\u3068\\u601D\\u3044\\u51FA\\u3059\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u65C5\\u884C\\u524D\\u306E\\u8377\\u7269\\u30D1\\u30C3\\u30AD\\u30F3\\u30B0\\u304C\\u610F\\u5916\\u3068\\u597D\\u304D\\u306A\\u4F5C\\u696D\\u306B\\u306A\\u3063\\u3066\\u304D\\u305F',\n    '\\u65C5\\u5148\\u3067\\u624B\\u306B\\u5165\\u308C\\u305F\\u304A\\u571F\\u7523\\u3088\\u308A\\u4F53\\u9A13\\u306E\\u8A18\\u61B6\\u306E\\u65B9\\u304C\\u9577\\u6301\\u3061\\u3059\\u308B',\n    '\\u65C5\\u3092\\u3059\\u308B\\u3068\\u65E5\\u672C\\u306E\\u3044\\u3044\\u3068\\u3053\\u308D\\u3068\\u8AB2\\u984C\\u304C\\u4E21\\u65B9\\u898B\\u3048\\u3066\\u304F\\u308B',\n    '\\u4E00\\u4EBA\\u65C5\\u306E\\u81EA\\u7531\\u3055\\u3068\\u8AB0\\u304B\\u3068\\u884C\\u304F\\u65C5\\u306E\\u697D\\u3057\\u3055\\u306F\\u5168\\u304F\\u5225\\u306E\\u826F\\u3055\\u304C\\u3042\\u308B',\n    '\\u65C5\\u5148\\u3067\\u8A00\\u8A9E\\u304C\\u901A\\u3058\\u306A\\u304F\\u3066\\u3082\\u7B11\\u9854\\u3068\\u8EAB\\u632F\\u308A\\u3067\\u610F\\u601D\\u758E\\u901A\\u3067\\u304D\\u305F',\n    '\\u65C5\\u884C\\u304B\\u3089\\u5E30\\u308B\\u3068\\u65E5\\u5E38\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5C11\\u3057\\u5909\\u308F\\u3063\\u3066\\u3044\\u308B\\u306E\\u304C\\u65C5\\u306E\\u529B',\n    '\\u65C5\\u5148\\u3067\\u661F\\u7A7A\\u3092\\u898B\\u4E0A\\u3052\\u305F\\u6642\\u3001\\u4EBA\\u751F\\u306E\\u60A9\\u307F\\u304C\\u5168\\u3066\\u5C0F\\u3055\\u304F\\u601D\\u3048\\u305F',\n    '\\u65C5\\u884C\\u8A08\\u753B\\u3092\\u7ACB\\u3066\\u308B\\u9031\\u306F\\u4ED5\\u4E8B\\u3082\\u4F55\\u6545\\u304B\\u9811\\u5F35\\u308C\\u308B',\n    '\\u65C5\\u5148\\u3067\\u98DF\\u3079\\u305F\\u671D\\u98DF\\u304C\\u4EBA\\u751F\\u3067\\u4E00\\u756A\\u7F8E\\u5473\\u3057\\u304B\\u3063\\u305F\\u98DF\\u4E8B\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u65C5\\u884C\\u306E\\u601D\\u3044\\u51FA\\u306F\\u5E74\\u3092\\u91CD\\u306D\\u308B\\u307B\\u3069\\u7F8E\\u3057\\u304F\\u8F1D\\u3044\\u3066\\u3044\\u304F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u65C5\\u5148\\u3067\\u898B\\u304B\\u3051\\u305F\\u98A8\\u666F\\u304C\\u6642\\u9593\\u5DEE\\u3067\\u5922\\u306B\\u51FA\\u3066\\u304F\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u65C5\\u306F\\u81EA\\u5206\\u3092\\u898B\\u3064\\u3081\\u76F4\\u3059\\u305F\\u3081\\u306E\\u6642\\u9593\\u3067\\u3082\\u3042\\u308B\\u3068\\u601D\\u3046\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u65C5\\u884C\\u3067\\u5B66\\u3093\\u3060\\u3053\\u3068\\u306F\\u6559\\u79D1\\u66F8\\u3088\\u308A\\u6DF1\\u304F\\u8EAB\\u306B\\u523B\\u307E\\u308C\\u3066\\u3044\\u308B',\n    '\\u65C5\\u5148\\u3067\\u5730\\u5143\\u306E\\u5E02\\u5834\\u3092\\u6B69\\u304F\\u306E\\u304C\\u535A\\u7269\\u9928\\u3088\\u308A\\u597D\\u304D\\u306A\\u6642\\u304C\\u3042\\u308B',\n    '\\u65B0\\u5E79\\u7DDA\\u3084\\u98DB\\u884C\\u6A5F\\u306E\\u7A93\\u304B\\u3089\\u898B\\u3048\\u308B\\u666F\\u8272\\u3092\\u307C\\u30FC\\u3063\\u3068\\u773A\\u3081\\u308B\\u6642\\u9593\\u304C\\u8D05\\u6CA2',\n    '\\u65C5\\u5148\\u3067\\u5076\\u7136\\u7ACB\\u3061\\u5BC4\\u3063\\u305F\\u30AB\\u30D5\\u30A7\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044\\u5834\\u6240\\u306B\\u306A\\u3063\\u305F',\n    '\\u65C5\\u306E\\u6700\\u5F8C\\u306E\\u591C\\u306E\\u7279\\u5225\\u306A\\u7A7A\\u6C17\\u611F\\u304C\\u305F\\u307E\\u3089\\u306A\\u304F\\u597D\\u304D',\n    '\\u65C5\\u884C\\u3067\\u77E5\\u308A\\u5408\\u3063\\u305F\\u4EBA\\u3068\\u306E\\u9023\\u7D61\\u304C\\u4F55\\u5E74\\u3082\\u7D9A\\u3044\\u3066\\u3044\\u308B\\u5947\\u8DE1',\n    '\\u65C5\\u3092\\u3059\\u308B\\u305F\\u3073\\u306B\\u4E16\\u754C\\u306F\\u81EA\\u5206\\u304C\\u601D\\u3063\\u3066\\u3044\\u305F\\u3088\\u308A\\u5E83\\u304F\\u3066\\u6E29\\u304B\\u3044\\u3068\\u611F\\u3058\\u308B',\n    '\\u65C5\\u5148\\u3067\\u64AE\\u3063\\u305F\\u4E00\\u679A\\u306E\\u5199\\u771F\\u304C\\u4F5C\\u54C1\\u3068\\u3057\\u3066\\u8A55\\u4FA1\\u3055\\u308C\\u305F\\u9A5A\\u304D',\n    '\\u65C5\\u597D\\u304D\\u306A\\u4EBA\\u3068\\u8A71\\u3059\\u3068\\u81EA\\u5206\\u304C\\u77E5\\u3089\\u306A\\u3044\\u4E16\\u754C\\u3092\\u6559\\u3048\\u3066\\u3082\\u3089\\u3048\\u308B',\n    '\\u65C5\\u306E\\u5F8C\\u306B\\u4F5C\\u308B\\u65C5\\u884C\\u8A18\\u304C\\u65C5\\u4F53\\u9A13\\u3092\\u3055\\u3089\\u306B\\u8C4A\\u304B\\u306B\\u3057\\u3066\\u304F\\u308C\\u308B',\n    '\\u65C5\\u5148\\u3067\\u306E\\u5C0F\\u3055\\u306A\\u30C8\\u30E9\\u30D6\\u30EB\\u304C\\u5F8C\\u304B\\u3089\\u4E00\\u756A\\u306E\\u7B11\\u3044\\u8A71\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u65C5\\u884C\\u306E\\u7D4C\\u9A13\\u304C\\u4ED5\\u4E8B\\u3067\\u306E\\u767A\\u60F3\\u529B\\u3084\\u554F\\u984C\\u89E3\\u6C7A\\u80FD\\u529B\\u3092\\u935B\\u3048\\u3066\\u3044\\u308B',\n    '\\u65C5\\u3092\\u3059\\u308B\\u7406\\u7531\\u306F\\u7B54\\u3048\\u304C\\u306A\\u304F\\u3066\\u3082\\u3044\\u3044\\u3002\\u884C\\u304D\\u305F\\u3044\\u304B\\u3089\\u884C\\u304F',\n    '\\u65C5\\u5148\\u3067\\u611F\\u3058\\u305F\\u611F\\u52D5\\u3092\\u8AB0\\u304B\\u3068\\u5171\\u6709\\u3057\\u305F\\u3044\\u6B32\\u6C42\\u304C\\u65E5\\u8A18\\u3092\\u66F8\\u304B\\u305B\\u308B',\n    '\\u65C5\\u306F\\u4EBA\\u751F\\u306E\\u53E5\\u8AAD\\u70B9\\u3060\\u3068\\u601D\\u3046\\u3002\\u533A\\u5207\\u308A\\u3092\\u3064\\u3051\\u3066\\u6B21\\u3078\\u9032\\u3080\\u529B\\u3092\\u304F\\u308C\\u308B'\n  ],\n  '\\u52D5\\u7269': [\n    '\\u5E30\\u5B85\\u3057\\u305F\\u3089\\u732B\\u306B\\u5B8C\\u5168\\u306B\\u5FD8\\u308C\\u3089\\u308C\\u3066\\u3044\\u305F\\u3002\\u3053\\u308C\\u304C\\u732B\\u98FC\\u3044\\u306E\\u73FE\\u5B9F',\n    '\\u72AC\\u306E\\u671D\\u306E\\u64E6\\u308A\\u5BC4\\u308A\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u72AC\\u7A2E\\u306B\\u3064\\u3044\\u3066\\u8ABF\\u3079\\u59CB\\u3081\\u3066\\u3044\\u308B',\n    '\\u516C\\u5712\\u3067\\u72AC\\u306E\\u6563\\u6B69\\u306B\\u4F1A\\u3063\\u305F\\u304A\\u3058\\u3055\\u3093\\u304C\\u6BCE\\u65E5\\u5143\\u6C17\\u3092\\u304F\\u308C\\u308B\\u5B58\\u5728\\u306B\\u306A\\u3063\\u305F',\n    '\\u5C0F\\u9CE5\\u304C\\u30D0\\u30EB\\u30B3\\u30CB\\u30FC\\u306B\\u98DB\\u3093\\u3067\\u304D\\u305F\\u3002\\u898B\\u77E5\\u3089\\u306C\\u4EBA\\u9593\\u3068\\u3082\\u53CB\\u9054\\u306B\\u306A\\u308C\\u308B\\u6C17\\u304C\\u3057\\u305F',\n    '\\u53CB\\u4EBA\\u306E\\u5BB6\\u306E\\u30CF\\u30E0\\u30B9\\u30BF\\u30FC\\u304C\\u60B2\\u3057\\u3059\\u304E\\u308B\\u8868\\u60C5\\u3092\\u3057\\u3066\\u3044\\u3066\\u753B\\u50CF\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u6C34\\u65CF\\u9928\\u3067\\u30AF\\u30E9\\u30B2\\u306B\\u898B\\u3064\\u3081\\u3089\\u308C\\u305F\\u3002\\u3042\\u306E\\u76EE\\u306B\\u306F\\u4F55\\u304B\\u304C\\u5BBF\\u3063\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u306E\\u52D5\\u753B\\u3092\\u898B\\u3066\\u3044\\u308B\\u3060\\u3051\\u3067\\u6642\\u9593\\u304C\\u6EB6\\u3051\\u308B\\u73FE\\u8C61\\u3092\\u8AB0\\u304B\\u79D1\\u5B66\\u7684\\u306B\\u8AAC\\u660E\\u3057\\u3066',\n    '\\u30DA\\u30C3\\u30C8\\u3092\\u98FC\\u3044\\u59CB\\u3081\\u3066\\u304B\\u3089\\u751F\\u6D3B\\u30EA\\u30BA\\u30E0\\u304C\\u6574\\u3063\\u305F\\u3002\\u8CAC\\u4EFB\\u611F\\u306E\\u52B9\\u679C',\n    '\\u6D77\\u8FBA\\u3067\\u30A4\\u30EB\\u30AB\\u3068\\u6CF3\\u3044\\u3060\\u65E5\\u304C\\u4EBA\\u751F\\u3067\\u4E00\\u756A\\u597D\\u304D\\u306A\\u65E5\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u306B\\u8A71\\u3057\\u304B\\u3051\\u308B\\u80FD\\u529B\\u304C\\u6B32\\u3057\\u3059\\u304E\\u3066\\u56F0\\u3063\\u3066\\u3044\\u308B',\n    '\\u72AC\\u3092\\u64AB\\u3067\\u3066\\u3044\\u305F\\u3089\\u96A3\\u306E\\u5B50\\u4F9B\\u305F\\u3061\\u304C\\u5C71\\u306E\\u3088\\u3046\\u306B\\u8FD1\\u3065\\u3044\\u3066\\u304D\\u305F\\u73FE\\u8C61\\u304C\\u8DA3\\u6DF1\\u3044',\n    '\\u52D5\\u7269\\u5712\\u3067\\u3074\\u3063\\u305F\\u308A\\u76EE\\u304C\\u5408\\u3063\\u305F\\u30B4\\u30EA\\u30E9\\u306E\\u76EE\\u306E\\u6DF1\\u3055\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u5B50\\u4F9B\\u306E\\u3053\\u308D\\u5ACC\\u3044\\u3060\\u3063\\u305F\\u866B\\u304C\\u5927\\u4EBA\\u306B\\u306A\\u3063\\u305F\\u4ECA\\u3053\\u3093\\u306A\\u306B\\u304B\\u308F\\u3044\\u304F\\u898B\\u3048\\u308B\\u3068\\u306F\\u601D\\u308F\\u306A\\u304B\\u3063\\u305F',\n    '\\u732B\\u304C\\u6D88\\u706F\\u5F8C\\u306B\\u305D\\u3063\\u3068\\u5BD2\\u3044\\u5834\\u6240\\u306B\\u5165\\u308A\\u8FBC\\u3093\\u3067\\u304F\\u308B\\u884C\\u52D5\\u304C\\u5B8C\\u5168\\u306B\\u4E3B\\u5C0E\\u6A29\\u3092\\u63E1\\u3089\\u308C\\u3066\\u3044\\u308B',\n    '\\u6D77\\u3067\\u30A4\\u30EB\\u30AB\\u3068\\u6CF3\\u3044\\u3060\\u3002\\u3042\\u306E\\u76EE\\u306F\\u307B\\u3093\\u3068\\u306B\\u4EBA\\u306E\\u5FC3\\u3092\\u6C72\\u3093\\u3067\\u3044\\u308B\\u3068\\u5FC3\\u306E\\u4E2D\\u3067\\u53EB\\u3093\\u3060',\n    '\\u52D5\\u7269\\u3068\\u306E\\u6642\\u9593\\u306F\\u8A00\\u8449\\u304C\\u306A\\u304F\\u3066\\u3082\\u5FC3\\u304C\\u901A\\u3058\\u308B\\u3053\\u3068\\u3092\\u6559\\u3048\\u3066\\u304F\\u308C\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u30ED\\u30B9\\u306E\\u8F9B\\u3055\\u3092\\u7D4C\\u9A13\\u3057\\u3066\\u304B\\u3089\\u52D5\\u7269\\u3078\\u306E\\u611B\\u60C5\\u306E\\u6DF1\\u3055\\u3092\\u518D\\u8A8D\\u8B58\\u3057\\u305F',\n    '\\u91CE\\u9CE5\\u306E\\u89B3\\u5BDF\\u3092\\u59CB\\u3081\\u305F\\u3089\\u8FD1\\u6240\\u306E\\u516C\\u5712\\u304C\\u5168\\u304F\\u9055\\u3046\\u5834\\u6240\\u306B\\u898B\\u3048\\u3066\\u304D\\u305F',\n    '\\u52D5\\u7269\\u306E\\u7761\\u7720\\u4E2D\\u306E\\u7121\\u9632\\u5099\\u306A\\u59FF\\u3092\\u898B\\u308B\\u3068\\u7121\\u6761\\u4EF6\\u3067\\u4FE1\\u983C\\u3055\\u308C\\u3066\\u3044\\u308B\\u6C17\\u304C\\u3057\\u3066\\u5B09\\u3057\\u3044',\n    '\\u52D5\\u7269\\u5712\\u306E\\u98FC\\u80B2\\u54E1\\u3055\\u3093\\u306E\\u8A71\\u3092\\u805E\\u3044\\u3066\\u304B\\u3089\\u52D5\\u7269\\u306E\\u898B\\u65B9\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u72AC\\u3068\\u732B\\u304C\\u5E73\\u548C\\u5171\\u5B58\\u3057\\u3066\\u3044\\u308B\\u5BB6\\u3067\\u552F\\u4E00\\u306E\\u7D1B\\u4E89\\u7BA1\\u7406\\u62C5\\u5F53\\u3092\\u3057\\u3066\\u3044\\u307E\\u3059',\n    '\\u52D5\\u7269\\u306E\\u5B50\\u4F9B\\u304C\\u53EF\\u611B\\u304F\\u3066\\u6C42\\u5EA6\\u306E\\u30EC\\u30D9\\u30EB\\u304C\\u9AD8\\u3059\\u304E\\u3066\\u8AA4\\u89E3\\u3055\\u308C\\u3066\\u3044\\u308B',\n    '\\u81EA\\u7136\\u306E\\u4E2D\\u3067\\u91CE\\u751F\\u52D5\\u7269\\u306B\\u51FA\\u4F1A\\u3063\\u305F\\u6642\\u306E\\u7DCA\\u5F35\\u611F\\u3068\\u611F\\u52D5\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u30DA\\u30C3\\u30C8\\u306E\\u5199\\u771F\\u3070\\u304B\\u308A\\u64AE\\u3063\\u3066\\u3044\\u305F\\u3089\\u5199\\u771F\\u306E\\u8155\\u304C\\u4E0A\\u304C\\u3063\\u3066\\u3044\\u305F',\n    '\\u52D5\\u7269\\u306E\\u8868\\u60C5\\u304C\\u8C4A\\u304B\\u3067\\u611F\\u60C5\\u304C\\u3042\\u308B\\u3053\\u3068\\u3092\\u78BA\\u4FE1\\u3057\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u3068\\u63A5\\u3059\\u308B\\u3053\\u3068\\u3067\\u4EBA\\u9593\\u306E\\u8907\\u96D1\\u3055\\u3068\\u5358\\u7D14\\u3055\\u3092\\u540C\\u6642\\u306B\\u611F\\u3058\\u308B',\n    '\\u4FDD\\u8B77\\u72AC\\u3092\\u8FCE\\u3048\\u3066\\u304B\\u3089\\u4E00\\u5E74\\u3001\\u3059\\u3063\\u304B\\u308A\\u5BB6\\u65CF\\u306B\\u306A\\u3063\\u305F',\n    '\\u52D5\\u7269\\u306E\\u8A00\\u8449\\u304C\\u5206\\u304B\\u3063\\u305F\\u3089\\u3069\\u308C\\u307B\\u3069\\u9762\\u767D\\u3044\\u4F1A\\u8A71\\u304C\\u3067\\u304D\\u308B\\u3060\\u308D\\u3046\\u3068\\u672C\\u6C17\\u3067\\u8003\\u3048\\u3066\\u3044\\u308B',\n    '\\u516C\\u5712\\u306E\\u9CE9\\u306B\\u6BCE\\u65E5\\u4F1A\\u3044\\u306B\\u884C\\u304F\\u304A\\u3058\\u3055\\u3093\\u304C\\u7FA8\\u307E\\u3057\\u3044\\u3068\\u601D\\u3044\\u59CB\\u3081\\u305F',\n    '\\u52D5\\u7269\\u306B\\u597D\\u304B\\u308C\\u308B\\u4EBA\\u304C\\u6301\\u3063\\u3066\\u3044\\u308B\\u72EC\\u7279\\u306E\\u7A4F\\u3084\\u304B\\u3055\\u3092\\u8EAB\\u306B\\u3064\\u3051\\u305F\\u3044',\n    '\\u52D5\\u7269\\u3068\\u76EE\\u304C\\u5408\\u3063\\u305F\\u6642\\u306E\\u4E0D\\u601D\\u8B70\\u306A\\u7E4B\\u304C\\u308A\\u306E\\u611F\\u899A\\u304C\\u597D\\u304D',\n    '\\u30DA\\u30C3\\u30C8\\u304C\\u6BCE\\u65E5\\u540C\\u3058\\u6642\\u9593\\u306B\\u8D77\\u3053\\u3057\\u306B\\u6765\\u3066\\u304F\\u308C\\u308B\\u751F\\u6D3B\\u30EA\\u30BA\\u30E0\\u3078\\u306E\\u611F\\u8B1D',\n    '\\u52D5\\u7269\\u306E\\u7121\\u6761\\u4EF6\\u306E\\u611B\\u60C5\\u304C\\u4EBA\\u9593\\u95A2\\u4FC2\\u306B\\u75B2\\u308C\\u305F\\u6642\\u306B\\u6551\\u3044\\u306B\\u306A\\u308B',\n    '\\u91CE\\u751F\\u52D5\\u7269\\u306E\\u30C9\\u30AD\\u30E5\\u30E1\\u30F3\\u30BF\\u30EA\\u30FC\\u3067\\u6CE3\\u3044\\u305F\\u591C\\u304C\\u4F55\\u5EA6\\u3082\\u3042\\u308B',\n    '\\u52D5\\u7269\\u75C5\\u9662\\u3067\\u5148\\u751F\\u306E\\u8AAC\\u660E\\u3092\\u805E\\u304D\\u306A\\u304C\\u3089\\u30DA\\u30C3\\u30C8\\u3078\\u306E\\u8CAC\\u4EFB\\u3092\\u518D\\u5B9F\\u611F\\u3059\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u304C\\u5065\\u5EB7\\u3067\\u3044\\u3066\\u304F\\u308C\\u308B\\u3053\\u3068\\u304C\\u4E00\\u756A\\u306E\\u5E78\\u305B\\u3060\\u3068\\u672C\\u6C17\\u3067\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u306E\\u8D64\\u3061\\u3083\\u3093\\u52D5\\u753B\\u3067\\u4F55\\u6642\\u9593\\u3067\\u3082\\u904E\\u3054\\u305B\\u3066\\u3057\\u307E\\u3046\\u554F\\u984C',\n    '\\u52D5\\u7269\\u3092\\u98FC\\u3063\\u3066\\u304B\\u3089\\u751F\\u547D\\u306E\\u5C0A\\u3055\\u3092\\u65E5\\u5E38\\u3067\\u611F\\u3058\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u8857\\u3067\\u898B\\u304B\\u3051\\u305F\\u91CE\\u826F\\u732B\\u306B\\u540D\\u524D\\u3092\\u3064\\u3051\\u3066\\u52DD\\u624B\\u306B\\u89AA\\u8FD1\\u611F\\u3092\\u6301\\u3063\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u304C\\u3044\\u308B\\u5BB6\\u306E\\u7A7A\\u6C17\\u611F\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u53CB\\u4EBA\\u306E\\u5BB6\\u306B\\u9577\\u5C45\\u3057\\u3059\\u304E\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u306E\\u30EB\\u30FC\\u30C6\\u30A3\\u30F3\\u306B\\u5408\\u308F\\u305B\\u305F\\u751F\\u6D3B\\u304C\\u5B9F\\u306F\\u81EA\\u5206\\u306E\\u5065\\u5EB7\\u306B\\u3082\\u826F\\u304B\\u3063\\u305F',\n    '\\u52D5\\u7269\\u306E\\u8868\\u60C5\\u304C\\u8C4A\\u304B\\u3067\\u611F\\u60C5\\u304C\\u3042\\u308B\\u3053\\u3068\\u3092\\u6BCE\\u65E5\\u78BA\\u4FE1\\u3057\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u5712\\u3067\\u5C55\\u793A\\u3088\\u308A\\u98FC\\u80B2\\u54E1\\u3055\\u3093\\u306E\\u8A71\\u3092\\u805E\\u304F\\u6642\\u9593\\u306E\\u65B9\\u304C\\u9577\\u304F\\u306A\\u3063\\u305F',\n    '\\u30DA\\u30C3\\u30C8\\u304C\\u4F53\\u8ABF\\u306E\\u5909\\u5316\\u306B\\u6700\\u521D\\u306B\\u6C17\\u3065\\u3044\\u3066\\u304F\\u308C\\u308B\\u3053\\u3068\\u3078\\u306E\\u611F\\u8B1D',\n    '\\u52D5\\u7269\\u3068\\u306E\\u4F1A\\u8A71\\u304C\\u3067\\u304D\\u306A\\u3044\\u5206\\u3060\\u3051\\u76EE\\u3068\\u884C\\u52D5\\u3067\\u4F1D\\u3048\\u308B\\u52AA\\u529B\\u304C\\u597D\\u304D',\n    '\\u52D5\\u7269\\u306E\\u540D\\u524D\\u3092\\u899A\\u3048\\u308B\\u901F\\u3055\\u304C\\u4EBA\\u9593\\u3088\\u308A\\u5727\\u5012\\u7684\\u306B\\u901F\\u3044',\n    '\\u4FDD\\u8B77\\u6D3B\\u52D5\\u3092\\u652F\\u63F4\\u3057\\u305F\\u3044\\u6C17\\u6301\\u3061\\u304C\\u52D5\\u7269\\u3092\\u597D\\u304D\\u306B\\u306A\\u308B\\u307B\\u3069\\u5F37\\u304F\\u306A\\u308B',\n    '\\u52D5\\u7269\\u30AB\\u30D5\\u30A7\\u3067\\u904E\\u3054\\u3057\\u305F\\u6642\\u9593\\u306E\\u7652\\u3084\\u3057\\u52B9\\u679C\\u306F\\u79D1\\u5B66\\u7684\\u306B\\u6B63\\u3057\\u3044\\u3068\\u601D\\u3046',\n    '\\u30DA\\u30C3\\u30C8\\u306E\\u4E00\\u65E5\\u3092\\u60F3\\u50CF\\u3057\\u306A\\u304C\\u3089\\u5E30\\u5B85\\u3092\\u6025\\u3050\\u6642\\u9593\\u304C\\u597D\\u304D',\n    '\\u52D5\\u7269\\u3068\\u66AE\\u3089\\u3059\\u3053\\u3068\\u3067\\u5FD8\\u308C\\u3066\\u3044\\u305F\\u611F\\u899A\\u3092\\u53D6\\u308A\\u623B\\u3057\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u91CE\\u9CE5\\u306E\\u89B3\\u5BDF\\u3092\\u59CB\\u3081\\u305F\\u3089\\u8FD1\\u6240\\u306E\\u516C\\u5712\\u304C\\u5168\\u304F\\u9055\\u3046\\u5834\\u6240\\u306B\\u306A\\u3063\\u305F',\n    '\\u52D5\\u7269\\u306B\\u597D\\u304B\\u308C\\u308B\\u4EBA\\u306E\\u5171\\u901A\\u70B9\\u3092\\u7814\\u7A76\\u3057\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u306E\\u5199\\u771F\\u30D5\\u30A9\\u30EB\\u30C0\\u304C\\u4E00\\u756A\\u5BB9\\u91CF\\u3092\\u4F7F\\u3063\\u3066\\u3044\\u308B\\u306E\\u306F\\u4ED5\\u65B9\\u306A\\u3044',\n    '\\u52D5\\u7269\\u306E\\u884C\\u52D5\\u3092\\u89B3\\u5BDF\\u3057\\u3066\\u3044\\u308B\\u3060\\u3051\\u3067\\u6642\\u9593\\u304C\\u6EB6\\u3051\\u3066\\u3044\\u304F\\u5E78\\u798F\\u306A\\u6642\\u9593',\n    '\\u52D5\\u7269\\u306F\\u5618\\u3092\\u3064\\u304B\\u306A\\u3044\\u304B\\u3089\\u3053\\u305D\\u4FE1\\u983C\\u3067\\u304D\\u308B\\u5B58\\u5728\\u3060\\u3068\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u304C\\u5143\\u6C17\\u306B\\u8D70\\u308A\\u56DE\\u3063\\u3066\\u3044\\u308B\\u59FF\\u3092\\u898B\\u308B\\u3060\\u3051\\u3067\\u4E00\\u65E5\\u306E\\u75B2\\u308C\\u304C\\u6D88\\u3048\\u308B',\n    '\\u52D5\\u7269\\u3068\\u306E\\u5225\\u308C\\u3092\\u7D4C\\u9A13\\u3057\\u3066\\u547D\\u306E\\u5927\\u5207\\u3055\\u3092\\u7406\\u89E3\\u3057\\u305F',\n    '\\u52D5\\u7269\\u306E\\u7FD2\\u6027\\u3092\\u8ABF\\u3079\\u59CB\\u3081\\u308B\\u3068\\u6B62\\u307E\\u3089\\u306A\\u304F\\u306A\\u308B\\u9762\\u767D\\u3055\\u304C\\u3042\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u3092\\u8FCE\\u3048\\u3066\\u304B\\u3089\\u65C5\\u884C\\u306E\\u8A08\\u753B\\u304C\\u5909\\u308F\\u3063\\u305F\\u3002\\u305D\\u308C\\u3067\\u3082\\u5F8C\\u6094\\u306F\\u306A\\u3044',\n    '\\u52D5\\u7269\\u304C\\u4EBA\\u9593\\u306B\\u4E0E\\u3048\\u3066\\u304F\\u308C\\u308B\\u7652\\u3084\\u3057\\u306E\\u4FA1\\u5024\\u306F\\u6570\\u5B57\\u3067\\u8868\\u305B\\u306A\\u3044',\n    '\\u52D5\\u7269\\u306B\\u512A\\u3057\\u3044\\u4EBA\\u306F\\u4EBA\\u9593\\u306B\\u3082\\u512A\\u3057\\u3044\\u3068\\u3044\\u3046\\u6CD5\\u5247\\u3092\\u4FE1\\u3058\\u3066\\u3044\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u3068\\u904E\\u3054\\u3059\\u4F55\\u6C17\\u306A\\u3044\\u4E00\\u65E5\\u304C\\u5F8C\\u304B\\u3089\\u4E00\\u756A\\u5927\\u5207\\u306A\\u8A18\\u61B6\\u306B\\u306A\\u308B',\n    '\\u52D5\\u7269\\u306E\\u5199\\u771F\\u3092\\u898B\\u308B\\u3068\\u7121\\u6761\\u4EF6\\u3067\\u8868\\u60C5\\u304C\\u7DE9\\u3080\\u81EA\\u5206\\u306E\\u5358\\u7D14\\u3055\\u304C\\u597D\\u304D',\n    '\\u52D5\\u7269\\u306E\\u3044\\u308B\\u65E5\\u5E38\\u304C\\u5F53\\u305F\\u308A\\u524D\\u306B\\u306A\\u308B\\u3068\\u52D5\\u7269\\u306E\\u3044\\u306A\\u3044\\u65E5\\u5E38\\u306B\\u306F\\u623B\\u308C\\u306A\\u3044',\n    '\\u52D5\\u7269\\u3092\\u901A\\u3058\\u3066\\u77E5\\u308A\\u5408\\u3063\\u305F\\u4EBA\\u3068\\u306E\\u53CB\\u60C5\\u304C\\u7D9A\\u3044\\u3066\\u3044\\u308B',\n    '\\u30DA\\u30C3\\u30C8\\u306E\\u6210\\u9577\\u8A18\\u9332\\u3092\\u3064\\u3051\\u308B\\u307B\\u3069\\u5199\\u771F\\u304C\\u5897\\u3048\\u3066\\u30D5\\u30A9\\u30EB\\u30C0\\u304C\\u6574\\u7406\\u3067\\u304D\\u306A\\u3044',\n    '\\u52D5\\u7269\\u306E\\u58F0\\u3084\\u4F53\\u6E29\\u306E\\u611F\\u89E6\\u304C\\u6700\\u9AD8\\u306E\\u30B9\\u30C8\\u30EC\\u30B9\\u89E3\\u6D88\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u52D5\\u7269\\u3092\\u597D\\u304D\\u3067\\u3044\\u308B\\u3053\\u3068\\u3067\\u81EA\\u5206\\u306E\\u4E2D\\u306E\\u512A\\u3057\\u3055\\u3092\\u4FDD\\u3066\\u3066\\u3044\\u308B\\u6C17\\u304C\\u3059\\u308B'\n  ],\n  '\\u30B9\\u30DD\\u30FC\\u30C4': [\n    '\\u4ECA\\u65E5\\u306E\\u30B8\\u30E7\\u30AE\\u30F3\\u30B0\\u306F5km\\u8D70\\u3063\\u305F\\u3002\\u6C57\\u304C\\u51FA\\u305F\\u5F8C\\u306E\\u30B3\\u30FC\\u30D2\\u30FC\\u304C\\u76EE\\u6A19\\u3060\\u3063\\u305F',\n    '\\u30D5\\u30A9\\u30FC\\u30E0\\u3092\\u610F\\u8B58\\u3057\\u305F\\u3089\\u30BF\\u30A4\\u30E0\\u304C2\\u5206\\u4EE5\\u4E0A\\u4F38\\u3073\\u305F\\u3002\\u3053\\u308C\\u304C\\u6B63\\u3057\\u3044\\u7DF4\\u7FD2\\u3068\\u3044\\u3046\\u3082\\u306E',\n    '\\u7B4B\\u30C8\\u30EC\\u3092\\u7D9A\\u3051\\u3066\\u534A\\u5E74\\u3001\\u93E1\\u3092\\u898B\\u308B\\u7FD2\\u6163\\u304C\\u3067\\u304D\\u305F\\u3002\\u5909\\u5316\\u304C\\u697D\\u3057\\u304F\\u306A\\u3063\\u3066\\u304D\\u305F',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u89B3\\u6226\\u3067\\u96A3\\u306E\\u4EBA\\u3068\\u4E00\\u7DD2\\u306B\\u76DB\\u308A\\u4E0A\\u304C\\u308C\\u308B\\u77AC\\u9593\\u304C\\u597D\\u304D\\u3059\\u304E\\u308B',\n    '\\u671D\\u30E9\\u30F3\\u3092\\u7FD2\\u6163\\u306B\\u3057\\u3066\\u304B\\u3089\\u4E00\\u65E5\\u306E\\u6C17\\u5206\\u304C\\u5909\\u308F\\u3063\\u305F\\u3002\\u5618\\u3060\\u3068\\u601D\\u3063\\u3066\\u305F',\n    '\\u30C1\\u30FC\\u30E0\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u918D\\u9190\\u5473\\u306F\\u500B\\u4EBA\\u3067\\u306F\\u51FA\\u305B\\u306A\\u3044\\u77AC\\u9593\\u304C\\u751F\\u307E\\u308C\\u308B\\u3053\\u3068',\n    '\\u8A66\\u5408\\u524D\\u306E\\u7DCA\\u5F35\\u611F\\u304C\\u3042\\u308B\\u304B\\u3089\\u7D50\\u679C\\u304C\\u5B09\\u3057\\u3044\\u3002\\u30D7\\u30EC\\u30C3\\u30B7\\u30E3\\u30FC\\u306A\\u3057\\u3067\\u306F\\u9054\\u6210\\u611F\\u3082\\u306A\\u3044',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u898B\\u308B\\u3060\\u3051\\u3067\\u3082\\u5FC3\\u62CD\\u6570\\u304C\\u4E0A\\u304C\\u308B\\u3002\\u89B3\\u6226\\u30B9\\u30DD\\u30FC\\u30C4\\u306F\\u7ACB\\u6D3E\\u306A\\u904B\\u52D5\\u3060\\u3068\\u601D\\u3046',\n    '\\u5B50\\u4F9B\\u306E\\u3053\\u308D\\u306B\\u8AE6\\u3081\\u305F\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u5927\\u4EBA\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u59CB\\u3081\\u305F\\u3089\\u5411\\u3044\\u3066\\u3044\\u305F',\n    '\\u30B3\\u30FC\\u30C8\\u306B\\u7ACB\\u3064\\u3068\\u65E5\\u5E38\\u306E\\u3053\\u3068\\u3092\\u5168\\u90E8\\u5FD8\\u308C\\u308B\\u3002\\u305D\\u308C\\u304C\\u7D9A\\u3051\\u3066\\u3044\\u308B\\u7406\\u7531',\n    '\\u30E9\\u30A4\\u30D0\\u30EB\\u306E\\u5B58\\u5728\\u304C\\u81EA\\u5206\\u306E\\u9650\\u754C\\u3092\\u5F15\\u304D\\u4E0A\\u3052\\u3066\\u304F\\u308C\\u308B\\u3053\\u3068\\u3092\\u77E5\\u3063\\u305F',\n    '\\u8CA0\\u3051\\u305F\\u8A66\\u5408\\u304B\\u3089\\u5B66\\u3076\\u3053\\u3068\\u306E\\u65B9\\u304C\\u52DD\\u3063\\u305F\\u8A66\\u5408\\u3088\\u308A\\u591A\\u3044\\u6C17\\u304C\\u3057\\u3066\\u3044\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u77AC\\u9593\\u306E\\u7F8E\\u3057\\u3055\\u306F\\u5199\\u771F\\u3084\\u52D5\\u753B\\u3067\\u306F\\u7D76\\u5BFE\\u306B\\u4F1D\\u308F\\u3089\\u306A\\u3044',\n    '\\u4F53\\u3092\\u52D5\\u304B\\u3057\\u305F\\u5F8C\\u306E\\u7A7A\\u8179\\u611F\\u3068\\u5145\\u5B9F\\u611F\\u306E\\u30BB\\u30C3\\u30C8\\u304C\\u6700\\u9AD8\\u306E\\u72B6\\u614B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u30B8\\u30E0\\u3067\\u898B\\u304B\\u3051\\u308B\\u5E38\\u9023\\u3055\\u3093\\u306E\\u5909\\u5316\\u304C\\u5BC6\\u304B\\u306A\\u697D\\u3057\\u307F',\n    '\\u8A66\\u5408\\u306E\\u6700\\u5F8C\\u306E\\u6570\\u5206\\u306E\\u7DCA\\u5F35\\u611F\\u3060\\u3051\\u306E\\u305F\\u3081\\u306B\\u89B3\\u6226\\u3057\\u3066\\u3044\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u30A2\\u30B9\\u30EA\\u30FC\\u30C8\\u306E\\u30E1\\u30F3\\u30BF\\u30EB\\u7BA1\\u7406\\u3092\\u5B66\\u3093\\u3067\\u304B\\u3089\\u65E5\\u5E38\\u306E\\u30D7\\u30EC\\u30C3\\u30B7\\u30E3\\u30FC\\u3078\\u306E\\u5BFE\\u51E6\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u4E2D\\u7D99\\u306E\\u30A2\\u30CA\\u30A6\\u30F3\\u30B5\\u30FC\\u306E\\u5B9F\\u6CC1\\u3067\\u611F\\u52D5\\u304C\\u500D\\u306B\\u306A\\u308B\\u73FE\\u8C61\\u304C\\u597D\\u304D',\n    '\\u8DA3\\u5473\\u306E\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u901A\\u3058\\u305F\\u53CB\\u4EBA\\u3068\\u306F\\u4E0D\\u601D\\u8B70\\u306A\\u4FE1\\u983C\\u95A2\\u4FC2\\u304C\\u3042\\u308B',\n    '\\u904B\\u52D5\\u5F8C\\u306E\\u30B7\\u30E3\\u30EF\\u30FC\\u304C\\u4E00\\u756A\\u6C17\\u6301\\u3061\\u3044\\u3044\\u77AC\\u9593\\u3068\\u3044\\u3046\\u4E3B\\u5F35\\u3092\\u64A4\\u56DE\\u3059\\u308B\\u3064\\u3082\\u308A\\u306F\\u306A\\u3044',\n    '\\u30D5\\u30A3\\u30B8\\u30AB\\u30EB\\u306E\\u9650\\u754C\\u3068\\u7CBE\\u795E\\u306E\\u9650\\u754C\\u306F\\u9055\\u3046\\u3053\\u3068\\u3092\\u30B9\\u30DD\\u30FC\\u30C4\\u3067\\u5B66\\u3093\\u3060',\n    '\\u521D\\u5FC3\\u8005\\u6B53\\u8FCE\\u306E\\u30B3\\u30DF\\u30E5\\u30CB\\u30C6\\u30A3\\u306B\\u5165\\u3063\\u3066\\u304B\\u3089\\u4E0A\\u9054\\u306E\\u901F\\u5EA6\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u30C9\\u30EA\\u30F3\\u30AF\\u3088\\u308A\\u3082\\u30C8\\u30EC\\u30FC\\u30CB\\u30F3\\u30B0\\u5F8C\\u306E\\u6C34\\u306E\\u65B9\\u304C\\u7F8E\\u5473\\u3044\\u8AD6',\n    '\\u597D\\u304D\\u306A\\u30C1\\u30FC\\u30E0\\u304C\\u52DD\\u3063\\u305F\\u65E5\\u306E\\u4ED5\\u4E8B\\u306E\\u751F\\u7523\\u6027\\u304C\\u4E0A\\u304C\\u308B\\u6C17\\u304C\\u3059\\u308B\\u306E\\u306F\\u6C17\\u306E\\u305B\\u3044\\u3067\\u306F\\u306A\\u3044',\n    '\\u4F53\\u529B\\u304C\\u3042\\u308B\\u3053\\u3068\\u304C\\u81EA\\u4FE1\\u306B\\u306A\\u3063\\u3066\\u4ED6\\u306E\\u90E8\\u5206\\u306B\\u3082\\u5F71\\u97FF\\u3059\\u308B\\u5FAA\\u74B0\\u304C\\u9762\\u767D\\u3044',\n    '\\u9577\\u5E74\\u7D9A\\u3051\\u305F\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u4E00\\u6642\\u671F\\u96E2\\u308C\\u3066\\u623B\\u3063\\u3066\\u304D\\u305F\\u6642\\u306E\\u611F\\u899A\\u306F\\u683C\\u5225',\n    '\\u8A18\\u9332\\u3092\\u66F4\\u65B0\\u3057\\u305F\\u77AC\\u9593\\u3088\\u308A\\u66F4\\u65B0\\u3059\\u308B\\u76F4\\u524D\\u306E\\u96C6\\u4E2D\\u72B6\\u614B\\u304C\\u597D\\u304D',\n    '\\u9053\\u5177\\u3078\\u306E\\u3053\\u3060\\u308F\\u308A\\u304C\\u51FA\\u59CB\\u3081\\u305F\\u3089\\u305D\\u306E\\u30B9\\u30DD\\u30FC\\u30C4\\u304C\\u672C\\u5F53\\u306B\\u597D\\u304D\\u306B\\u306A\\u3063\\u305F\\u8A3C\\u62E0',\n    '\\u4EF2\\u9593\\u3068\\u7DF4\\u7FD2\\u3059\\u308B\\u6642\\u9593\\u306F\\u7D50\\u679C\\u95A2\\u4FC2\\u306A\\u304F\\u5145\\u5B9F\\u3057\\u3066\\u3044\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u30EB\\u30FC\\u30EB\\u3092\\u6DF1\\u304F\\u77E5\\u308B\\u307B\\u3069\\u89B3\\u6226\\u304C\\u9762\\u767D\\u304F\\u306A\\u308B\\u4F53\\u9A13\\u3092\\u3057\\u305F',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u898B\\u3066\\u3044\\u3066\\u9CE5\\u808C\\u304C\\u7ACB\\u3064\\u77AC\\u9593\\u306B\\u751F\\u304D\\u3066\\u3044\\u3066\\u3088\\u304B\\u3063\\u305F\\u3068\\u601D\\u3046',\n    '\\u30C1\\u30FC\\u30E0\\u304C\\u52DD\\u3063\\u305F\\u65E5\\u306F\\u4ED5\\u4E8B\\u3082\\u5BB6\\u4E8B\\u3082\\u3059\\u3079\\u3066\\u3046\\u307E\\u304F\\u3044\\u304F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u30A2\\u30B9\\u30EA\\u30FC\\u30C8\\u304C\\u5168\\u529B\\u3092\\u51FA\\u3057\\u5207\\u3063\\u305F\\u5F8C\\u306E\\u8868\\u60C5\\u304C\\u597D\\u304D',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u89B3\\u6226\\u3067\\u898B\\u77E5\\u3089\\u306C\\u4EBA\\u3068\\u4E00\\u7DD2\\u306B\\u559C\\u3079\\u308B\\u77AC\\u9593\\u304C\\u793E\\u4F1A\\u306E\\u7E2E\\u56F3',\n    '\\u4F53\\u3092\\u52D5\\u304B\\u3057\\u305F\\u5F8C\\u306E\\u723D\\u5FEB\\u611F\\u3092\\u8D85\\u3048\\u308B\\u6C17\\u5206\\u8EE2\\u63DB\\u304C\\u306A\\u3044',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u901A\\u3058\\u305F\\u53CB\\u60C5\\u306F\\u4ED6\\u306E\\u4F55\\u3068\\u3082\\u9055\\u3046\\u6DF1\\u3055\\u304C\\u3042\\u308B',\n    '\\u597D\\u304D\\u306A\\u30C1\\u30FC\\u30E0\\u306E\\u8A66\\u5408\\u524D\\u306E\\u7DCA\\u5F35\\u611F\\u304C\\u697D\\u3057\\u304F\\u3066\\u4ED5\\u65B9\\u306A\\u3044',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u30EB\\u30FC\\u30EB\\u3092\\u899A\\u3048\\u3066\\u304B\\u3089\\u89B3\\u6226\\u304C\\u4F55\\u500D\\u3082\\u9762\\u767D\\u304F\\u306A\\u3063\\u305F',\n    '\\u30A2\\u30B9\\u30EA\\u30FC\\u30C8\\u306E\\u30A4\\u30F3\\u30BF\\u30D3\\u30E5\\u30FC\\u304B\\u3089\\u4EBA\\u751F\\u306E\\u6559\\u8A13\\u3092\\u5F97\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u30B8\\u30E0\\u3067\\u9854\\u898B\\u77E5\\u308A\\u306B\\u306A\\u3063\\u305F\\u4EBA\\u3068\\u306E\\u6328\\u62F6\\u304C\\u5C0F\\u3055\\u306A\\u559C\\u3073',\n    '\\u671D\\u306E\\u8EFD\\u3044\\u904B\\u52D5\\u304C\\u4E00\\u65E5\\u306E\\u30D1\\u30D5\\u30A9\\u30FC\\u30DE\\u30F3\\u30B9\\u3092\\u5909\\u3048\\u308B\\u3068\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3067\\u57F9\\u3063\\u305F\\u7CBE\\u795E\\u529B\\u304C\\u4ED5\\u4E8B\\u306E\\u5834\\u9762\\u3067\\u6D3B\\u304D\\u3066\\u3044\\u308B',\n    '\\u8CA0\\u3051\\u305F\\u6642\\u3082\\u5168\\u529B\\u3092\\u51FA\\u3057\\u5207\\u3063\\u305F\\u30C1\\u30FC\\u30E0\\u306E\\u59FF\\u306B\\u611F\\u52D5\\u3067\\u304D\\u308B',\n    '\\u9577\\u5E74\\u5FDC\\u63F4\\u3057\\u3066\\u3044\\u308B\\u30C1\\u30FC\\u30E0\\u304C\\u512A\\u52DD\\u3057\\u305F\\u6642\\u306E\\u611F\\u6168\\u306F\\u683C\\u5225',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u4E2D\\u7D99\\u306E\\u30A2\\u30CA\\u30A6\\u30F3\\u30B5\\u30FC\\u306E\\u5B9F\\u6CC1\\u3067\\u611F\\u52D5\\u304C\\u500D\\u306B\\u306A\\u308B\\u73FE\\u8C61',\n    '\\u8A66\\u5408\\u306E\\u52DD\\u6557\\u3088\\u308A\\u9078\\u624B\\u306E\\u6210\\u9577\\u3092\\u898B\\u5C4A\\u3051\\u308B\\u3053\\u3068\\u304C\\u697D\\u3057\\u304F\\u306A\\u3063\\u305F',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u59CB\\u3081\\u3066\\u304B\\u3089\\u4F53\\u529B\\u3060\\u3051\\u3067\\u306A\\u304F\\u96C6\\u4E2D\\u529B\\u3082\\u4E0A\\u304C\\u3063\\u305F',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u89B3\\u6226\\u30C1\\u30B1\\u30C3\\u30C8\\u306E\\u53D6\\u308A\\u306B\\u304F\\u3055\\u3068\\u53D6\\u308C\\u305F\\u6642\\u306E\\u559C\\u3073\\u304C\\u6BD4\\u4F8B\\u3059\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u304C\\u597D\\u304D\\u306A\\u4EBA\\u540C\\u58EB\\u306E\\u4F1A\\u8A71\\u306F\\u3069\\u3053\\u304B\\u5171\\u901A\\u8A9E\\u304C\\u3042\\u308B',\n    '\\u8A66\\u5408\\u524D\\u306E\\u30A6\\u30A9\\u30FC\\u30DF\\u30F3\\u30B0\\u30A2\\u30C3\\u30D7\\u306E\\u610F\\u5473\\u304C\\u5206\\u304B\\u3063\\u3066\\u304B\\u3089\\u771F\\u5263\\u306B\\u53D6\\u308A\\u7D44\\u3080',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u901A\\u3058\\u3066\\u81EA\\u5206\\u306E\\u9650\\u754C\\u3092\\u66F4\\u65B0\\u3057\\u7D9A\\u3051\\u308B\\u697D\\u3057\\u3055\\u3092\\u77E5\\u3063\\u305F',\n    '\\u9577\\u8DDD\\u96E2\\u8D70\\u306E\\u8F9B\\u3044\\u5C40\\u9762\\u3092\\u4E57\\u308A\\u8D8A\\u3048\\u305F\\u5F8C\\u306E\\u9054\\u6210\\u611F\\u306F\\u72EC\\u7279',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u6226\\u8853\\u3092\\u5B66\\u3076\\u3068\\u8A66\\u5408\\u306E\\u898B\\u65B9\\u304C\\u5168\\u7136\\u5909\\u308F\\u308B',\n    '\\u30A2\\u30B9\\u30EA\\u30FC\\u30C8\\u306E\\u98DF\\u4E8B\\u7BA1\\u7406\\u3084\\u751F\\u6D3B\\u7FD2\\u6163\\u3078\\u306E\\u610F\\u8B58\\u306E\\u9AD8\\u3055\\u304C\\u53C2\\u8003\\u306B\\u306A\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u30AF\\u30E9\\u30D6\\u306B\\u5165\\u3063\\u3066\\u304B\\u3089\\u81EA\\u7136\\u3068\\u5065\\u5EB7\\u610F\\u8B58\\u304C\\u9AD8\\u307E\\u3063\\u305F',\n    '\\u5B50\\u4F9B\\u3068\\u4E00\\u7DD2\\u306B\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u3059\\u308B\\u3053\\u3068\\u3067\\u7D46\\u304C\\u6DF1\\u307E\\u3063\\u305F',\n    '\\u8A18\\u9332\\u3092\\u66F4\\u65B0\\u3057\\u305F\\u77AC\\u9593\\u3088\\u308A\\u8A18\\u9332\\u66F4\\u65B0\\u76F4\\u524D\\u306E\\u96C6\\u4E2D\\u72B6\\u614B\\u304C\\u597D\\u304D',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u516C\\u5E73\\u306A\\u30EB\\u30FC\\u30EB\\u306E\\u4E2D\\u3067\\u5168\\u529B\\u3092\\u7AF6\\u3044\\u5408\\u3046\\u7F8E\\u3057\\u3055',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3067\\u602A\\u6211\\u3092\\u3057\\u3066\\u56DE\\u5FA9\\u671F\\u9593\\u306E\\u7CBE\\u795E\\u7684\\u306A\\u8A66\\u7DF4\\u3092\\u4E57\\u308A\\u8D8A\\u3048\\u305F',\n    '\\u904B\\u52D5\\u5F8C\\u306E\\u98DF\\u4E8B\\u304C\\u4E00\\u756A\\u7F8E\\u5473\\u3057\\u3044\\u77AC\\u9593\\u306E\\u5E78\\u798F\\u611F\\u3092\\u8AB0\\u304B\\u3068\\u5171\\u6709\\u3057\\u305F\\u3044',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3092\\u901A\\u3058\\u3066\\u76EE\\u6A19\\u3092\\u8A2D\\u5B9A\\u3057\\u9054\\u6210\\u3059\\u308B\\u3053\\u3068\\u306E\\u559C\\u3073\\u3092\\u5B66\\u3093\\u3060',\n    '\\u30C1\\u30FC\\u30E0\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u5168\\u54E1\\u3067\\u52DD\\u3061\\u53D6\\u3063\\u305F\\u611F\\u899A\\u306F\\u500B\\u4EBA\\u3067\\u306F\\u5F97\\u3089\\u308C\\u306A\\u3044',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306B\\u5E74\\u9F62\\u306F\\u95A2\\u4FC2\\u306A\\u3044\\u3068\\u7D9A\\u3051\\u3066\\u3044\\u308B\\u5148\\u8F29\\u304B\\u3089\\u5B66\\u3093\\u3067\\u3044\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u9B45\\u529B\\u3092\\u5B50\\u4F9B\\u305F\\u3061\\u306B\\u4F1D\\u3048\\u308B\\u3053\\u3068\\u3078\\u306E\\u4F7F\\u547D\\u611F\\u304C\\u3042\\u308B',\n    '\\u81EA\\u5206\\u304C\\u30D7\\u30EC\\u30FC\\u3059\\u308B\\u3088\\u308A\\u3082\\u89B3\\u6226\\u306E\\u65B9\\u304C\\u7DCA\\u5F35\\u3059\\u308B\\u8B0E\\u306E\\u73FE\\u8C61',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u3067\\u6D41\\u3059\\u6C57\\u306E\\u91CF\\u3068\\u6BD4\\u4F8B\\u3059\\u308B\\u3088\\u3046\\u306B\\u5FC3\\u304C\\u8EFD\\u304F\\u306A\\u308B',\n    '\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u8A66\\u5408\\u306B\\u306F\\u4EBA\\u751F\\u306E\\u7E2E\\u56F3\\u304C\\u5168\\u3066\\u8A70\\u307E\\u3063\\u3066\\u3044\\u308B\\u3068\\u601D\\u3046',\n    '\\u597D\\u304D\\u306A\\u30B9\\u30DD\\u30FC\\u30C4\\u306E\\u8056\\u5730\\u306B\\u4E00\\u5EA6\\u306F\\u8A2A\\u308C\\u305F\\u3044\\u3068\\u3044\\u3046\\u5922\\u304C\\u3042\\u308B'\n  ],\n  '\\u30E9\\u30A4\\u30D5\\u30B9\\u30BF\\u30A4\\u30EB': [\n    '\\u671D\\u306E\\u73C8\\u7432\\u3092\\u4E01\\u5BE7\\u306B\\u6DF9\\u308C\\u308B10\\u5206\\u304C\\u4E00\\u65E5\\u306E\\u4E2D\\u3067\\u4E00\\u756A\\u597D\\u304D\\u306A\\u6642\\u9593\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u65AD\\u6368\\u96E2\\u3092\\u6C7A\\u610F\\u3057\\u3066\\u4E09\\u6642\\u9593\\u5F8C\\u306B\\u306F\\u65B0\\u3057\\u3044\\u3082\\u306E\\u3092\\u8CB7\\u3063\\u3066\\u3044\\u305F\\u3002\\u3053\\u308C\\u304C\\u4EBA\\u9593',\n    '\\u591C\\u66F4\\u304B\\u3057\\u3057\\u305F\\u7FCC\\u65E5\\u306E\\u982D\\u306E\\u91CD\\u3055\\u304C\\u5E74\\u3005\\u304D\\u3064\\u304F\\u306A\\u3063\\u3066\\u3044\\u308B\\u3002\\u3053\\u308C\\u304C\\u8001\\u5316\\u3068\\u3044\\u3046\\u3082\\u306E',\n    '\\u9031\\u306B\\u4E00\\u56DE\\u306E\\u4F55\\u3082\\u3057\\u306A\\u3044\\u65E5\\u3092\\u4F5C\\u3063\\u305F\\u3089\\u751F\\u7523\\u6027\\u304C\\u4E0A\\u304C\\u3063\\u305F\\u3002\\u9006\\u8AAC\\u7684\\u3060\\u304C\\u672C\\u5F53',\n    '\\u304A\\u6C17\\u306B\\u5165\\u308A\\u306E\\u30AB\\u30D5\\u30A7\\u306E\\u5B9A\\u4F4D\\u7F6E\\u304C\\u4ED6\\u306E\\u4EBA\\u306B\\u53D6\\u3089\\u308C\\u305F\\u6642\\u306E\\u5C0F\\u3055\\u306A\\u60B2\\u5287',\n    '\\u30EB\\u30FC\\u30C6\\u30A3\\u30F3\\u3092\\u5909\\u3048\\u305F\\u3089\\u7FD2\\u6163\\u306E\\u5927\\u5207\\u3055\\u3092\\u9006\\u8AAC\\u7684\\u306B\\u7406\\u89E3\\u3057\\u305F',\n    '\\u624B\\u5E33\\u306B\\u66F8\\u304F\\u7FD2\\u6163\\u3092\\u59CB\\u3081\\u3066\\u6C17\\u3065\\u3044\\u305F\\u3053\\u3068\\u306F\\u3001\\u8003\\u3048\\u304C\\u6574\\u7406\\u3055\\u308C\\u308B\\u3088\\u308A\\u611F\\u60C5\\u304C\\u6574\\u7406\\u3055\\u308C\\u308B',\n    '\\u9593\\u63A5\\u7167\\u660E\\u3060\\u3051\\u3067\\u904E\\u3054\\u3059\\u591C\\u306E\\u8C4A\\u304B\\u3055\\u3092\\u77E5\\u3063\\u3066\\u304B\\u3089\\u5929\\u4E95\\u306E\\u86CD\\u5149\\u706F\\u3092\\u70B9\\u3051\\u3089\\u308C\\u306A\\u304F\\u306A\\u3063\\u305F',\n    '\\u6563\\u6B69\\u306E\\u8DDD\\u96E2\\u304C\\u5C11\\u3057\\u305A\\u3064\\u4F38\\u3073\\u3066\\u3044\\u3063\\u3066\\u4ECA\\u3067\\u306F\\u6BCE\\u65E58km\\u6B69\\u3044\\u3066\\u3044\\u308B',\n    '\\u9031\\u4E00\\u306E\\u4E00\\u4EBA\\u6620\\u753B\\u9928\\u901A\\u3044\\u304C\\u30E9\\u30A4\\u30D5\\u30EF\\u30FC\\u30AF\\u306B\\u306A\\u3063\\u3066\\u4E09\\u5E74\\u76EE\\u3002\\u3084\\u3081\\u308B\\u7406\\u7531\\u304C\\u306A\\u3044',\n    '\\u30C7\\u30B8\\u30BF\\u30EB\\u30C7\\u30C8\\u30C3\\u30AF\\u30B9\\u3092\\u8A66\\u307F\\u305F\\u4F11\\u65E5\\u304C\\u4ECA\\u307E\\u3067\\u4E00\\u756A\\u5145\\u5B9F\\u3057\\u3066\\u3044\\u305F\\u7406\\u7531\\u3092\\u8003\\u3048\\u4E2D',\n    '\\u597D\\u304D\\u306A\\u9999\\u308A\\u306E\\u30EB\\u30FC\\u30E0\\u30D5\\u30EC\\u30B0\\u30E9\\u30F3\\u30B9\\u304C\\u751F\\u6D3B\\u306E\\u8CEA\\u3092\\u672C\\u5F53\\u306B\\u4E0A\\u3052\\u308B\\u3068\\u306F\\u601D\\u3063\\u3066\\u3044\\u306A\\u304B\\u3063\\u305F',\n    '\\u6BCE\\u671D5\\u5206\\u306E\\u7791\\u60F3\\u3092\\u7D9A\\u3051\\u3066\\u4E00\\u30F6\\u6708\\u3002\\u5909\\u5316\\u304C\\u3042\\u308B\\u306E\\u304B\\u306A\\u3044\\u306E\\u304B\\u3088\\u304F\\u308F\\u304B\\u3089\\u306A\\u3044\\u304C\\u7D9A\\u3051\\u3066\\u3044\\u308B',\n    '\\u8AAD\\u66F8\\u3068\\u6563\\u6B69\\u3068\\u97F3\\u697D\\u304C\\u3042\\u308C\\u3070\\u751F\\u304D\\u3066\\u3044\\u3051\\u308B\\u3068\\u6C17\\u3065\\u3044\\u305F\\u9031\\u672B',\n    '\\u30B3\\u30F3\\u30D3\\u30CB\\u306B\\u5BC4\\u3089\\u306A\\u3044\\u751F\\u6D3B\\u3092\\u8A66\\u307F\\u305F\\u3089\\u6708\\u306E\\u51FA\\u8CBB\\u304C\\u60F3\\u50CF\\u4EE5\\u4E0A\\u306B\\u6E1B\\u3063\\u305F',\n    '\\u304A\\u6C17\\u306B\\u5165\\u308A\\u306E\\u30DE\\u30B0\\u30AB\\u30C3\\u30D7\\u304C\\u5272\\u308C\\u305F\\u6642\\u306E\\u55AA\\u5931\\u611F\\u306F\\u7269\\u3078\\u306E\\u57F7\\u7740\\u3092\\u8003\\u3048\\u3055\\u305B\\u3089\\u308C\\u308B',\n    '\\u9031\\u672B\\u306E\\u671D\\u306B\\u8FD1\\u6240\\u306E\\u30D1\\u30F3\\u5C4B\\u306B\\u884C\\u304F\\u7FD2\\u6163\\u304C\\u751F\\u6D3B\\u306E\\u4E2D\\u5FC3\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u7761\\u7720\\u306E\\u8CEA\\u3092\\u4E0A\\u3052\\u305F\\u3089\\u4EBA\\u751F\\u306E\\u8CEA\\u304C\\u4E0A\\u304C\\u3063\\u305F\\u3002\\u5F53\\u305F\\u308A\\u524D\\u306E\\u3053\\u3068\\u3060\\u3051\\u3069\\u4F53\\u611F\\u3059\\u308B\\u307E\\u3067\\u4FE1\\u3058\\u3066\\u306A\\u304B\\u3063\\u305F',\n    '\\u5B63\\u7BC0\\u3054\\u3068\\u306B\\u30A4\\u30F3\\u30C6\\u30EA\\u30A2\\u3092\\u5C11\\u3057\\u5909\\u3048\\u308B\\u697D\\u3057\\u307F\\u3092\\u899A\\u3048\\u3066\\u304B\\u3089\\u5BB6\\u304C\\u597D\\u304D\\u306B\\u306A\\u3063\\u305F',\n    '\\u81EA\\u5206\\u306E\\u30DA\\u30FC\\u30B9\\u3067\\u751F\\u304D\\u308B\\u3053\\u3068\\u3068\\u4ED6\\u4EBA\\u306E\\u30DA\\u30FC\\u30B9\\u306B\\u5408\\u308F\\u305B\\u308B\\u3053\\u3068\\u306E\\u30D0\\u30E9\\u30F3\\u30B9\\u3092\\u63A2\\u3057\\u3066\\u3044\\u308B',\n    '\\u4E00\\u65E5\\u306E\\u7D42\\u308F\\u308A\\u306B\\u4E09\\u3064\\u306E\\u826F\\u304B\\u3063\\u305F\\u3053\\u3068\\u3092\\u66F8\\u304F\\u7FD2\\u6163\\u304C\\u7D9A\\u3044\\u3066\\u534A\\u5E74\\u306B\\u306A\\u3063\\u305F',\n    '\\u671D\\u578B\\u306B\\u5909\\u3048\\u305F\\u3089\\u5915\\u65B9\\u306E\\u96C6\\u4E2D\\u529B\\u304C\\u4E0A\\u304C\\u3063\\u305F\\u3002\\u4EBA\\u9593\\u306E\\u4ED5\\u7D44\\u307F\\u306F\\u4E0D\\u601D\\u8B70',\n    '\\u5B9A\\u671F\\u7684\\u306B\\u81EA\\u7136\\u306E\\u4E2D\\u306B\\u884C\\u304B\\u306A\\u3044\\u3068\\u7CBE\\u795E\\u7684\\u306B\\u606F\\u82E6\\u3057\\u304F\\u306A\\u308B\\u3053\\u3068\\u306B\\u6C17\\u3065\\u3044\\u305F',\n    '\\u4E01\\u5BE7\\u306B\\u751F\\u6D3B\\u3059\\u308B\\u3053\\u3068\\u3068\\u52B9\\u7387\\u3088\\u304F\\u751F\\u6D3B\\u3059\\u308B\\u3053\\u3068\\u306F\\u5FC5\\u305A\\u3057\\u3082\\u77DB\\u76FE\\u3057\\u306A\\u3044',\n    '\\u597D\\u304D\\u306A\\u3082\\u306E\\u306B\\u56F2\\u307E\\u308C\\u3066\\u751F\\u6D3B\\u3059\\u308B\\u3053\\u3068\\u306E\\u5927\\u5207\\u3055\\u309230\\u4EE3\\u306B\\u306A\\u3063\\u3066\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u9031\\u672B\\u306E\\u671D\\u306E\\u5E02\\u5834\\u901A\\u3044\\u304C\\u8DA3\\u5473\\u306B\\u306A\\u3063\\u3066\\u91CE\\u83DC\\u306E\\u76EE\\u5229\\u304D\\u304C\\u5C11\\u3057\\u4E0A\\u624B\\u304F\\u306A\\u3063\\u305F',\n    '\\u65C5\\u884C\\u306E\\u8A08\\u753B\\u3092\\u7ACB\\u3066\\u3066\\u3044\\u308B\\u6642\\u9593\\u304C\\u65C5\\u884C\\u672C\\u756A\\u3068\\u540C\\u3058\\u304F\\u3089\\u3044\\u697D\\u3057\\u3044',\n    '\\u30C7\\u30B9\\u30AF\\u5468\\u308A\\u3092\\u6574\\u7406\\u3057\\u305F\\u3089\\u4ED5\\u4E8B\\u3078\\u306E\\u6C17\\u6301\\u3061\\u307E\\u3067\\u6574\\u7406\\u3055\\u308C\\u305F\\u6C17\\u304C\\u3057\\u305F',\n    '\\u597D\\u304D\\u306A\\u3053\\u3068\\u306B\\u6642\\u9593\\u3092\\u4F7F\\u3046\\u305F\\u3081\\u306B\\u5ACC\\u3044\\u306A\\u3053\\u3068\\u3092\\u52B9\\u7387\\u5316\\u3059\\u308B\\u306E\\u304C\\u4ECA\\u306E\\u8AB2\\u984C',\n    '\\u4F55\\u3082\\u306A\\u3044\\u4F11\\u65E5\\u306E\\u5348\\u5F8C\\u306B\\u5916\\u306E\\u97F3\\u3092\\u8074\\u304D\\u306A\\u304C\\u3089\\u307C\\u30FC\\u3063\\u3068\\u3059\\u308B\\u6642\\u9593\\u304C\\u4E00\\u756A\\u8D05\\u6CA2',\n    '\\u671D10\\u5206\\u65E9\\u304F\\u8D77\\u304D\\u308B\\u3060\\u3051\\u3067\\u4E00\\u65E5\\u306E\\u59CB\\u307E\\u308A\\u65B9\\u304C\\u5168\\u7136\\u9055\\u3046',\n    '\\u9031\\u306B\\u4E00\\u5EA6\\u3060\\u3051\\u5B8C\\u5168\\u306B\\u30B9\\u30DE\\u30DB\\u3092\\u30AA\\u30D5\\u306B\\u3059\\u308B\\u6642\\u9593\\u304C\\u4E00\\u756A\\u81EA\\u5206\\u3089\\u3057\\u304F\\u306A\\u308C\\u308B',\n    '\\u304A\\u6C17\\u306B\\u5165\\u308A\\u306E\\u30EB\\u30FC\\u30C6\\u30A3\\u30F3\\u3092\\u6301\\u3064\\u3068\\u6BCE\\u65E5\\u306B\\u5B89\\u5FC3\\u611F\\u304C\\u751F\\u307E\\u308C\\u308B',\n    '\\u751F\\u6D3B\\u306E\\u4E2D\\u306E\\u5C0F\\u3055\\u306A\\u8D05\\u6CA2\\u3092\\u898B\\u3064\\u3051\\u308B\\u3053\\u3068\\u304C\\u5E78\\u798F\\u611F\\u3092\\u4E0A\\u3052\\u308B\\u30B3\\u30C4',\n    '\\u65AD\\u6368\\u96E2\\u3057\\u305F\\u5F8C\\u306E\\u7A7A\\u9593\\u306E\\u5FC3\\u5730\\u3088\\u3055\\u304C\\u624B\\u653E\\u305B\\u306A\\u304F\\u306A\\u3063\\u305F',\n    '\\u65E9\\u8D77\\u304D\\u3092\\u7FD2\\u6163\\u306B\\u3057\\u305F\\u3089\\u4EBA\\u751F\\u3067\\u4F7F\\u3048\\u308B\\u6642\\u9593\\u304C\\u5897\\u3048\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u81EA\\u5206\\u306E\\u30DA\\u30FC\\u30B9\\u3067\\u66AE\\u3089\\u3059\\u3053\\u3068\\u306E\\u5927\\u5207\\u3055\\u309230\\u4EE3\\u306B\\u306A\\u3063\\u3066\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u6BCE\\u65E5\\u5C11\\u3057\\u305A\\u3064\\u3067\\u3082\\u597D\\u304D\\u306A\\u3053\\u3068\\u3092\\u3059\\u308B\\u6642\\u9593\\u3092\\u78BA\\u4FDD\\u3059\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u98DF\\u4E8B\\u3092\\u4E01\\u5BE7\\u306B\\u53D6\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u4F53\\u3068\\u6C17\\u6301\\u3061\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u90E8\\u5C4B\\u306E\\u74B0\\u5883\\u304C\\u601D\\u8003\\u3068\\u611F\\u60C5\\u306B\\u76F4\\u63A5\\u5F71\\u97FF\\u3059\\u308B\\u3053\\u3068\\u3092\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u751F\\u6D3B\\u8CBB\\u306E\\u898B\\u76F4\\u3057\\u3092\\u3057\\u305F\\u3089\\u672C\\u5F53\\u306B\\u5FC5\\u8981\\u306A\\u3082\\u306E\\u304C\\u898B\\u3048\\u3066\\u304D\\u305F',\n    '\\u9031\\u672B\\u306E\\u4E88\\u5B9A\\u3092\\u8A70\\u3081\\u8FBC\\u307E\\u306A\\u3044\\u3088\\u3046\\u306B\\u3057\\u305F\\u3089\\u56DE\\u5FA9\\u529B\\u304C\\u4E0A\\u304C\\u3063\\u305F',\n    '\\u7DD1\\u3092\\u90E8\\u5C4B\\u306B\\u7F6E\\u3044\\u305F\\u3089\\u7A7A\\u6C17\\u611F\\u304C\\u5909\\u308F\\u3063\\u3066\\u5FC3\\u304C\\u843D\\u3061\\u7740\\u3044\\u305F',\n    '\\u65E5\\u3005\\u306E\\u611F\\u8B1D\\u3092\\u66F8\\u304F\\u7FD2\\u6163\\u304C\\u4E00\\u756A\\u7CBE\\u795E\\u7684\\u306A\\u5B89\\u5B9A\\u306B\\u3064\\u306A\\u304C\\u3063\\u3066\\u3044\\u308B',\n    '\\u81EA\\u708A\\u7387\\u304C\\u4E0A\\u304C\\u3063\\u3066\\u304B\\u3089\\u5065\\u5EB7\\u72B6\\u614B\\u3082\\u5BB6\\u8A08\\u3082\\u6539\\u5584\\u3055\\u308C\\u305F',\n    '\\u901A\\u52E4\\u6642\\u9593\\u306E\\u4F7F\\u3044\\u65B9\\u3092\\u5909\\u3048\\u305F\\u3060\\u3051\\u3067\\u751F\\u6D3B\\u306E\\u8CEA\\u304C\\u4E0A\\u304C\\u3063\\u305F',\n    '\\u304A\\u6C17\\u306B\\u5165\\u308A\\u306E\\u9999\\u308A\\u306E\\u30A2\\u30ED\\u30DE\\u3092\\u3064\\u3051\\u308B\\u3060\\u3051\\u3067\\u7A7A\\u9593\\u304C\\u5909\\u308F\\u308B\\u4F53\\u9A13',\n    '\\u66AE\\u3089\\u3057\\u3092\\u30B7\\u30F3\\u30D7\\u30EB\\u306B\\u3059\\u308B\\u307B\\u3069\\u672C\\u5F53\\u306B\\u5927\\u5207\\u306A\\u3082\\u306E\\u304C\\u898B\\u3048\\u3066\\u304F\\u308B',\n    '\\u6BCE\\u9031\\u672B\\u306B\\u6765\\u9031\\u306E\\u8A08\\u753B\\u3092\\u7ACB\\u3066\\u308B\\u7FD2\\u6163\\u304C\\u4ED5\\u4E8B\\u3082\\u30D7\\u30E9\\u30A4\\u30D9\\u30FC\\u30C8\\u3082\\u6539\\u5584\\u3057\\u305F',\n    '\\u30C7\\u30B8\\u30BF\\u30EB\\u3092\\u610F\\u8B58\\u7684\\u306B\\u6E1B\\u3089\\u3057\\u305F\\u65E5\\u306E\\u5145\\u5B9F\\u611F\\u304C\\u9AD8\\u304B\\u3063\\u305F\\u7406\\u7531\\u3092\\u8003\\u3048\\u3066\\u3044\\u308B',\n    '\\u904B\\u52D5\\u306E\\u7FD2\\u6163\\u304C\\u5168\\u3066\\u306E\\u30D9\\u30FC\\u30B9\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B\\u3068\\u5B9F\\u611F\\u3059\\u308B',\n    '\\u751F\\u6D3B\\u306E\\u4E2D\\u306B\\u697D\\u3057\\u307F\\u3092\\u6563\\u308A\\u3070\\u3081\\u3066\\u304A\\u304F\\u3068\\u65E5\\u3005\\u306E\\u5145\\u5B9F\\u611F\\u304C\\u5909\\u308F\\u308B',\n    '\\u9031\\u306B\\u4E00\\u5EA6\\u306F\\u65B0\\u3057\\u3044\\u3053\\u3068\\u3092\\u8A66\\u3059\\u7FD2\\u6163\\u304C\\u4EBA\\u751F\\u3092\\u30DE\\u30F3\\u30CD\\u30EA\\u304B\\u3089\\u5B88\\u3063\\u3066\\u3044\\u308B',\n    '\\u597D\\u304D\\u306A\\u5834\\u6240\\u3067\\u597D\\u304D\\u306A\\u3082\\u306E\\u3092\\u98DF\\u3079\\u308B\\u6642\\u9593\\u3092\\u610F\\u8B58\\u7684\\u306B\\u4F5C\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u66AE\\u3089\\u3057\\u306E\\u4E01\\u5BE7\\u3055\\u3068\\u4EBA\\u9593\\u95A2\\u4FC2\\u306E\\u4E01\\u5BE7\\u3055\\u306F\\u30EA\\u30F3\\u30AF\\u3057\\u3066\\u3044\\u308B\\u6C17\\u304C\\u3059\\u308B',\n    '\\u7D99\\u7D9A\\u3067\\u304D\\u3066\\u3044\\u308B\\u7FD2\\u6163\\u304C\\u5897\\u3048\\u308B\\u307B\\u3069\\u81EA\\u5DF1\\u4FE1\\u983C\\u304C\\u9AD8\\u307E\\u3063\\u3066\\u3044\\u304F',\n    '\\u5B63\\u7BC0\\u3092\\u610F\\u8B58\\u3057\\u305F\\u66AE\\u3089\\u3057\\u3092\\u3059\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u611F\\u53D7\\u6027\\u304C\\u8C4A\\u304B\\u306B\\u306A\\u3063\\u305F',\n    '\\u751F\\u6D3B\\u306E\\u4E2D\\u306B\\u9069\\u5EA6\\u306A\\u4F59\\u767D\\u3092\\u4F5C\\u308B\\u3053\\u3068\\u304C\\u9577\\u304F\\u7D9A\\u3051\\u3089\\u308C\\u308B\\u79D8\\u8A23',\n    '\\u81EA\\u5206\\u306E\\u4FA1\\u5024\\u89B3\\u306B\\u5408\\u3063\\u305F\\u751F\\u6D3B\\u30B9\\u30BF\\u30A4\\u30EB\\u3092\\u898B\\u3064\\u3051\\u308B\\u306E\\u306B\\u6642\\u9593\\u304C\\u304B\\u304B\\u3063\\u305F',\n    '\\u66AE\\u3089\\u3057\\u3092\\u6574\\u3048\\u308B\\u3053\\u3068\\u304C\\u6700\\u3082\\u8EAB\\u8FD1\\u306A\\u81EA\\u5DF1\\u6295\\u8CC7\\u3060\\u3068\\u4FE1\\u3058\\u3066\\u3044\\u308B',\n    '\\u5C0F\\u3055\\u306A\\u3053\\u3068\\u3092\\u4E01\\u5BE7\\u306B\\u3059\\u308B\\u7FD2\\u6163\\u304C\\u7A4D\\u307F\\u91CD\\u306A\\u3063\\u3066\\u5927\\u304D\\u306A\\u5909\\u5316\\u306B\\u306A\\u3063\\u305F',\n    '\\u81EA\\u5206\\u306E\\u305F\\u3081\\u306E\\u6642\\u9593\\u3092\\u78BA\\u4FDD\\u3059\\u308B\\u3053\\u3068\\u306B\\u7F6A\\u60AA\\u611F\\u3092\\u611F\\u3058\\u306A\\u304F\\u306A\\u3063\\u305F',\n    '\\u751F\\u6D3B\\u306E\\u30EB\\u30FC\\u30C6\\u30A3\\u30F3\\u304C\\u5D29\\u308C\\u305F\\u6642\\u306E\\u5BFE\\u5FDC\\u529B\\u304C\\u4E0A\\u304C\\u3063\\u3066\\u304D\\u305F',\n    '\\u597D\\u304D\\u306A\\u3053\\u3068\\u3078\\u306E\\u6642\\u9593\\u6295\\u8CC7\\u304C\\u4E00\\u756A\\u30EA\\u30BF\\u30FC\\u30F3\\u304C\\u9AD8\\u3044\\u3068\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u5B8C\\u74A7\\u306A\\u751F\\u6D3B\\u3092\\u76EE\\u6307\\u3059\\u3088\\u308A\\u7A0B\\u3088\\u3044\\u751F\\u6D3B\\u3092\\u7D9A\\u3051\\u308B\\u3053\\u3068\\u306E\\u65B9\\u304C\\u5927\\u5207',\n    '\\u4F4F\\u3080\\u5834\\u6240\\u304C\\u5909\\u308F\\u308B\\u305F\\u3073\\u306B\\u81EA\\u5206\\u306E\\u512A\\u5148\\u9806\\u4F4D\\u304C\\u660E\\u78BA\\u306B\\u306A\\u3063\\u3066\\u304D\\u305F',\n    '\\u751F\\u6D3B\\u3092\\u898B\\u76F4\\u3059\\u304D\\u3063\\u304B\\u3051\\u306B\\u306A\\u3063\\u305F\\u672C\\u3084\\u4EBA\\u3068\\u306E\\u51FA\\u4F1A\\u3044\\u306B\\u611F\\u8B1D\\u3057\\u3066\\u3044\\u308B',\n    '\\u66AE\\u3089\\u3057\\u306E\\u4E2D\\u306E\\u7F8E\\u3057\\u3044\\u3082\\u306E\\u306B\\u6C17\\u3065\\u304F\\u76EE\\u304C\\u990A\\u308F\\u308C\\u3066\\u304D\\u305F\\u6C17\\u304C\\u3059\\u308B'\n  ],\n  '\\u30A2\\u30CB\\u30E1': [\n    '\\u6628\\u65E5\\u4E00\\u6C17\\u898B\\u3057\\u305F\\u30A2\\u30CB\\u30E1\\u306E\\u30E9\\u30B9\\u30C8\\u3067\\u58F0\\u304C\\u51FA\\u305F\\u3002\\u3053\\u306E\\u4F5C\\u54C1\\u3068\\u51FA\\u4F1A\\u3048\\u3066\\u3088\\u304B\\u3063\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u4E3B\\u984C\\u6B4C\\u304C\\u982D\\u304B\\u3089\\u96E2\\u308C\\u306A\\u304F\\u3066\\u4E09\\u65E5\\u9593\\u30EB\\u30FC\\u30D7\\u3057\\u3066\\u3044\\u308B',\n    '\\u539F\\u4F5C\\u3092\\u8AAD\\u3093\\u3067\\u3044\\u305F\\u30A2\\u30CB\\u30E1\\u5316\\u4F5C\\u54C1\\u306E\\u58F0\\u512A\\u3055\\u3093\\u304C\\u5B8C\\u74A7\\u3059\\u304E\\u3066\\u9707\\u3048\\u305F',\n    '\\u6DF1\\u591C\\u30A2\\u30CB\\u30E1\\u306F\\u6DF1\\u591C\\u306B\\u898B\\u306A\\u3044\\u3068\\u96F0\\u56F2\\u6C17\\u304C\\u51FA\\u306A\\u3044\\u3068\\u3044\\u3046\\u4FE1\\u5FF5\\u304C\\u3042\\u308B',\n    '\\u4F5C\\u753B\\u304C\\u5D29\\u308C\\u3066\\u3044\\u3066\\u3082\\u597D\\u304D\\u306A\\u4F5C\\u54C1\\u306F\\u597D\\u304D\\u3060\\u3051\\u3069\\u30AC\\u30C1\\u4F5C\\u753B\\u56DE\\u306F\\u672C\\u5F53\\u306B\\u683C\\u304C\\u9055\\u3046',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u8056\\u5730\\u5DE1\\u793C\\u3092\\u3057\\u305F\\u3089\\u73FE\\u5B9F\\u3068\\u753B\\u9762\\u304C\\u91CD\\u306A\\u3063\\u305F\\u77AC\\u9593\\u306E\\u4E0D\\u601D\\u8B70\\u306A\\u611F\\u52D5',\n    '\\u7D9A\\u304D\\u304C\\u6C17\\u306B\\u306A\\u308A\\u3059\\u304E\\u3066\\u539F\\u4F5C\\u3092\\u8CB7\\u3063\\u305F\\u3089\\u4E00\\u6669\\u3067\\u8AAD\\u3093\\u3067\\u3057\\u307E\\u3063\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u30AD\\u30E3\\u30E9\\u306E\\u30BB\\u30EA\\u30D5\\u304C\\u65E5\\u5E38\\u3067\\u4F7F\\u3044\\u305F\\u3044\\u306E\\u306B\\u6BCE\\u56DE\\u6ED1\\u308B\\u306E\\u3082\\u3042\\u308C',\n    '\\u30B5\\u30D6\\u30B9\\u30AF\\u306E\\u30A2\\u30CB\\u30E1\\u6570\\u304C\\u591A\\u3059\\u304E\\u3066\\u672A\\u8996\\u8074\\u30EA\\u30B9\\u30C8\\u304C\\u6D88\\u5316\\u3067\\u304D\\u3066\\u3044\\u306A\\u3044',\n    '\\u97F3\\u697D\\u304C\\u826F\\u3059\\u304E\\u3066\\u30A2\\u30CB\\u30E1\\u306EED\\u3060\\u3051\\u3067\\u6BCE\\u56DE\\u611F\\u52D5\\u3057\\u3066\\u308B',\n    '\\u597D\\u304D\\u306A\\u30A2\\u30CB\\u30E1\\u306E\\u65B0\\u30B7\\u30EA\\u30FC\\u30BA\\u767A\\u8868\\u306B\\u79D2\\u3067\\u53CD\\u5FDC\\u3057\\u305F\\u5F8C\\u306B\\u767A\\u58F2\\u65E5\\u3092\\u78BA\\u8A8D\\u3057\\u305F\\u3089\\u6765\\u5E74\\u3060\\u3063\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306B\\u6CE3\\u304B\\u3055\\u308C\\u308B\\u306E\\u304C\\u5ACC\\u3067\\u5F37\\u304C\\u3063\\u3066\\u3044\\u305F\\u306E\\u306B\\u6700\\u8FD1\\u306F\\u6CE3\\u304F\\u524D\\u63D0\\u3067\\u8996\\u8074\\u3057\\u3066\\u3044\\u308B',\n    '\\u4F5C\\u753B\\u76E3\\u7763\\u306B\\u3088\\u3063\\u3066\\u8868\\u60C5\\u306E\\u4F5C\\u308A\\u65B9\\u304C\\u9055\\u3046\\u3053\\u3068\\u306B\\u6C17\\u3065\\u3044\\u3066\\u304B\\u3089\\u898B\\u65B9\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u4E16\\u754C\\u89B3\\u304C\\u597D\\u304D\\u3059\\u304E\\u3066\\u8056\\u5178\\u30D6\\u30C3\\u30AF\\u3092\\u96C6\\u3081\\u3066\\u3044\\u308B',\n    '\\u30AD\\u30E3\\u30E9\\u30BD\\u30F3\\u3060\\u3051\\u3067\\u4E00\\u679A\\u306E\\u30A2\\u30EB\\u30D0\\u30E0\\u3068\\u3057\\u3066\\u5B8C\\u6210\\u5EA6\\u304C\\u9AD8\\u3044\\u3082\\u306E\\u304C\\u3042\\u3063\\u3066\\u56F0\\u308B',\n    '\\u5B50\\u4F9B\\u306E\\u9803\\u306B\\u898B\\u305F\\u30A2\\u30CB\\u30E1\\u306E\\u7D9A\\u7DE8\\u304C\\u5927\\u4EBA\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u898B\\u308B\\u3068\\u5168\\u7136\\u9055\\u3046\\u89E3\\u91C8\\u306B\\u306A\\u308B',\n    '\\u6D77\\u5916\\u3067\\u3082\\u4EBA\\u6C17\\u3068\\u77E5\\u3063\\u3066\\u5B09\\u3057\\u3044\\u3088\\u3046\\u306A\\u8907\\u96D1\\u306A\\u6C17\\u6301\\u3061\\u306B\\u306A\\u308B\\u30A2\\u30CB\\u30E1\\u304C\\u3042\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u80CC\\u666F\\u7F8E\\u8853\\u3060\\u3051\\u3067\\u4E00\\u6642\\u9593\\u8A9E\\u308C\\u308B\\u75C5\\u6C17\\u306B\\u306A\\u3063\\u3066\\u3057\\u307E\\u3063\\u305F',\n    '\\u597D\\u304D\\u306A\\u30A2\\u30CB\\u30E1\\u306E\\u4E3B\\u4EBA\\u516C\\u306E\\u8003\\u3048\\u65B9\\u304C\\u5B9F\\u306F\\u81EA\\u5206\\u306E\\u4FA1\\u5024\\u89B3\\u306B\\u5F71\\u97FF\\u3092\\u4E0E\\u3048\\u3066\\u3044\\u305F\\u3068\\u6C17\\u3065\\u3044\\u305F',\n    '\\u30B0\\u30C3\\u30BA\\u3092\\u8CB7\\u3044\\u3059\\u304E\\u3066\\u90E8\\u5C4B\\u304C\\u30C6\\u30FC\\u30DE\\u30D1\\u30FC\\u30AF\\u306B\\u306A\\u3063\\u3066\\u304D\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u76E3\\u7763\\u30A4\\u30F3\\u30BF\\u30D3\\u30E5\\u30FC\\u3092\\u8AAD\\u3080\\u306E\\u304C\\u8DA3\\u5473\\u306B\\u306A\\u3063\\u305F\\u3002\\u610F\\u56F3\\u304C\\u5206\\u304B\\u308B\\u3068\\u898B\\u3048\\u65B9\\u304C\\u5909\\u308F\\u308B',\n    'OP\\u66F2\\u3092\\u8074\\u304F\\u3060\\u3051\\u3067\\u5F53\\u6642\\u306E\\u6C17\\u6301\\u3061\\u304C\\u8607\\u308B\\u3002\\u97F3\\u697D\\u306E\\u8A18\\u61B6\\u3078\\u306E\\u7D50\\u3073\\u3064\\u304D\\u65B9\\u304C\\u4E0D\\u601D\\u8B70',\n    '\\u4F5C\\u54C1\\u306E\\u4F0F\\u7DDA\\u3092\\u5F8C\\u304B\\u3089\\u6C17\\u3065\\u3044\\u305F\\u6642\\u306E\\u5FEB\\u611F\\u3092\\u6C42\\u3081\\u3066\\u4E8C\\u5468\\u76EE\\u3092\\u898B\\u3066\\u3057\\u307E\\u3046',\n    '\\u4ECA\\u671F\\u306E\\u30A2\\u30CB\\u30E1\\u3092\\u5168\\u90E8\\u8FFD\\u3046\\u306E\\u3092\\u3084\\u3081\\u3066\\u597D\\u304D\\u306A\\u4F5C\\u54C1\\u3092\\u6DF1\\u304F\\u898B\\u308B\\u65B9\\u91DD\\u306B\\u8EE2\\u63DB\\u3057\\u305F',\n    '\\u58F0\\u512A\\u3055\\u3093\\u306E\\u4ED6\\u306E\\u4F5C\\u54C1\\u3092\\u8FBF\\u308A\\u59CB\\u3081\\u305F\\u3089\\u6CBC\\u304C\\u5E83\\u304C\\u308A\\u3059\\u304E\\u3066\\u6642\\u9593\\u304C\\u8DB3\\u308A\\u306A\\u3044',\n    '\\u30A2\\u30CB\\u30E1\\u304C\\u597D\\u304D\\u306A\\u7406\\u7531\\u3092\\u805E\\u304B\\u308C\\u3066\\u7B54\\u3048\\u3089\\u308C\\u306A\\u304B\\u3063\\u305F\\u3002\\u597D\\u304D\\u3059\\u304E\\u3066\\u8A00\\u8A9E\\u5316\\u3067\\u304D\\u306A\\u3044',\n    '\\u65B0\\u3057\\u3044\\u30A2\\u30CB\\u30E1\\u3092\\u52E7\\u3081\\u3066\\u3082\\u3089\\u3063\\u3066\\u4E00\\u8A71\\u3060\\u3051\\u306E\\u3064\\u3082\\u308A\\u304C\\u6C17\\u3065\\u3044\\u305F\\u3089\\u6700\\u7D42\\u8A71\\u3060\\u3063\\u305F',\n    '\\u6709\\u540D\\u306A\\u4F5C\\u54C1\\u3092\\u306A\\u305C\\u304B\\u305A\\u3063\\u3068\\u898B\\u3066\\u3044\\u306A\\u304B\\u3063\\u305F\\u304C\\u898B\\u59CB\\u3081\\u305F\\u3089\\u306A\\u305C\\u4ECA\\u307E\\u3067\\u898B\\u306A\\u304B\\u3063\\u305F\\u306E\\u304B\\u3068\\u5F8C\\u6094',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u697D\\u66F2\\u3092\\u30AB\\u30E9\\u30AA\\u30B1\\u3067\\u6B4C\\u3046\\u306E\\u304C\\u597D\\u304D\\u3060\\u3051\\u3069\\u63A1\\u70B9\\u6A5F\\u80FD\\u3078\\u306E\\u7570\\u5E38\\u306A\\u3053\\u3060\\u308F\\u308A\\u304C\\u3042\\u308B',\n    '\\u30D5\\u30A1\\u30F3\\u540C\\u58EB\\u3067\\u76DB\\u308A\\u4E0A\\u304C\\u3063\\u305F\\u5F8C\\u306B\\u4E00\\u4EBA\\u3067\\u305D\\u306E\\u4F5C\\u54C1\\u3092\\u898B\\u308B\\u3068\\u9055\\u3046\\u611F\\u52D5\\u304C\\u3042\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u3067\\u6D41\\u308C\\u305F\\u4E3B\\u984C\\u6B4C\\u304C\\u4ECA\\u3067\\u3082\\u982D\\u304B\\u3089\\u96E2\\u308C\\u306A\\u3044\\u3002\\u305D\\u308C\\u3060\\u3051\\u3067\\u540D\\u4F5C',\n    '\\u30A2\\u30CB\\u30E1\\u304D\\u3063\\u304B\\u3051\\u3067\\u539F\\u4F5C\\u6F2B\\u753B\\u3092\\u8AAD\\u307F\\u59CB\\u3081\\u305F\\u3089\\u6CBC\\u304C\\u5E83\\u304C\\u308A\\u3059\\u304E\\u305F',\n    '\\u6DF1\\u591C\\u30A2\\u30CB\\u30E1\\u3092\\u6700\\u7D42\\u8A71\\u307E\\u3067\\u89B3\\u305F\\u5F8C\\u306E\\u865A\\u7121\\u611F\\u3068\\u5145\\u5B9F\\u611F\\u304C\\u597D\\u304D',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u30AD\\u30E3\\u30E9\\u30C7\\u30B6\\u30A4\\u30F3\\u3060\\u3051\\u3067\\u7D9A\\u304D\\u3092\\u898B\\u305F\\u3044\\u3068\\u601D\\u308F\\u305B\\u308B\\u529B\\u304C\\u3042\\u308B',\n    '\\u58F0\\u512A\\u3055\\u3093\\u306E\\u6F14\\u6280\\u3067\\u611F\\u60C5\\u304C10\\u500D\\u5897\\u5E45\\u3055\\u308C\\u308B\\u4F53\\u9A13\\u304C\\u30A2\\u30CB\\u30E1\\u306E\\u918D\\u9190\\u5473',\n    '\\u5B50\\u4F9B\\u306E\\u9803\\u597D\\u304D\\u3060\\u3063\\u305F\\u30A2\\u30CB\\u30E1\\u3092\\u5927\\u4EBA\\u306B\\u306A\\u3063\\u3066\\u898B\\u76F4\\u3059\\u3068\\u5168\\u7136\\u9055\\u3046\\u898B\\u3048\\u65B9',\n    '\\u30A2\\u30CB\\u30E1\\u306EED\\u304C\\u6BCE\\u8A71\\u5909\\u308F\\u308B\\u6F14\\u51FA\\u306B\\u6C17\\u3065\\u3044\\u305F\\u6642\\u306E\\u611F\\u52D5',\n    '\\u30A2\\u30CB\\u30E1\\u6620\\u753B\\u306E\\u5287\\u5834\\u7248\\u306F\\u5FC5\\u305A\\u6620\\u753B\\u9928\\u3067\\u89B3\\u308B\\u3068\\u6C7A\\u3081\\u3066\\u3044\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u8056\\u5730\\u5DE1\\u793C\\u3067\\u73FE\\u5B9F\\u3068\\u30A2\\u30CB\\u30E1\\u304C\\u91CD\\u306A\\u3063\\u305F\\u77AC\\u9593\\u306E\\u4E0D\\u601D\\u8B70',\n    '\\u597D\\u304D\\u306A\\u30A2\\u30CB\\u30E1\\u306E\\u8003\\u5BDF\\u52D5\\u753B\\u3092\\u898B\\u3066\\u3044\\u305F\\u3089\\u6DF1\\u591C\\u3092\\u8D85\\u3048\\u3066\\u3044\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u3092\\u901A\\u3058\\u3066\\u77E5\\u308A\\u5408\\u3063\\u305F\\u4EBA\\u3068\\u306E\\u53CB\\u60C5\\u304C\\u30EA\\u30A2\\u30EB\\u3067\\u3082\\u7D9A\\u3044\\u3066\\u3044\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u306EOP\\u3092\\u8074\\u3044\\u305F\\u77AC\\u9593\\u306B\\u5F53\\u6642\\u306E\\u611F\\u60C5\\u3054\\u3068\\u30BF\\u30A4\\u30E0\\u30B9\\u30EA\\u30C3\\u30D7\\u3059\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u5316\\u3055\\u308C\\u305F\\u4F5C\\u54C1\\u306E\\u58F0\\u304C\\u60F3\\u50CF\\u3068\\u4E00\\u81F4\\u3057\\u305F\\u6642\\u306E\\u5E78\\u798F\\u611F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u30AD\\u30E3\\u30E9\\u30AF\\u30BF\\u30FC\\u306B\\u672C\\u6C17\\u3067\\u6012\\u3063\\u305F\\u308A\\u6CE3\\u3044\\u305F\\u308A\\u3067\\u304D\\u308B\\u81EA\\u5206\\u3092\\u80AF\\u5B9A\\u3057\\u3066\\u3044\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u4E16\\u754C\\u89B3\\u3092\\u4E01\\u5BE7\\u306B\\u4F5C\\u308A\\u8FBC\\u3093\\u3067\\u3044\\u308B\\u30B9\\u30BF\\u30C3\\u30D5\\u3078\\u306E\\u30EA\\u30B9\\u30DA\\u30AF\\u30C8',\n    '\\u30A2\\u30CB\\u30E1\\u3067\\u5B66\\u3093\\u3060\\u8A00\\u8449\\u3084\\u8003\\u3048\\u65B9\\u304C\\u4ECA\\u306E\\u81EA\\u5206\\u3092\\u5F62\\u6210\\u3057\\u3066\\u3044\\u308B',\n    '\\u65B0\\u756A\\u7D44\\u306E\\u4E00\\u8A71\\u3092\\u898B\\u305F\\u77AC\\u9593\\u306B\\u795E\\u56DE\\u78BA\\u4FE1\\u3059\\u308B\\u30A2\\u30CB\\u30E1\\u306E\\u898B\\u6975\\u3081',\n    '\\u30A2\\u30CB\\u30E1\\u597D\\u304D\\u306A\\u53CB\\u4EBA\\u304B\\u3089\\u306E\\u5E03\\u6559\\u3067\\u4EBA\\u751F\\u5909\\u308F\\u3063\\u305F\\u4F5C\\u54C1\\u304C\\u3042\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u58F0\\u512A\\u3055\\u3093\\u304C\\u597D\\u304D\\u306B\\u306A\\u3063\\u3066\\u4ED6\\u306E\\u51FA\\u6F14\\u4F5C\\u3092\\u5168\\u90E8\\u8FFD\\u3044\\u59CB\\u3081\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u30B0\\u30C3\\u30BA\\u53CE\\u96C6\\u304C\\u8DA3\\u5473\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u90E8\\u5C4B\\u306E\\u500B\\u6027\\u304C\\u51FA\\u3066\\u304D\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u6700\\u7D42\\u56DE\\u5F8C\\u306E\\u9759\\u5BC2\\u306A\\u6C17\\u6301\\u3061\\u3092\\u8AB0\\u304B\\u3068\\u5171\\u6709\\u3057\\u305F\\u304F\\u306A\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u3067\\u53F7\\u6CE3\\u3057\\u305F\\u4F53\\u9A13\\u304C\\u611F\\u53D7\\u6027\\u3092\\u8C4A\\u304B\\u306B\\u3057\\u3066\\u304F\\u308C\\u3066\\u3044\\u308B\\u3068\\u4FE1\\u3058\\u308B',\n    '\\u597D\\u304D\\u306A\\u30A2\\u30CB\\u30E1\\u306E\\u5236\\u4F5C\\u4F1A\\u793E\\u306E\\u540D\\u524D\\u3092\\u898B\\u305F\\u3060\\u3051\\u3067\\u671F\\u5F85\\u5024\\u304C\\u4E0A\\u304C\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u4E16\\u754C\\u306B\\u751F\\u307E\\u308C\\u3066\\u304D\\u305F\\u304B\\u3063\\u305F\\u3068\\u672C\\u6C17\\u3067\\u601D\\u3046\\u4F5C\\u54C1\\u306B\\u51FA\\u4F1A\\u3048\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u7D30\\u304B\\u3044\\u80CC\\u666F\\u63CF\\u5199\\u3092\\u767A\\u898B\\u3059\\u308B\\u559C\\u3073\\u304C\\u7E70\\u308A\\u8FD4\\u3057\\u898B\\u308B\\u7406\\u7531',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u539F\\u4F5C\\u8005\\u3078\\u306E\\u30EA\\u30B9\\u30DA\\u30AF\\u30C8\\u3092\\u30A2\\u30CB\\u30E1\\u5316\\u30B9\\u30BF\\u30C3\\u30D5\\u304B\\u3089\\u611F\\u3058\\u308B\\u4F5C\\u54C1\\u304C\\u597D\\u304D',\n    '\\u30A2\\u30CB\\u30E1\\u3067\\u8A9E\\u3089\\u308C\\u305F\\u54F2\\u5B66\\u7684\\u306A\\u30C6\\u30FC\\u30DE\\u3092\\u53CB\\u4EBA\\u3068\\u6DF1\\u591C\\u307E\\u3067\\u8A9E\\u308A\\u5408\\u3063\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u3092\\u89B3\\u308B\\u524D\\u3068\\u5F8C\\u3067\\u306F\\u540C\\u3058\\u97F3\\u697D\\u306E\\u8074\\u3053\\u3048\\u65B9\\u304C\\u5909\\u308F\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '\\u4ECA\\u671F\\u30A2\\u30CB\\u30E1\\u306E\\u4E2D\\u304B\\u3089\\u81EA\\u5206\\u306E\\u63A8\\u3057\\u3092\\u898B\\u3064\\u3051\\u308B\\u4F5C\\u696D\\u304C\\u6BCE\\u30AF\\u30FC\\u30EB\\u697D\\u3057\\u307F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u4E3B\\u4EBA\\u516C\\u306B\\u611F\\u60C5\\u79FB\\u5165\\u3067\\u304D\\u305F\\u4F5C\\u54C1\\u306F\\u7279\\u5225\\u306A\\u4F4D\\u7F6E\\u306B\\u6B8B\\u308A\\u7D9A\\u3051\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u304D\\u3063\\u304B\\u3051\\u3067\\u8A2A\\u308C\\u305F\\u5834\\u6240\\u304C\\u4EBA\\u751F\\u306E\\u304A\\u6C17\\u306B\\u5165\\u308A\\u30B9\\u30DD\\u30C3\\u30C8\\u306B\\u306A\\u3063\\u305F',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u6F14\\u51FA\\u6280\\u6CD5\\u3092\\u5B66\\u3093\\u3067\\u304B\\u3089\\u4F5C\\u308A\\u624B\\u306E\\u610F\\u56F3\\u304C\\u898B\\u3048\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u597D\\u304D\\u306A\\u30A2\\u30CB\\u30E1\\u3092\\u5B50\\u4F9B\\u3084\\u5F8C\\u8F29\\u306B\\u7D39\\u4ECB\\u3067\\u304D\\u308B\\u5E74\\u9F62\\u306B\\u306A\\u3063\\u305F\\u611F\\u6168',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u4E16\\u754C\\u89B3\\u306E\\u30D5\\u30A1\\u30F3\\u30A2\\u30FC\\u30C8\\u3092\\u63CF\\u304D\\u59CB\\u3081\\u305F\\u4EBA\\u306E\\u71B1\\u91CF\\u306B\\u611F\\u52D5\\u3059\\u308B',\n    '\\u30A2\\u30CB\\u30E1\\u3092\\u898B\\u7D42\\u308F\\u3063\\u305F\\u5F8C\\u3059\\u3050\\u306B\\u4E8C\\u9031\\u76EE\\u3092\\u59CB\\u3081\\u3066\\u3057\\u307E\\u3046\\u4F5C\\u54C1\\u306E\\u6761\\u4EF6',\n    '\\u30A2\\u30CB\\u30E1\\u3067\\u611F\\u3058\\u305F\\u611F\\u52D5\\u3092\\u8A00\\u8A9E\\u5316\\u3057\\u3088\\u3046\\u3068\\u3059\\u308B\\u3068\\u5FC5\\u305A\\u4F55\\u304B\\u304C\\u8DB3\\u308A\\u306A\\u3044',\n    '\\u30A2\\u30CB\\u30E1\\u306E\\u53F0\\u8A5E\\u3092\\u65E5\\u5E38\\u3067\\u4F7F\\u3044\\u305F\\u3044\\u306E\\u306B\\u6587\\u8108\\u304C\\u5408\\u308F\\u306A\\u3044\\u6C38\\u9060\\u306E\\u60A9\\u307F',\n    '\\u30A2\\u30CB\\u30E1\\u3092\\u901A\\u3058\\u3066\\u77E5\\u3063\\u305F\\u4FA1\\u5024\\u89B3\\u304C\\u4EBA\\u751F\\u306E\\u9078\\u629E\\u306B\\u5F71\\u97FF\\u3057\\u3066\\u3044\\u308B'\n  ],\n  '\\u30D3\\u30B8\\u30CD\\u30B9': [\n    '\\u4F1A\\u8B70\\u306E\\u8B70\\u4E8B\\u9332\\u3092\\u53D6\\u308B\\u4EBA\\u304C\\u4E00\\u756A\\u305D\\u306E\\u4F1A\\u8B70\\u304B\\u3089\\u5B66\\u3093\\u3067\\u3044\\u308B\\u3068\\u3044\\u3046\\u8AAC\\u306F\\u672C\\u5F53\\u3060\\u3068\\u601D\\u3046',\n    '\\u8D77\\u696D\\u3057\\u305F\\u3044\\u6C17\\u6301\\u3061\\u3068\\u5B89\\u5B9A\\u3057\\u305F\\u53CE\\u5165\\u3078\\u306E\\u57F7\\u7740\\u304C\\u6BCE\\u6708\\u4E00\\u56DE\\u683C\\u95D8\\u3057\\u3066\\u3044\\u308B',\n    '\\u512A\\u79C0\\u306A\\u4EBA\\u306E\\u4ED5\\u4E8B\\u306E\\u4ED5\\u65B9\\u3092\\u89B3\\u5BDF\\u3059\\u308B\\u306E\\u304C\\u8DA3\\u5473\\u306E\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u30D7\\u30EC\\u30BC\\u30F3\\u3067\\u7DCA\\u5F35\\u3057\\u306A\\u304F\\u306A\\u3063\\u305F\\u306E\\u306F\\u5185\\u5BB9\\u3078\\u306E\\u81EA\\u4FE1\\u3067\\u306F\\u306A\\u304F\\u5834\\u6570\\u3060\\u3068\\u6C17\\u3065\\u3044\\u305F',\n    '\\u8AAD\\u3093\\u3060\\u30D3\\u30B8\\u30CD\\u30B9\\u66F8\\u306E\\u77E5\\u8B58\\u3092\\u5B9F\\u8DF5\\u3059\\u308B\\u524D\\u306B\\u6B21\\u306E\\u672C\\u3092\\u8AAD\\u3093\\u3067\\u3057\\u307E\\u3046\\u60AA\\u3044\\u7656',\n    '\\u526F\\u696D\\u3092\\u59CB\\u3081\\u3066\\u672C\\u696D\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5909\\u308F\\u3063\\u305F\\u3002\\u8996\\u70B9\\u304C\\u5897\\u3048\\u308B\\u3053\\u3068\\u306E\\u4FA1\\u5024',\n    '\\u30C1\\u30FC\\u30E0\\u3067\\u6210\\u679C\\u3092\\u51FA\\u3059\\u96E3\\u3057\\u3055\\u3068\\u9762\\u767D\\u3055\\u3092\\u540C\\u6642\\u306B\\u611F\\u3058\\u3066\\u3044\\u308B',\n    '\\u5931\\u6557\\u304B\\u3089\\u5B66\\u3076\\u3068\\u3044\\u3046\\u306E\\u306F\\u6B63\\u3057\\u3044\\u304C\\u5931\\u6557\\u3057\\u306A\\u3044\\u306B\\u8D8A\\u3057\\u305F\\u3053\\u3068\\u306F\\u306A\\u3044\\u3068\\u3082\\u601D\\u3046',\n    '\\u7D4C\\u55B6\\u8005\\u76EE\\u7DDA\\u3092\\u6301\\u3066\\u3068\\u8A00\\u308F\\u308C\\u3066\\u3084\\u3063\\u3068\\u610F\\u5473\\u304C\\u308F\\u304B\\u3063\\u3066\\u304D\\u305F\\u4E09\\u5E74\\u76EE',\n    '\\u4ED5\\u4E8B\\u306E\\u901F\\u3055\\u3088\\u308A\\u5224\\u65AD\\u306E\\u7CBE\\u5EA6\\u3092\\u4E0A\\u3052\\u308B\\u3053\\u3068\\u306E\\u65B9\\u304C\\u91CD\\u8981\\u3060\\u3068\\u6700\\u8FD1\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u6570\\u5B57\\u3067\\u8A71\\u3059\\u3053\\u3068\\u306E\\u91CD\\u8981\\u6027\\u306F\\u982D\\u3067\\u306F\\u5206\\u304B\\u3063\\u3066\\u3044\\u308B\\u304C\\u4F53\\u5F97\\u3059\\u308B\\u307E\\u3067\\u306B\\u6642\\u9593\\u304C\\u304B\\u304B\\u3063\\u305F',\n    '\\u5C0F\\u3055\\u306A\\u30C1\\u30FC\\u30E0\\u3067\\u52D5\\u3044\\u3066\\u3044\\u308B\\u6642\\u306E\\u610F\\u601D\\u6C7A\\u5B9A\\u306E\\u901F\\u3055\\u304C\\u5FD8\\u308C\\u3089\\u308C\\u306A\\u3044',\n    '\\u30DE\\u30FC\\u30B1\\u30C6\\u30A3\\u30F3\\u30B0\\u3092\\u5B66\\u3076\\u3068\\u65E5\\u5E38\\u306E\\u5E83\\u544A\\u304C\\u6C17\\u306B\\u306A\\u308A\\u3059\\u304E\\u3066\\u75B2\\u308C\\u308B',\n    '\\u4EA4\\u6E09\\u306E\\u5834\\u3067\\u306E\\u6C88\\u9ED9\\u306E\\u4F7F\\u3044\\u65B9\\u3092\\u610F\\u8B58\\u3059\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u3066\\u304B\\u3089\\u7D50\\u679C\\u304C\\u5909\\u308F\\u3063\\u305F',\n    '\\u81EA\\u5206\\u306E\\u30D3\\u30B8\\u30CD\\u30B9\\u30E2\\u30C7\\u30EB\\u3092\\u4E00\\u8A00\\u3067\\u8AAC\\u660E\\u3067\\u304D\\u306A\\u3044\\u306E\\u306F\\u7406\\u89E3\\u304C\\u8DB3\\u308A\\u306A\\u3044\\u8A3C\\u62E0\\u3060\\u3068\\u5B66\\u3093\\u3060',\n    '\\u30B9\\u30BF\\u30FC\\u30C8\\u30A2\\u30C3\\u30D7\\u306E\\u63A1\\u7528\\u57FA\\u6E96\\u3092\\u805E\\u3044\\u3066\\u3044\\u305F\\u3089\\u81EA\\u5206\\u3067\\u306F\\u53D7\\u304B\\u3089\\u306A\\u3044\\u3068\\u6C17\\u3065\\u3044\\u305F\\u4EF6',\n    '\\u671D\\u306E\\u6700\\u521D\\u306E1\\u6642\\u9593\\u306E\\u4F7F\\u3044\\u65B9\\u3067\\u4E00\\u65E5\\u306E\\u751F\\u7523\\u6027\\u304C\\u6C7A\\u307E\\u308B\\u3068\\u3044\\u3046\\u7D4C\\u9A13\\u5247\\u306F\\u672C\\u5F53\\u3060\\u3063\\u305F',\n    '\\u9867\\u5BA2\\u306E\\u8AB2\\u984C\\u3092\\u805E\\u304F\\u306E\\u304C\\u5F97\\u610F\\u306A\\u4EBA\\u3068\\u89E3\\u6C7A\\u7B56\\u3092\\u8003\\u3048\\u308B\\u306E\\u304C\\u5F97\\u610F\\u306A\\u4EBA\\u306F\\u5225\\u306E\\u624D\\u80FD\\u3060\\u3068\\u601D\\u3046',\n    '\\u58F2\\u4E0A\\u3088\\u308A\\u3082\\u5229\\u76CA\\u7387\\u306E\\u5927\\u5207\\u3055\\u3092\\u4F53\\u611F\\u3059\\u308B\\u307E\\u3067\\u306B\\u4F55\\u5E74\\u3082\\u304B\\u304B\\u3063\\u305F',\n    '\\u30D5\\u30A3\\u30FC\\u30C9\\u30D0\\u30C3\\u30AF\\u3092\\u7D20\\u76F4\\u306B\\u53D7\\u3051\\u5165\\u308C\\u308B\\u80FD\\u529B\\u304C\\u30D3\\u30B8\\u30CD\\u30B9\\u3067\\u4E00\\u756A\\u5927\\u4E8B\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u4EBA\\u6750\\u3053\\u305D\\u304C\\u6700\\u5927\\u306E\\u8CC7\\u7523\\u3068\\u3044\\u3046\\u306E\\u306F\\u5F53\\u7136\\u306E\\u3053\\u3068\\u3060\\u304C\\u5B9F\\u8DF5\\u3067\\u304D\\u3066\\u3044\\u308B\\u4F01\\u696D\\u306F\\u5C11\\u306A\\u3044',\n    '\\u81EA\\u5206\\u306E\\u30D6\\u30E9\\u30F3\\u30C9\\u3092\\u610F\\u8B58\\u3057\\u59CB\\u3081\\u3066\\u304B\\u3089\\u767A\\u8A00\\u306E\\u8CEA\\u304C\\u5C11\\u3057\\u5909\\u308F\\u3063\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u30D4\\u30C3\\u30C1\\u30B3\\u30F3\\u3067\\u5B66\\u3093\\u3060\\u306E\\u306F\\u4F1D\\u3048\\u308B\\u6280\\u8853\\u3088\\u308A\\u805E\\u304F\\u6280\\u8853\\u306E\\u65B9\\u304C\\u5927\\u5207\\u3060\\u3068\\u3044\\u3046\\u3053\\u3068',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u30D1\\u30FC\\u30C8\\u30CA\\u30FC\\u3068\\u306E\\u4FE1\\u983C\\u95A2\\u4FC2\\u306F\\u5951\\u7D04\\u66F8\\u3088\\u308A\\u5927\\u5207\\u3060\\u3068\\u8EAB\\u3092\\u3082\\u3063\\u3066\\u5B66\\u3093\\u3060',\n    '\\u8CA1\\u52D9\\u8AF8\\u8868\\u304C\\u8AAD\\u3081\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F\\u65E5\\u304B\\u3089\\u4E16\\u754C\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5C11\\u3057\\u5909\\u308F\\u3063\\u305F',\n    '\\u5931\\u6557\\u3092\\u96A0\\u3059\\u6587\\u5316\\u304C\\u3042\\u308B\\u7D44\\u7E54\\u307B\\u3069\\u6210\\u9577\\u304C\\u9045\\u3044\\u3068\\u78BA\\u4FE1\\u3057\\u3066\\u3044\\u308B',\n    '\\u9867\\u5BA2\\u30A4\\u30F3\\u30BF\\u30D3\\u30E5\\u30FC\\u306E\\u5927\\u5207\\u3055\\u3092\\u77E5\\u3063\\u3066\\u304B\\u3089\\u4F5C\\u308B\\u524D\\u306B\\u805E\\u304F\\u3053\\u3068\\u304C\\u7FD2\\u6163\\u306B\\u306A\\u3063\\u305F',\n    '\\u826F\\u3044\\u30D7\\u30ED\\u30C0\\u30AF\\u30C8\\u3088\\u308A\\u826F\\u3044\\u5E02\\u5834\\u306B\\u5165\\u308B\\u3053\\u3068\\u306E\\u65B9\\u304C\\u6210\\u529F\\u78BA\\u7387\\u304C\\u9AD8\\u3044\\u3068\\u3044\\u3046\\u6B8B\\u9177\\u306A\\u4E8B\\u5B9F',\n    '\\u7D4C\\u55B6\\u8005\\u3068\\u5F93\\u696D\\u54E1\\u306E\\u8996\\u70B9\\u306E\\u9055\\u3044\\u3092\\u57CB\\u3081\\u308B\\u3053\\u3068\\u304C\\u7D44\\u7E54\\u8AB2\\u984C\\u306E\\u5927\\u534A\\u3060\\u3068\\u611F\\u3058\\u3066\\u3044\\u308B',\n    '\\u9577\\u671F\\u76EE\\u7DDA\\u3067\\u8003\\u3048\\u308B\\u3068\\u77ED\\u671F\\u306E\\u5224\\u65AD\\u304C\\u5909\\u308F\\u308B\\u3002\\u3053\\u306E\\u611F\\u899A\\u3092\\u5927\\u5207\\u306B\\u3057\\u3066\\u3044\\u308B',\n    '\\u5C0F\\u3055\\u306A\\u4FE1\\u983C\\u306E\\u7A4D\\u307F\\u91CD\\u306D\\u304C\\u5927\\u304D\\u306A\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u57FA\\u76E4\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B\\u3068\\u5B9F\\u611F',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u3067\\u5931\\u6557\\u3057\\u3066\\u6C17\\u3065\\u3044\\u305F\\u3053\\u3068\\u306E\\u65B9\\u304C\\u6210\\u529F\\u4F53\\u9A13\\u3088\\u308A\\u591A\\u304B\\u3063\\u305F',\n    '\\u826F\\u3044\\u4E0A\\u53F8\\u3068\\u60AA\\u3044\\u4E0A\\u53F8\\u306E\\u5DEE\\u306F\\u6307\\u793A\\u306E\\u4ED5\\u65B9\\u3067\\u306F\\u306A\\u304F\\u59FF\\u52E2\\u3060\\u3068\\u601D\\u3046',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u8A71\\u3067\\u76DB\\u308A\\u4E0A\\u304C\\u308C\\u308B\\u53CB\\u4EBA\\u306E\\u5B58\\u5728\\u304C\\u30AD\\u30E3\\u30EA\\u30A2\\u306B\\u5F71\\u97FF\\u3057\\u3066\\u3044\\u308B',\n    '\\u526F\\u696D\\u3092\\u59CB\\u3081\\u3066\\u304B\\u3089\\u672C\\u696D\\u3078\\u306E\\u898B\\u3048\\u65B9\\u304C\\u5909\\u308F\\u3063\\u3066\\u4E21\\u65B9\\u826F\\u304F\\u306A\\u3063\\u305F',\n    '\\u9867\\u5BA2\\u306E\\u7ACB\\u5834\\u3067\\u8003\\u3048\\u308B\\u3053\\u3068\\u304C\\u6700\\u3082\\u91CD\\u8981\\u306A\\u30D3\\u30B8\\u30CD\\u30B9\\u30B9\\u30AD\\u30EB\\u3060\\u3068\\u78BA\\u4FE1\\u3057\\u3066\\u3044\\u308B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u66F8\\u306B\\u66F8\\u3044\\u3066\\u3042\\u308B\\u3053\\u3068\\u3088\\u308A\\u5B9F\\u8DF5\\u3067\\u5B66\\u3093\\u3060\\u3053\\u3068\\u306E\\u65B9\\u304C\\u8EAB\\u306B\\u3064\\u304F',\n    '\\u826F\\u3044\\u7FD2\\u6163\\u3092\\u6301\\u3063\\u3066\\u3044\\u308B\\u30D3\\u30B8\\u30CD\\u30B9\\u30D1\\u30FC\\u30BD\\u30F3\\u304C\\u9577\\u671F\\u7684\\u306B\\u52DD\\u3064\\u50BE\\u5411\\u304C\\u3042\\u308B',\n    '\\u30C1\\u30FC\\u30E0\\u30E1\\u30F3\\u30D0\\u30FC\\u306E\\u5F37\\u307F\\u3092\\u6D3B\\u304B\\u305B\\u308B\\u30EA\\u30FC\\u30C0\\u30FC\\u306B\\u306A\\u308A\\u305F\\u3044\\u3068\\u3044\\u3046\\u76EE\\u6A19',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u30C8\\u30EC\\u30F3\\u30C9\\u3092\\u8FFD\\u3046\\u3088\\u308A\\u672C\\u8CEA\\u7684\\u306A\\u30B9\\u30AD\\u30EB\\u3092\\u78E8\\u304F\\u65B9\\u304C\\u5927\\u4E8B',\n    '\\u9867\\u5BA2\\u306E\\u554F\\u984C\\u3092\\u672C\\u5F53\\u306B\\u89E3\\u6C7A\\u3067\\u304D\\u3066\\u3044\\u308B\\u304B\\u5E38\\u306B\\u554F\\u3044\\u76F4\\u3057\\u3066\\u3044\\u308B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306B\\u304A\\u3051\\u308B\\u8AA0\\u5B9F\\u3055\\u306E\\u4FA1\\u5024\\u306F\\u6570\\u5B57\\u3067\\u6E2C\\u308C\\u306A\\u3044\\u3051\\u3069\\u78BA\\u5B9F\\u306B\\u5B58\\u5728\\u3059\\u308B',\n    '\\u81EA\\u5206\\u306E\\u30D3\\u30B8\\u30CD\\u30B9\\u4E0A\\u306E\\u5F37\\u307F\\u3092\\u8A00\\u8A9E\\u5316\\u3059\\u308B\\u306E\\u306B\\u601D\\u3063\\u305F\\u3088\\u308A\\u6642\\u9593\\u304C\\u304B\\u304B\\u3063\\u305F',\n    '\\u826F\\u3044\\u4ED5\\u4E8B\\u306F\\u826F\\u3044\\u6E96\\u5099\\u304B\\u3089\\u59CB\\u307E\\u308B\\u3068\\u4F55\\u5EA6\\u7D4C\\u9A13\\u3057\\u3066\\u3082\\u5FD8\\u308C\\u304C\\u3061\\u306B\\u306A\\u308B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u30D1\\u30FC\\u30C8\\u30CA\\u30FC\\u3068\\u306E\\u51FA\\u4F1A\\u3044\\u304C\\u4EBA\\u751F\\u3092\\u5909\\u3048\\u305F\\u4F53\\u9A13\\u304C\\u3042\\u308B',\n    '\\u5229\\u76CA\\u3060\\u3051\\u3092\\u8FFD\\u3046\\u30D3\\u30B8\\u30CD\\u30B9\\u3068\\u4FA1\\u5024\\u3092\\u5275\\u308B\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u9055\\u3044\\u3092\\u5B9F\\u611F\\u3057\\u305F',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u4EA4\\u6E09\\u3067\\u5927\\u5207\\u306A\\u306E\\u306F\\u76F8\\u624B\\u304C\\u4F55\\u3092\\u6C42\\u3081\\u3066\\u3044\\u308B\\u304B\\u3092\\u7406\\u89E3\\u3059\\u308B\\u3053\\u3068',\n    '\\u5C0F\\u898F\\u6A21\\u3067\\u3082\\u81EA\\u5206\\u306E\\u30D3\\u30B8\\u30CD\\u30B9\\u3092\\u6301\\u3064\\u3053\\u3068\\u306E\\u81EA\\u7531\\u3055\\u3068\\u8CAC\\u4EFB\\u3092\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u4E16\\u754C\\u3067\\u306F\\u8A00\\u8449\\u3088\\u308A\\u884C\\u52D5\\u3067\\u4FE1\\u983C\\u3092\\u793A\\u3059\\u3053\\u3068\\u304C\\u5927\\u5207',\n    '\\u76EE\\u6A19\\u8A2D\\u5B9A\\u306E\\u4ED5\\u65B9\\u3092\\u5909\\u3048\\u305F\\u3089\\u4ED5\\u4E8B\\u3078\\u306E\\u5411\\u304D\\u5408\\u3044\\u65B9\\u304C\\u5168\\u7136\\u5909\\u308F\\u3063\\u305F',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u3067\\u51FA\\u4F1A\\u3063\\u305F\\u4EBA\\u304B\\u3089\\u5B66\\u3093\\u3060\\u3053\\u3068\\u304C\\u8CA1\\u7523\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u9867\\u5BA2\\u6E80\\u8DB3\\u3092\\u7A81\\u304D\\u8A70\\u3081\\u308B\\u3068\\u81EA\\u7136\\u3068\\u53E3\\u30B3\\u30DF\\u304C\\u751F\\u307E\\u308C\\u308B\\u6CD5\\u5247\\u3092\\u4F53\\u611F\\u3057\\u305F',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u8996\\u70B9\\u3067\\u65E5\\u5E38\\u3092\\u898B\\u308B\\u3068\\u81F3\\u308B\\u3068\\u3053\\u308D\\u306B\\u30D2\\u30F3\\u30C8\\u304C\\u843D\\u3061\\u3066\\u3044\\u308B',\n    '\\u826F\\u3044\\u8CEA\\u554F\\u3092\\u3059\\u308B\\u529B\\u304C\\u30D3\\u30B8\\u30CD\\u30B9\\u3067\\u3082\\u3063\\u3068\\u3082\\u91CD\\u8981\\u306A\\u30B9\\u30AD\\u30EB\\u3060\\u3068\\u601D\\u3046',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u5931\\u6557\\u3092\\u516C\\u958B\\u3057\\u3066\\u5B66\\u3073\\u3092\\u5171\\u6709\\u3059\\u308B\\u6587\\u5316\\u304C\\u5E83\\u304C\\u3063\\u3066\\u307B\\u3057\\u3044',\n    '\\u6570\\u5B57\\u3092\\u8FFD\\u3044\\u306A\\u304C\\u3089\\u4EBA\\u3092\\u898B\\u5931\\u308F\\u306A\\u3044\\u30D0\\u30E9\\u30F3\\u30B9\\u304C\\u7D4C\\u55B6\\u8005\\u306E\\u771F\\u306E\\u6280\\u8853',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u898F\\u6A21\\u3088\\u308A\\u793E\\u4F1A\\u3078\\u306E\\u5F71\\u97FF\\u306E\\u5927\\u304D\\u3055\\u3092\\u8003\\u3048\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u81EA\\u5206\\u304C\\u4F5C\\u3063\\u305F\\u30B5\\u30FC\\u30D3\\u30B9\\u3067\\u8AB0\\u304B\\u306E\\u554F\\u984C\\u304C\\u89E3\\u6C7A\\u3067\\u304D\\u305F\\u6642\\u306E\\u559C\\u3073\\u304C\\u539F\\u52D5\\u529B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u3067\\u4FE1\\u983C\\u3055\\u308C\\u308B\\u4EBA\\u306B\\u306A\\u308B\\u306E\\u306B\\u8FD1\\u9053\\u306F\\u306A\\u304B\\u3063\\u305F',\n    '\\u826F\\u3044\\u7D44\\u7E54\\u306F\\u826F\\u3044\\u6587\\u5316\\u304B\\u3089\\u751F\\u307E\\u308C\\u308B\\u3068\\u3044\\u3046\\u4FE1\\u5FF5\\u304C\\u5F37\\u304F\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u5834\\u3067\\u5B66\\u3093\\u3060\\u30B3\\u30DF\\u30E5\\u30CB\\u30B1\\u30FC\\u30B7\\u30E7\\u30F3\\u304C\\u79C1\\u751F\\u6D3B\\u3067\\u3082\\u6D3B\\u304D\\u3066\\u3044\\u308B',\n    '\\u30DE\\u30FC\\u30B1\\u30C6\\u30A3\\u30F3\\u30B0\\u306E\\u672C\\u8CEA\\u306F\\u76F8\\u624B\\u306E\\u7ACB\\u5834\\u306B\\u7ACB\\u3064\\u3053\\u3068\\u3060\\u3068\\u6C17\\u3065\\u3044\\u305F',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u3092\\u901A\\u3058\\u3066\\u793E\\u4F1A\\u306B\\u8CA2\\u732E\\u3067\\u304D\\u3066\\u3044\\u308B\\u5B9F\\u611F\\u304C\\u4ED5\\u4E8B\\u3092\\u7D9A\\u3051\\u308B\\u7406\\u7531',\n    '\\u9577\\u671F\\u7684\\u306A\\u8996\\u70B9\\u3092\\u6301\\u3064\\u3053\\u3068\\u304C\\u30D3\\u30B8\\u30CD\\u30B9\\u3067\\u3082\\u4EBA\\u751F\\u3067\\u3082\\u5927\\u5207\\u3060\\u3068\\u4FE1\\u3058\\u3066\\u3044\\u308B',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u6210\\u529F\\u306B\\u306F\\u904B\\u3082\\u5B9F\\u529B\\u3082\\u5FC5\\u8981\\u3060\\u304C\\u6E96\\u5099\\u3060\\u3051\\u306F\\u81EA\\u5206\\u3067\\u3067\\u304D\\u308B',\n    '\\u30C1\\u30FC\\u30E0\\u3067\\u6210\\u3057\\u9042\\u3052\\u305F\\u6210\\u679C\\u306E\\u559C\\u3073\\u306F\\u500B\\u4EBA\\u306E\\u6210\\u529F\\u3088\\u308A\\u5927\\u304D\\u3044',\n    '\\u30D3\\u30B8\\u30CD\\u30B9\\u306E\\u4E16\\u754C\\u3067\\u81EA\\u5206\\u306E\\u8EF8\\u3092\\u6301\\u3064\\u3053\\u3068\\u306E\\u96E3\\u3057\\u3055\\u3068\\u5927\\u5207\\u3055',\n    '\\u9867\\u5BA2\\u306B\\u611F\\u8B1D\\u3055\\u308C\\u308B\\u3053\\u3068\\u304C\\u30D3\\u30B8\\u30CD\\u30B9\\u3092\\u7D9A\\u3051\\u308B\\u4E00\\u756A\\u306E\\u30E2\\u30C1\\u30D9\\u30FC\\u30B7\\u30E7\\u30F3'\n  ],\n  '\\u63A8\\u3057\\u6D3B': [\n    '\\u63A8\\u3057\\u306E\\u305F\\u3081\\u306B\\u50CD\\u3044\\u3066\\u3044\\u308B\\u3068\\u3044\\u3063\\u3066\\u3082\\u904E\\u8A00\\u3067\\u306F\\u306A\\u3044\\u4ECA\\u6708\\u306E\\u63A8\\u3057\\u6D3B\\u53CE\\u652F',\n    '\\u63A8\\u3057\\u306E\\u8A95\\u751F\\u65E5\\u306B\\u4E00\\u4EBA\\u3067\\u304A\\u795D\\u3044\\u3057\\u305F\\u3002\\u4E00\\u756A\\u697D\\u3057\\u3044\\u8A95\\u751F\\u65E5\\u3060\\u3063\\u305F\\u304B\\u3082\\u3057\\u308C\\u306A\\u3044',\n    '\\u63A8\\u3057\\u306E\\u30B0\\u30C3\\u30BA\\u304C\\u5C4A\\u3044\\u305F\\u77AC\\u9593\\u306E\\u5E78\\u798F\\u611F\\u306F\\u4ED6\\u306E\\u4F55\\u7269\\u306B\\u3082\\u4EE3\\u3048\\u3089\\u308C\\u306A\\u3044',\n    '\\u30E9\\u30A4\\u30D6\\u306E\\u30BB\\u30C8\\u30EA\\u3092\\u898B\\u305F\\u77AC\\u9593\\u306B\\u6CE3\\u3044\\u305F\\u3002\\u3042\\u306E\\u66F2\\u304C\\u6765\\u308B\\u3068\\u601D\\u308F\\u306A\\u304B\\u3063\\u305F',\n    '\\u63A8\\u3057\\u306E\\u65B0\\u4F5C\\u306E\\u611F\\u60F3\\u3092\\u8AB0\\u304B\\u3068\\u8A71\\u3057\\u305F\\u3059\\u304E\\u3066\\u30B3\\u30DF\\u30E5\\u30CB\\u30C6\\u30A3\\u306B\\u5165\\u3063\\u305F',\n    '\\u63A8\\u3057\\u306E\\u5B58\\u5728\\u3067\\u4F55\\u5EA6\\u3082\\u6551\\u308F\\u308C\\u3066\\u3044\\u308B\\u306E\\u3067\\u76F4\\u63A5\\u304A\\u793C\\u3092\\u8A00\\u3044\\u305F\\u3044',\n    '\\u63A8\\u3057\\u304C\\u4E0A\\u624B\\u304F\\u3044\\u3063\\u3066\\u3044\\u308B\\u5831\\u544A\\u3092\\u898B\\u308B\\u305F\\u3073\\u306B\\u81EA\\u5206\\u306E\\u3053\\u3068\\u306E\\u3088\\u3046\\u306B\\u5B09\\u3057\\u304F\\u306A\\u308B',\n    '\\u9060\\u5F81\\u8CBB\\u3092\\u637B\\u51FA\\u3059\\u308B\\u305F\\u3081\\u306B\\u4ECA\\u6708\\u306F\\u7BC0\\u7D04\\u3059\\u308B\\u6C7A\\u610F\\u3092\\u3057\\u305F\\u3002\\u4F55\\u5EA6\\u76EE\\u304B',\n    '\\u63A8\\u3057\\u306E\\u904E\\u53BB\\u4F5C\\u54C1\\u3092\\u6398\\u308A\\u4E0B\\u3052\\u3066\\u3044\\u305F\\u3089\\u591C\\u304C\\u660E\\u3051\\u3066\\u3044\\u305F',\n    '\\u30B0\\u30C3\\u30BA\\u306E\\u98FE\\u308A\\u65B9\\u3092\\u7814\\u7A76\\u3057\\u3059\\u304E\\u3066\\u30A4\\u30F3\\u30C6\\u30EA\\u30A2\\u306E\\u77E5\\u8B58\\u304C\\u3064\\u3044\\u3066\\u3057\\u307E\\u3063\\u305F',\n    '\\u63A8\\u3057\\u304C\\u8A00\\u53CA\\u3057\\u3066\\u3044\\u308B\\u4F5C\\u54C1\\u3092\\u5168\\u90E8\\u5236\\u8987\\u3057\\u305F\\u3044\\u6C17\\u6301\\u3061\\u3068\\u6642\\u9593\\u306E\\u8DB3\\u308A\\u306A\\u3055\\u306E\\u30B8\\u30EC\\u30F3\\u30DE',\n    '\\u30D5\\u30A1\\u30F3\\u306E\\u4EBA\\u305F\\u3061\\u3068\\u8A71\\u3059\\u3068\\u5171\\u901A\\u8A00\\u8A9E\\u304C\\u3042\\u308B\\u5B89\\u5FC3\\u611F\\u304C\\u534A\\u7AEF\\u306A\\u3044',\n    '\\u63A8\\u3057\\u3092\\u77E5\\u3089\\u306A\\u3044\\u4EBA\\u306B\\u9B45\\u529B\\u3092\\u8AAC\\u660E\\u3059\\u308B\\u305F\\u3081\\u306E\\u8A9E\\u5F59\\u529B\\u304C\\u8DB3\\u308A\\u306A\\u3044',\n    '\\u63A8\\u3057\\u6D3B\\u3092\\u59CB\\u3081\\u3066\\u304B\\u3089\\u7B11\\u9854\\u304C\\u5897\\u3048\\u305F\\u3068\\u53CB\\u4EBA\\u306B\\u8A00\\u308F\\u308C\\u305F',\n    '\\u30E9\\u30A4\\u30D6\\u306B\\u5411\\u3051\\u305F\\u4F53\\u529B\\u4F5C\\u308A\\u3092\\u771F\\u9762\\u76EE\\u306B\\u8003\\u3048\\u3066\\u3044\\u308B\\u81EA\\u5206\\u304C\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u30B3\\u30F3\\u30C6\\u30F3\\u30C4\\u3092\\u6D88\\u8CBB\\u3059\\u308B\\u305F\\u3081\\u306B\\u6642\\u9593\\u306E\\u4F7F\\u3044\\u65B9\\u304C\\u4E0A\\u624B\\u304F\\u306A\\u3063\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u521D\\u3081\\u3066\\u751F\\u3067\\u898B\\u305F\\u6642\\u306E\\u611F\\u52D5\\u306F\\u4F55\\u5E74\\u7D4C\\u3063\\u3066\\u3082\\u9BAE\\u660E\\u306B\\u899A\\u3048\\u3066\\u3044\\u308B',\n    '\\u540C\\u62C5\\u3055\\u3093\\u3068\\u8A9E\\u308A\\u5408\\u3048\\u308B\\u6642\\u9593\\u304C\\u4EBA\\u751F\\u306E\\u8C4A\\u304B\\u3055\\u306B\\u76F4\\u7D50\\u3057\\u3066\\u3044\\u308B\\u3068\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u30E1\\u30C3\\u30BB\\u30FC\\u30B8\\u304C\\u4ECA\\u65E5\\u3082\\u523A\\u3055\\u308A\\u3059\\u304E\\u3066\\u4ED5\\u4E8B\\u306B\\u96C6\\u4E2D\\u3067\\u304D\\u306A\\u3044\\u5348\\u5F8C',\n    '\\u597D\\u304D\\u306A\\u3082\\u306E\\u3092\\u597D\\u304D\\u3068\\u8A00\\u3048\\u308B\\u5834\\u6240\\u304C\\u3042\\u308B\\u3053\\u3068\\u306E\\u5E78\\u305B\\u3092\\u565B\\u307F\\u7DE0\\u3081\\u3066\\u3044\\u308B',\n    '\\u30C7\\u30D3\\u30E5\\u30FC\\u5F53\\u6642\\u304B\\u3089\\u306E\\u30D5\\u30A1\\u30F3\\u3068\\u3057\\u3066\\u4ECA\\u306E\\u6D3B\\u8E8D\\u3092\\u8A87\\u308A\\u306B\\u601D\\u3046',\n    '\\u63A8\\u3057\\u306B\\u5F71\\u97FF\\u3055\\u308C\\u3066\\u59CB\\u3081\\u305F\\u8DA3\\u5473\\u304C\\u4ECA\\u3067\\u306F\\u81EA\\u5206\\u306E\\u3082\\u306E\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u30E9\\u30A4\\u30D6\\u306E\\u4F59\\u97FB\\u304C\\u4E00\\u9031\\u9593\\u7D9A\\u3044\\u3066\\u3044\\u308B\\u3002\\u3044\\u3044\\u52A0\\u6E1B\\u65E5\\u5E38\\u306B\\u623B\\u3089\\u306A\\u3044\\u3068\\u3044\\u3051\\u306A\\u3044',\n    '\\u63A8\\u3057\\u306E\\u5F71\\u97FF\\u3067\\u77E5\\u3063\\u305F\\u697D\\u66F2\\u3084\\u6620\\u753B\\u304C\\u4EBA\\u751F\\u306E\\u5B9D\\u7269\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u81EA\\u5206\\u304C\\u63A8\\u3057\\u3092\\u5FDC\\u63F4\\u3057\\u3066\\u3044\\u308B\\u306E\\u304B\\u63A8\\u3057\\u306B\\u5FDC\\u63F4\\u3055\\u308C\\u3066\\u3044\\u308B\\u306E\\u304B\\u308F\\u304B\\u3089\\u306A\\u304F\\u306A\\u308B\\u6642\\u304C\\u3042\\u308B',\n    '\\u30B0\\u30C3\\u30BA\\u3092\\u8CB7\\u3046\\u305F\\u3073\\u306B\\u5E78\\u305B\\u306B\\u306A\\u308C\\u308B\\u8CA1\\u5E03\\u3092\\u6301\\u3061\\u305F\\u3044',\n    '\\u63A8\\u3057\\u306E\\u3053\\u3068\\u3092\\u8003\\u3048\\u308B\\u3060\\u3051\\u3067\\u9854\\u304C\\u307B\\u3053\\u308D\\u3093\\u3067\\u3057\\u307E\\u3046\\u75C5\\u6C17\\u306B\\u304B\\u304B\\u3063\\u3066\\u3044\\u308B',\n    '\\u540C\\u3058\\u63A8\\u3057\\u3092\\u6301\\u3064\\u4EBA\\u3068\\u306E\\u7E4B\\u304C\\u308A\\u304C\\u672C\\u5F53\\u306E\\u610F\\u5473\\u3067\\u4EBA\\u751F\\u3092\\u8C4A\\u304B\\u306B\\u3057\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u6D3B\\u306E\\u4E88\\u7B97\\u7BA1\\u7406\\u3092\\u3057\\u3063\\u304B\\u308A\\u3057\\u306A\\u304C\\u3089\\u63A8\\u305B\\u308B\\u81EA\\u5206\\u3092\\u8912\\u3081\\u3066\\u3042\\u3052\\u305F\\u3044',\n    '\\u63A8\\u3057\\u304C\\u3044\\u308B\\u4EBA\\u751F\\u3068\\u3044\\u306A\\u3044\\u4EBA\\u751F\\u3092\\u6BD4\\u3079\\u305F\\u3089\\u6BD4\\u8F03\\u306B\\u306A\\u3089\\u306A\\u3044\\u304F\\u3089\\u3044\\u8C4A\\u304B\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u4E00\\u8A00\\u3067\\u4ECA\\u65E5\\u3082\\u9811\\u5F35\\u308C\\u308B\\u3068\\u672C\\u6C17\\u3067\\u601D\\u3063\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u6D3B\\u3092\\u901A\\u3058\\u3066\\u77E5\\u308A\\u5408\\u3063\\u305F\\u4EBA\\u304C\\u4ECA\\u3067\\u306F\\u5927\\u5207\\u306A\\u53CB\\u4EBA\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u304C\\u9811\\u5F35\\u3063\\u3066\\u3044\\u308B\\u59FF\\u3092\\u898B\\u308B\\u3068\\u81EA\\u5206\\u3082\\u9811\\u5F35\\u308C\\u308B\\u4E0D\\u601D\\u8B70\\u306A\\u9023\\u52D5',\n    '\\u63A8\\u3057\\u306E\\u30B0\\u30C3\\u30BA\\u3092\\u773A\\u3081\\u3066\\u3044\\u308B\\u3060\\u3051\\u3067\\u5E78\\u305B\\u306A\\u6C17\\u6301\\u3061\\u306B\\u306A\\u308C\\u308B',\n    '\\u63A8\\u3057\\u3078\\u306E\\u611B\\u60C5\\u3092\\u8A9E\\u308A\\u59CB\\u3081\\u305F\\u3089\\u6B62\\u307E\\u3089\\u306A\\u304F\\u306A\\u308B\\u81EA\\u5206\\u306E\\u6027\\u683C',\n    '\\u63A8\\u3057\\u306E\\u8A95\\u751F\\u65E5\\u3092\\u795D\\u3046\\u305F\\u3081\\u306B\\u6709\\u7D66\\u3092\\u4F7F\\u3046\\u3053\\u3068\\u306B\\u4E00\\u5207\\u306E\\u8FF7\\u3044\\u304C\\u306A\\u3044',\n    '\\u63A8\\u3057\\u304C\\u65B0\\u3057\\u3044\\u6311\\u6226\\u3092\\u3059\\u308B\\u6642\\u306E\\u671F\\u5F85\\u3068\\u5FC3\\u914D\\u304C\\u540C\\u6642\\u306B\\u6765\\u308B\\u611F\\u899A',\n    '\\u63A8\\u3057\\u6D3B\\u306E\\u8CBB\\u7528\\u5BFE\\u52B9\\u679C\\u3092\\u8003\\u3048\\u305F\\u3089\\u6700\\u9AD8\\u306E\\u6295\\u8CC7\\u3060\\u3068\\u78BA\\u4FE1\\u3057\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u5F71\\u97FF\\u3067\\u8208\\u5473\\u3092\\u6301\\u3063\\u305F\\u3053\\u3068\\u304C\\u65B0\\u3057\\u3044\\u8DA3\\u5473\\u306B\\u306A\\u3063\\u305F',\n    '\\u63A8\\u3057\\u306E\\u53E4\\u3044\\u4F5C\\u54C1\\u3092\\u6398\\u308A\\u8D77\\u3053\\u3059\\u559C\\u3073\\u304C\\u5C3D\\u304D\\u306A\\u3044',\n    '\\u63A8\\u3057\\u304C\\u8A8D\\u77E5\\u3057\\u3066\\u304F\\u308C\\u305F\\u65E5\\u306E\\u8A18\\u61B6\\u3092\\u4F55\\u5E74\\u7D4C\\u3063\\u3066\\u3082\\u899A\\u3048\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u6D3B\\u52D5\\u30A8\\u30EA\\u30A2\\u306B\\u8A73\\u3057\\u304F\\u306A\\u3063\\u3066\\u3057\\u307E\\u3046\\u63A8\\u3057\\u6D3B\\u306E\\u526F\\u7523\\u7269',\n    '\\u63A8\\u3057\\u304C\\u3044\\u308B\\u3053\\u3068\\u3067\\u6BCE\\u65E5\\u306B\\u5F69\\u308A\\u304C\\u52A0\\u308F\\u3063\\u3066\\u3044\\u308B\\u3068\\u5B9F\\u611F\\u3057\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u6D3B\\u3067\\u8CAF\\u91D1\\u304C\\u6E1B\\u308B\\u4E00\\u65B9\\u3067\\u4EBA\\u751F\\u304C\\u8C4A\\u304B\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B\\u9006\\u8AAC',\n    '\\u63A8\\u3057\\u306E\\u8A00\\u8449\\u304C\\u81EA\\u5206\\u306E\\u4FA1\\u5024\\u89B3\\u306B\\u5F71\\u97FF\\u3092\\u4E0E\\u3048\\u3066\\u3044\\u308B\\u3068\\u6C17\\u3065\\u3044\\u305F',\n    '\\u63A8\\u3057\\u306ESNS\\u3092\\u5B9A\\u671F\\u30C1\\u30A7\\u30C3\\u30AF\\u3059\\u308B\\u30EB\\u30FC\\u30C6\\u30A3\\u30F3\\u304C\\u751F\\u6D3B\\u306E\\u4E00\\u90E8\\u306B\\u306A\\u3063\\u305F',\n    '\\u63A8\\u3057\\u3078\\u306E\\u30D5\\u30A1\\u30F3\\u30EC\\u30BF\\u30FC\\u3092\\u66F8\\u304F\\u3053\\u3068\\u3067\\u81EA\\u5206\\u306E\\u6C17\\u6301\\u3061\\u3082\\u6574\\u7406\\u3067\\u304D\\u308B',\n    '\\u63A8\\u3057\\u304C\\u8A55\\u4FA1\\u3055\\u308C\\u305F\\u6642\\u306F\\u81EA\\u5206\\u306E\\u3053\\u3068\\u3088\\u308A\\u5B09\\u3057\\u3044\\u4E0D\\u601D\\u8B70\\u306A\\u611F\\u60C5',\n    '\\u63A8\\u3057\\u6D3B\\u3092\\u901A\\u3058\\u3066\\u81EA\\u5206\\u306E\\u611F\\u60C5\\u8868\\u73FE\\u304C\\u8C4A\\u304B\\u306B\\u306A\\u3063\\u305F\\u6C17\\u304C\\u3059\\u308B',\n    '\\u63A8\\u3057\\u304C\\u3044\\u308B\\u304A\\u304B\\u3052\\u3067\\u5ACC\\u306A\\u3053\\u3068\\u304C\\u3042\\u3063\\u3066\\u3082\\u7ACB\\u3061\\u76F4\\u308C\\u308B\\u529B\\u304C\\u3042\\u308B',\n    '\\u63A8\\u3057\\u6D3B\\u306ESNS\\u30B3\\u30DF\\u30E5\\u30CB\\u30C6\\u30A3\\u3067\\u4E16\\u754C\\u304C\\u5E83\\u304C\\u3063\\u305F\\u4F53\\u9A13\\u304C\\u3042\\u308B',\n    '\\u63A8\\u3057\\u306E\\u4F5C\\u54C1\\u3092\\u901A\\u3058\\u3066\\u4ECA\\u307E\\u3067\\u77E5\\u3089\\u306A\\u304B\\u3063\\u305F\\u6587\\u5316\\u3084\\u4E16\\u754C\\u89B3\\u3092\\u77E5\\u3063\\u305F',\n    '\\u63A8\\u3057\\u3078\\u306E\\u611F\\u8B1D\\u3092\\u4F1D\\u3048\\u305F\\u304F\\u3066\\u6D3B\\u52D5\\u3092\\u5FDC\\u63F4\\u3059\\u308B\\u3053\\u3068\\u304C\\u7FD2\\u6163\\u306B\\u306A\\u3063\\u305F',\n    '\\u63A8\\u3057\\u6D3B\\u3067\\u8EAB\\u306B\\u3064\\u3044\\u305F\\u96C6\\u4E2D\\u529B\\u3068\\u30EA\\u30B5\\u30FC\\u30C1\\u529B\\u304C\\u4ED5\\u4E8B\\u306B\\u3082\\u6D3B\\u304D\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u304C\\u5143\\u6C17\\u3067\\u3044\\u3066\\u304F\\u308C\\u308B\\u3053\\u3068\\u304C\\u4E00\\u756A\\u306E\\u9858\\u3044\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u3068\\u540C\\u3058\\u5834\\u6240\\u3084\\u6642\\u9593\\u3092\\u5171\\u6709\\u3067\\u304D\\u308B\\u6A5F\\u4F1A\\u306E\\u5E0C\\u5C11\\u3055\\u3092\\u5927\\u5207\\u306B\\u3057\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u5B58\\u5728\\u304C\\u81EA\\u5206\\u306E\\u30E2\\u30C1\\u30D9\\u30FC\\u30B7\\u30E7\\u30F3\\u306E\\u6E90\\u6CC9\\u306B\\u306A\\u3063\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u6D3B\\u3092\\u901A\\u3058\\u3066\\u81EA\\u5206\\u81EA\\u8EAB\\u3092\\u5927\\u5207\\u306B\\u3059\\u308B\\u3053\\u3068\\u3082\\u5B66\\u3093\\u3060',\n    '\\u63A8\\u3057\\u304C\\u3044\\u306A\\u3044\\u4EBA\\u751F\\u3082\\u826F\\u304B\\u3063\\u305F\\u3060\\u308D\\u3046\\u3051\\u3069\\u3001\\u3044\\u308B\\u4EBA\\u751F\\u306E\\u65B9\\u304C\\u8C4A\\u304B\\u3060\\u3068\\u601D\\u3046',\n    '\\u63A8\\u3057\\u3078\\u306E\\u611B\\u60C5\\u306F\\u5E74\\u6708\\u3092\\u7D4C\\u3066\\u3082\\u5909\\u308F\\u3089\\u306A\\u3044\\u3053\\u3068\\u304C\\u81EA\\u5206\\u3067\\u3082\\u9A5A\\u304D',\n    '\\u63A8\\u3057\\u306E\\u5922\\u3092\\u5FDC\\u63F4\\u3057\\u306A\\u304C\\u3089\\u81EA\\u5206\\u306E\\u5922\\u3082\\u6301\\u3061\\u7D9A\\u3051\\u308B\\u3053\\u3068\\u3092\\u5B66\\u3093\\u3060',\n    '\\u63A8\\u3057\\u6D3B\\u3067\\u77E5\\u308A\\u5408\\u3063\\u305F\\u4EF2\\u9593\\u3068\\u306E\\u7D46\\u306F\\u30B8\\u30E3\\u30F3\\u30EB\\u3092\\u8D85\\u3048\\u3066\\u7D9A\\u3044\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306E\\u8AA0\\u5B9F\\u306A\\u6D3B\\u52D5\\u3078\\u306E\\u59FF\\u52E2\\u304C\\u81EA\\u5206\\u306E\\u4ED5\\u4E8B\\u3078\\u306E\\u59FF\\u52E2\\u306B\\u3082\\u5F71\\u97FF\\u3057\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u306B\\u611F\\u8B1D\\u3092\\u4F1D\\u3048\\u3089\\u308C\\u308B\\u6A5F\\u4F1A\\u304C\\u6765\\u305F\\u3089\\u6CE3\\u3044\\u3066\\u3057\\u307E\\u3046\\u3068\\u5206\\u304B\\u3063\\u3066\\u3044\\u308B',\n    '\\u63A8\\u3057\\u304C\\u9811\\u5F35\\u308C\\u3066\\u3044\\u308B\\u306E\\u306F\\u5FDC\\u63F4\\u3057\\u3066\\u3044\\u308B\\u4EBA\\u305F\\u3061\\u306E\\u529B\\u3082\\u3042\\u308B\\u3068\\u4FE1\\u3058\\u305F\\u3044',\n    '\\u63A8\\u3057\\u6D3B\\u306F\\u81EA\\u5DF1\\u8868\\u73FE\\u3067\\u3082\\u3042\\u308A\\u81EA\\u5206\\u3089\\u3057\\u3055\\u3092\\u898B\\u3064\\u3051\\u308B\\u65C5\\u3067\\u3082\\u3042\\u308B',\n    '\\u63A8\\u3057\\u306E\\u5B58\\u5728\\u3067\\u4E16\\u754C\\u304C\\u4EE5\\u524D\\u3088\\u308A\\u660E\\u308B\\u304F\\u898B\\u3048\\u308B\\u3088\\u3046\\u306B\\u306A\\u3063\\u305F',\n    '\\u63A8\\u3057\\u3078\\u306E\\u611B\\u60C5\\u3092\\u8A00\\u8449\\u306B\\u3059\\u308B\\u305F\\u3073\\u306B\\u81EA\\u5206\\u306E\\u611F\\u60C5\\u306B\\u6B63\\u76F4\\u306B\\u306A\\u308C\\u308B'\n  ]\n};\n\n\n// ===== \u30ad\u30fc\u30ef\u30fc\u30c9\u62bd\u51fa + \u52d5\u7684\u8fd4\u4fe1\u751f\u6210 =====\nfunction extractKeyword(text) {\n  const tags = (text.match(/#[\\u3041-\\u9FFF\\w]+/g)||[]).map(t=>t.replace('#',''));\n  if (tags.length) return tags[0];\n  const words = text.split(/[\\s\\u3001\\u3002\\uFF01\\uFF1F!?.]+/)\n    .filter(w => w.length >= 2 && /[\\u30A1-\\u30FF\\u3041-\\u9FFF]/.test(w));\n  return words[0] || text.slice(0,8);\n}\n\nconst KW_TEMPLATES = {\n  influencer: [\n    '{kw}\\u304C\\u6700\\u9AD8\\u306B\\u306A\\u308C\\u308B\\u6295\\u7A3F\\u3067\\u3042\\u308A\\u304C\\u3068\\u3046',\n    '{kw}\\u306E\\u8A71\\u3001\\u308A\\u3087\\u304B\\u308F\\u304B\\u308B\\uFF01',\n    '{kw}\\u304C\\u6C17\\u306B\\u306A\\u308B\\u3002\\u3082\\u3063\\u3068\\u8A71\\u3057\\u3066',\n    '{kw}\\u3063\\u3066\\u3044\\u3046\\u306E\\u304C\\u9762\\u767D\\u3059\\u304E\\u308B',\n    '{kw}\\u3067\\u76DB\\u308A\\u4E0A\\u304C\\u308C\\u308B\\u306E\\u898B\\u305F\\u3044',\n    '{kw}\\u304C\\u8A71\\u984C\\u306B\\u306A\\u308B\\u306E\\u306F\\u6642\u9593\u306e\u554f\u984c\u3060',\n  ],\n  mental: [\n    '{kw}\\u306E\\u6C17\\u6301\\u3061\\u3001\\u8A71\\u3057\\u3066\\u304F\\u308C\\u3066\\u3042\\u308A\\u304C\\u3068\\u3046',\n    '{kw}\\u3063\\u3066\\u8A00\\u3063\\u3066\\u3044\\u3044\\u3093\\u3060\\u3088\\u3002\\u5C11\\u3057\\u697D\\u306B\\u306A\\u308B',\n    '{kw}\\u3092\\u62B1\\u3048\\u3066\\u308B\\u306E\\u306F\\u3072\\u3068\\u308A\\u3058\\u3083\\u306A\\u3044\\u3088',\n    '{kw}\\u3001\\u305D\\u308C\\u3063\\u3066\\u3064\\u3089\\u304B\\u3063\\u305F\\u306D',\n    '{kw}\\u306E\\u3053\\u3068\\u3001\\u3061\\u3083\\u3093\\u3068\\u53D7\\u3051\\u53D6\\u3063\\u305F\\u3088',\n    '{kw}\\u304C\\u3042\\u3063\\u3066\\u5927\\u5909\\u3060\\u3063\\u305F\\u306D\\u3002\\u3086\\u3063\\u304F\\u308A\\u3067\\u3044\\u3044',\n  ],\n  debate: [\n    '{kw}\\u306B\\u3064\\u3044\\u3066\\u306E\\u4E3B\\u5F35\\u3001\\u6839\\u62E0\\u3092\\u805E\\u304B\\u305B\\u3066',\n    '{kw}\\u306F\\u9006\\u304B\\u3089\\u898B\\u308B\\u3068\\u5225\\u306E\\u9762\\u304C\\u3042\\u308B',\n    '{kw}\\u306E\\u524D\\u63D0\\u3092\\u305D\\u3082\\u305D\\u3082\\u78BA\\u8A8D\\u3057\\u305F\\u65B9\\u304C\\u3044\\u3044',\n    '{kw}\\u3063\\u3066\\u8A00\\u3044\\u5207\\u308B\\u306E\\u306F\\u5C11\\u3057\\u65E9\\u304F\\u306A\\u3044\\u304B',\n    '{kw}\\u306B\\u3064\\u3044\\u3066\\u6570\\u5B57\\u3067\\u8A71\\u3057\\u3066\\u308C\\u3002\\u5370\\u8C61\\u8AD6\\u306F\\u8981\\u3089\\u306A\\u3044',\n    '{kw}\\u306E\\u8AD6\\u70B9\\u3001\\u6574\\u7406\\u3059\\u308B\\u3068\\u5225\\u306E\\u7D50\\u8AD6\\u306B\\u306A\\u308B',\n  ],\n  legend: [\n    '{kw}\\u306B\\u3064\\u3044\\u3066\\u306F\\u6211\\u3089\\u306E\\u6642\\u4EE3\\u306B\\u3082\\u540C\\u3058\\u8AD6\\u8B70\\u304C\\u3042\\u3063\\u305F',\n    '{kw}\\u3068\\u306F\\u4F55\\u304B\\u3002\\u3082\\u3063\\u3068\\u6DF1\\u304F\\u8003\\u3048\\u308B\\u4FA1\\u5024\\u304C\\u3042\\u308B',\n    '{kw}\\u304B\\u3089\\u5B66\\u3079\\u308B\\u3053\\u3068\\u304C\\u3042\\u308B',\n    '{kw}\\u306F\\u6B74\\u53F2\\u306E\\u4E2D\\u3067\\u4F55\\u5EA6\\u3082\\u7E70\\u308A\\u8FD4\\u3055\\u308C\\u305F\\u30C6\\u30FC\\u30DE\\u3060',\n    '{kw}\\u3092\\u901A\\u3058\\u3066\\u4EBA\\u306E\\u5FC3\\u306E\\u672C\\u8CEA\\u304C\\u898B\\u3048\\u3066\\u304F\\u308B',\n    '{kw}\\u3001\\u6B63\\u89E3\\u306F\\u306A\\u3044\\u304C\\u8003\\u3048\\u7D9A\\u3051\\u308B\\u3053\\u3068\\u306B\\u610F\\u5473\\u304C\\u3042\\u308B',\n  ]\n};\n\nfunction genKwReply(postText, mode, charNames) {\n  const kw = extractKeyword(postText);\n  if (!kw || kw.length < 2) return null;\n  const tmpls = KW_TEMPLATES[mode] || KW_TEMPLATES.influencer;\n  const tmpl  = tmpls[Math.floor(Math.random() * tmpls.length)];\n  const comment = tmpl.replace(/\\{kw\\}/g, kw);\n  const name = charNames && charNames.length\n    ? charNames[Math.floor(Math.random()*charNames.length)]\n    : AI_NAMES[Math.floor(Math.random()*AI_NAMES.length)];\n  const n = typeof name === 'string' ? name : (name.name || name);\n  return { name: n, uid: '@'+n.slice(0,15), avatar: '\\u2B50', comment, likes: Math.floor(Math.random()*5000)+100 };\n}\n\n// ===================================================\n//  \u30c8\u30d4\u30c3\u30af\u5225\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u81ea\u52d5\u751f\u6210\u30a8\u30f3\u30b8\u30f3\n// ===================================================\n\n// \u4f7f\u7528\u6e08\u307f\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u30a4\u30f3\u30c7\u30c3\u30af\u30b9\u306e\u8ffd\u8de1\uff08300\u4ef6\u30b5\u30a4\u30af\u30eb\uff09\n// \u30ad\u30fc: \"\u30c8\u30d4\u30c3\u30af|\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u30a4\u30f3\u30c7\u30c3\u30af\u30b9|\u30ad\u30e3\u30e9\u540d\"\nlet usedTLKeys = new Set();\nlet tlAutoTimer = null;\nlet tlPostCount = 0; // \u81ea\u52d5\u8ffd\u52a0\u306e\u7dcf\u30ab\u30a6\u30f3\u30c8\n\n// \u30a4\u30f3\u30bf\u30ec\u30b9\u30c8\u30e9\u30d9\u30eb\u3068TOPIC_TEMPLATES\u30ad\u30fc\u306e\u30de\u30c3\u30d4\u30f3\u30b0\nconst INTEREST_MAP = {\n  '\\uD83C\\uDFB5 \\u97F3\\u697D':     '\\u97F3\\u697D',\n  '\\uD83C\\uDFAC \\u6620\\u753B':     '\\u6620\\u753B',\n  '\\uD83C\\uDFAE \\u30B2\\u30FC\\u30E0':     '\\u30B2\\u30FC\\u30E0',\n  '\\uD83C\\uDF73 \\u6599\\u7406':     '\\u6599\\u7406',\n  '\\uD83D\\uDCBB \\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC': '\\u30C6\\u30AF\\u30CE\\u30ED\\u30B8\\u30FC',\n  '\\uD83D\\uDCDA \\u8AAD\\u66F8':     '\\u8AAD\\u66F8',\n  '\\u2708\\uFE0F \\u65C5\\u884C':     '\\u65C5\\u884C',\n  '\\uD83D\\uDC3E \\u52D5\\u7269':     '\\u52D5\\u7269',\n  '\\u26BD \\u30B9\\u30DD\\u30FC\\u30C4': '\\u30B9\\u30DD\\u30FC\\u30C4',\n  '\\uD83C\\uDF3F \\u30E9\\u30A4\\u30D5\\u30B9\\u30BF\\u30A4\\u30EB': '\\u30E9\\u30A4\\u30D5\\u30B9\\u30BF\\u30A4\\u30EB',\n  '\\uD83C\\uDFAD \\u30A2\\u30CB\\u30E1': '\\u30A2\\u30CB\\u30E1',\n  '\\uD83D\\uDCB0 \\u30D3\\u30B8\\u30CD\\u30B9': '\\u30D3\\u30B8\\u30CD\\u30B9',\n  '\\uD83C\\uDF1F \\u63A8\\u3057\\u6D3B': '\\u63A8\\u3057\\u6D3B',\n};\n\n// \u7c21\u6613\u30cf\u30c3\u30b7\u30e5\u95a2\u6570\nfunction hashStr(s) {\n  let h = 0;\n  for (let i = 0; i < s.length; i++) {\n    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;\n  }\n  return Math.abs(h);\n}\n\n// \u30e6\u30fc\u30b6\u30fc\u306e\u8208\u5473\u306b\u5bfe\u5fdc\u3059\u308b\u30c8\u30d4\u30c3\u30af\u30ea\u30b9\u30c8\u3092\u53d6\u5f97\nfunction getUserTopics() {\n  const topics = [];\n  for (const interest of (user.interests || [])) {\n    const key = INTEREST_MAP[interest];\n    if (key && TOPIC_TEMPLATES[key]) topics.push(key);\n  }\n  // \u4f55\u3082\u4e00\u81f4\u3057\u306a\u3051\u308c\u3070\u5168\u30c8\u30d4\u30c3\u30af\u304b\u3089\u9078\u629e\n  return topics.length ? topics : Object.keys(TOPIC_TEMPLATES);\n}\n\n// \u30a2\u30d0\u30bf\u30fc\u7d75\u6587\u5b57\u306e\u30d7\u30fc\u30eb\nconst TL_AVATARS = [\n  '\\uD83D\\uDE0A','\\uD83D\\uDE0E','\\uD83D\\uDC36','\\uD83D\\uDC31','\\uD83E\\uDD8A','\\uD83D\\uDC38',\n  '\\uD83E\\uDD84','\\uD83D\\uDC3C','\\uD83E\\uDD81','\\uD83D\\uDC2F','\\uD83D\\uDC3B','\\uD83D\\uDC28',\n  '\\uD83D\\uDC3A','\\uD83D\\uDC27','\\uD83D\\uDC37','\\uD83D\\uDC22','\\uD83D\\uDC26','\\uD83E\\uDD9C',\n  '\\uD83D\\uDC2E','\\uD83D\\uDC34','\\uD83D\\uDC11','\\uD83D\\uDC0A','\\uD83E\\uDDB7','\\uD83D\\uDC19',\n];\n\n// 1\u4ef6\u306e\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u6295\u7a3f\u3092\u751f\u6210\nfunction genOneTLPost(mode) {\n  const topics = getUserTopics();\n  const rand   = Math.random;\n\n  // 300\u4ef6\u3067\u30ea\u30bb\u30c3\u30c8\n  if (usedTLKeys.size >= 300) {\n    usedTLKeys.clear();\n    console.log('[TL] 300\u4ef6\u9054\u6210 \u2192 \u4f7f\u7528\u6e08\u307f\u30ea\u30bb\u30c3\u30c8');\n  }\n\n  // \u30c8\u30d4\u30c3\u30af\u3092\u30b7\u30e3\u30c3\u30d5\u30eb\u3057\u3066\u672a\u4f7f\u7528\u306e\u7d44\u307f\u5408\u308f\u305b\u3092\u63a2\u3059\n  const shuffledTopics = [...topics].sort(() => rand() - 0.5);\n\n  for (const topic of shuffledTopics) {\n    const pool = TOPIC_TEMPLATES[topic];\n    if (!pool || !pool.length) continue;\n\n    // \u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u3092\u30b7\u30e3\u30c3\u30d5\u30eb\n    const idxs = Array.from({length: pool.length}, (_, i) => i)\n      .sort(() => rand() - 0.5);\n\n    for (const ti of idxs) {\n      // \u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u3092\u30b7\u30e3\u30c3\u30d5\u30eb\n      const nameIdx = Math.floor(rand() * AI_NAMES.length);\n      const name = AI_NAMES[nameIdx];\n      const key  = topic + '|' + ti + '|' + name;\n\n      if (!usedTLKeys.has(key)) {\n        usedTLKeys.add(key);\n        const text   = pool[ti];\n        const avatar = TL_AVATARS[hashStr(name) % TL_AVATARS.length];\n        const uid    = '@' + name.replace(/\\s/g, '_').slice(0, 15);\n        return { text, comment: text, name, id: uid, uid, avatar, mode, topic };\n      }\n    }\n  }\n\n  // \u5168\u3066\u4f7f\u7528\u6e08\u307f\u306e\u5834\u5408\uff08\u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af\uff09\n  const topic = shuffledTopics[0] || Object.keys(TOPIC_TEMPLATES)[0];\n  const pool  = TOPIC_TEMPLATES[topic];\n  const ti    = Math.floor(rand() * pool.length);\n  const name  = AI_NAMES[Math.floor(rand() * AI_NAMES.length)];\n  const text  = pool[ti];\n  const avatar = TL_AVATARS[hashStr(name) % TL_AVATARS.length];\n  const uid   = '@' + name.replace(/\\s/g, '_').slice(0, 15);\n  return { text, name, uid, avatar, mode, topic };\n}\n\n// \u521d\u671f20\u4ef6\u3092\u4e00\u6c17\u306b\u751f\u6210\u3057\u3066\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306b\u8ffd\u52a0\nfunction initTopicTL() {\n  if (!user.interests.length) return;\n  const INITIAL = 20;\n  for (let i = 0; i < INITIAL; i++) {\n    const p = genOneTLPost(curMode);\n    mPosts[curMode].push(mkAI(p, curMode));\n  }\n  renderTL();\n  saveData();\n  console.log('[TL] \u521d\u671f' + INITIAL + '\u4ef6\u751f\u6210\u5b8c\u4e86');\n}\n\n// 1\u5206\u3054\u3068\u306b1\u4ef6\u8ffd\u52a0\u3059\u308b\u30bf\u30a4\u30de\u30fc\u3092\u958b\u59cb\nfunction startAutoTL() {\n  if (tlAutoTimer) clearInterval(tlAutoTimer);\n  tlAutoTimer = setInterval(() => {\n    if (curPanel !== 'timeline') return; // TL\u975e\u8868\u793a\u6642\u306f\u30b9\u30ad\u30c3\u30d7\n    const p = genOneTLPost(curMode);\n    mPosts[curMode].push(mkAI(p, curMode));\n    tlPostCount++;\n    renderTL();\n    saveData();\n    console.log('[TL] \u81ea\u52d5\u8ffd\u52a0 #' + tlPostCount);\n  }, 60000); // 1\u5206\n}\n\n\n// ===================================================\n//  \u4fdd\u5b58\u30fb\u8aad\u307f\u8fbc\u307f\n// ===================================================\nfunction saveData() {\n  try {\n    localStorage.setItem(STORE_KEY, JSON.stringify({user, mPosts, trends, notifs, pidCtr, curMode, unread}));\n  } catch(e) {}\n  // Firebase \u306b\u975e\u540c\u671f\u3067\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\n  if (fbEnabled) clearTimeout(saveData._fb);\n  if (fbEnabled) saveData._fb = setTimeout(fbSave, 3000);\n}\nfunction loadData() {\n  try {\n    const raw = localStorage.getItem(STORE_KEY); if (!raw) return false;\n    const d = JSON.parse(raw);\n    user   = d.user   || user;\n    mPosts = d.mPosts || {influencer:[],mental:[],debate:[],legend:[]};\n    trends = d.trends || []; notifs = d.notifs || [];\n    pidCtr = d.pidCtr || 0; curMode = d.curMode || 'influencer'; unread = d.unread || 0;\n    return true;\n  } catch(e) { return false; }\n}\n\n// ===================================================\n//  \u521d\u671f\u5316\n// ===================================================\n(function init() {\n  showLd('\u8d77\u52d5\u4e2d\u2026');\n  const ok = loadData();\n  if (ok && user.name && user.id) {\n    toMain(false).then(() => {\n      if (unread > 0) document.getElementById('ndot').classList.add('show');\n      if (Object.values(mPosts).flat().some(p => p.type === 'user')) startLikeSim();\n      applyTheme(user.theme || 'dark');\n      applyMode(curMode);\n    });\n  } else {\n    hideLd();\n    document.getElementById('setupScreen').classList.add('active');\n    applyTheme('dark');\n  }\n\n  // \u6295\u7a3f\u30dc\u30bf\u30f3\u6709\u52b9\u5316\n  const ta = document.getElementById('postInput');\n  let imgDebounce;\n  if (ta) ta.addEventListener('input', () => {\n    document.getElementById('sendBtn').disabled = ta.value.trim() === '' || busy;\n    clearTimeout(imgDebounce);\n    if (ta.value.trim().length >= 4) {\n      imgDebounce = setTimeout(() => fetchImages(ta.value.trim()), 800);\n    }\n  });\n\n  // \u30d0\u30c3\u30af\u30b0\u30e9\u30a6\u30f3\u30c9\u5fa9\u5e30\u6642\u306e\u3044\u3044\u306d\u51e6\u7406\n  let hidAt = null;\n  document.addEventListener('visibilitychange', () => {\n    if (document.hidden) {\n      hidAt = Date.now();\n    } else if (hidAt) {\n      const el = Date.now() - hidAt; hidAt = null;\n      if (el > 10000) {\n        const my = Object.values(mPosts).flat().filter(p => p.type === 'user');\n        const mins = Math.max(1, Math.floor(el / 60000));\n        my.forEach(p => autoLike(p.id, Math.floor(Math.random() * mins * 25) + mins));\n      }\n    }\n  });\n})();\n</script>\n</body>\n</html>";
+let rpdCount  = 0;
+let rpdResetAt = Date.now() + 24 * 60 * 60_000;
 
-// ===== \u30E6\u30FC\u30C6\u30A3\u30EA\u30C6\u30A3 =====
+function checkRPD() {
+  const now = Date.now();
+  if (now > rpdResetAt) {
+    rpdCount = 0;
+    rpdResetAt = now + 24 * 60 * 60_000;
+    console.log('[rpd] 日次リセット');
+  }
+  rpdCount++;
+  console.log(`[rpd] 本日${rpdCount}回目 / 上限${RPD_HARD}回`);
+  if (rpdCount >= RPD_HARD) throw new Error('RPD_EXCEEDED');
+  return rpdCount;
+}
+
+// ===================================================
+//  HTTP ヘルパー
+// ===================================================
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let b = '';
-    req.on('data', c => { b += c; if (b.length > 200000) reject(new Error('too large')); });
-    req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch(e) { reject(e); } });
+    req.on('data', c => {
+      b += c;
+      if (b.length > BODY_MAX_BYTES) reject(new Error('body too large'));
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(b || '{}')); }
+      catch (e) { reject(new Error('invalid JSON')); }
+    });
     req.on('error', reject);
   });
 }
@@ -65,442 +128,702 @@ function sendJSON(res, status, data) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(body),
-    ...(status === 429 ? {'Retry-After':'60'} : {})
+    ...(status === 429 ? { 'Retry-After': '60' } : {}),
   });
   res.end(body);
 }
 
+/**
+ * HTTPS POST（タイムアウト付き）
+ * @param {string} hostname
+ * @param {string} path
+ * @param {object} headers
+ * @param {object} body
+ * @returns {Promise<object>}
+ */
 function httpsPost(hostname, path, headers, body) {
   return new Promise((resolve, reject) => {
     const s = JSON.stringify(body);
     const req = https.request(
-      { hostname, path, method: 'POST',
-        headers: {'Content-Type':'application/json','Content-Length':Buffer.byteLength(s),...headers} },
+      {
+        hostname, path, method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(s),
+          ...headers,
+        },
+      },
       res => {
         let raw = '';
         res.on('data', c => { raw += c; });
         res.on('end', () => {
-          if (res.statusCode === 429) { reject(new Error('GEMINI_QUOTA_EXCEEDED')); return; }
-          if (res.statusCode >= 400)  { reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0,300)}`)); return; }
-          try { resolve(JSON.parse(raw)); } catch(e) { reject(new Error('JSON parse error: ' + raw.slice(0,200))); }
+          if (res.statusCode === 429)  { reject(new Error('GEMINI_QUOTA_EXCEEDED')); return; }
+          if (res.statusCode >= 400)   { reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0,300)}`)); return; }
+          try { resolve(JSON.parse(raw)); }
+          catch (e) { reject(new Error('JSON parse error: ' + raw.slice(0,200))); }
         });
       }
     );
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error('Request timeout'));
+    });
     req.on('error', reject);
-    req.write(s); req.end();
+    req.write(s);
+    req.end();
   });
-}
-// ===== Wikipedia\u8981\u7d04\u30ad\u30e3\u30c3\u30b7\u30e5 =====
-const wikiCache = new Map();
-
-async function fetchWikiSummary(name) {
-  if (wikiCache.has(name)) return wikiCache.get(name);
-  try {
-    const encoded = encodeURIComponent(name);
-    const d = await httpsGet(
-      'ja.wikipedia.org',
-      `/api/rest_v1/page/summary/${encoded}`
-    );
-    const summary = d.extract ? d.extract.slice(0, 300) : '';
-    wikiCache.set(name, summary);
-    return summary;
-  } catch(e) {
-    console.warn('[wiki]', name, e.message.slice(0, 60));
-    return '';
-  }
 }
 
 function httpsGet(hostname, path) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname, path, method: 'GET',
-        headers: { 'User-Agent': 'idobata-app/1.0' } },
+      { hostname, path, method: 'GET', headers: { 'User-Agent': 'idobata-app/1.0' } },
       res => {
         let raw = '';
         res.on('data', c => { raw += c; });
         res.on('end', () => {
           if (res.statusCode >= 400) { reject(new Error('HTTP ' + res.statusCode)); return; }
-          try { resolve(JSON.parse(raw)); } catch(e) { reject(e); }
+          try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
         });
       }
     );
+    req.setTimeout(HTTP_TIMEOUT_MS, () => req.destroy(new Error('Request timeout')));
     req.on('error', reject);
     req.end();
   });
 }
 
+// ===================================================
+//  Wikipedia キャッシュ（TTL付き）
+// ===================================================
+/** @type {Map<string, {summary: string, expiresAt: number}>} */
+const wikiCache = new Map();
 
+async function fetchWikiSummary(name) {
+  const cached = wikiCache.get(name);
+  if (cached && Date.now() < cached.expiresAt) return cached.summary;
 
-// ===== AI\u30EC\u30B9\u30DD\u30F3\u30B9\u306E\u30D1\u30FC\u30B9\uFF08\u591A\u6BB5\u968E\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF\uFF09=====
-// ===== Claude API \u547C\u3073\u51FA\u3057 =====
-const CLAUDE_KEY  = process.env.ANTHROPIC_API_KEY || '';
-const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';   // \u9AD8\u901F\u30FB\u4F4E\u30B3\u30B9\u30C8\u7248
-
-// API\u30AD\u30FC\u306E\u3069\u3061\u3089\u304B\u304C\u4F7F\u3048\u308B\u304B\u5224\u5B9A
-function hasAI() { return !!(CLAUDE_KEY || GEMINI_KEY); }
-
-// ---- Claude\u547C\u3073\u51FA\u3057 ----
-async function callClaude(systemPrompt, userPrompt) {
-  await waitRL_API();
-  const reqBody = {
-    model: CLAUDE_MODEL,
-    max_tokens: 2500,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userPrompt }]
-  };
-  console.log('[claude] sending request...');
-  const d = await httpsPost(
-    'api.anthropic.com',
-    '/v1/messages',
-    {
-      'x-api-key': CLAUDE_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    reqBody
-  );
-  // Claude\u306E\u30EC\u30B9\u30DD\u30F3\u30B9\u5F62\u5F0F: d.content[0].text
-  const raw = d.content?.[0]?.text || '';
-  console.log('[claude] raw:', raw.slice(0, 300));
-  return parseAI(raw);
-}
-
-// ---- Gemini\u547C\u3073\u51FA\u3057\uFF08\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF\u7528\uFF09----
-async function callGemini(prompt, schema) {
-  if (!GEMINI_KEY) throw new Error('GEMINI_API_KEY\u672A\u8A2D\u5B9A');
-  checkRPD();
-  await waitRL_API();
-  const reqBody = {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 1.0,
-      maxOutputTokens: 2500,
-      responseMimeType: 'application/json',
-      responseSchema: schema
-    }
-  };
-  const d = await httpsPost(
-    'generativelanguage.googleapis.com',
-    `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
-    {}, reqBody
-  );
-  const raw = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  return parseAI(raw);
-}
-
-// ---- \u7D71\u5408\u547C\u3073\u51FA\u3057: Claude\u512A\u5148 \u2192 Gemini\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF ----
-async function callAI(systemPrompt, userPrompt, geminiPrompt, schema) {
-  // Claude\u3042\u308A\u306A\u3089\u307E\u305FClaude\u3092\u8A66\u307F\u308B\u3002\u5931\u6557\u6642\u306FGemini\u306B\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF
-  if (CLAUDE_KEY) {
-    try {
-      return await callClaude(systemPrompt, userPrompt);
-    } catch(e) {
-      // \u30AF\u30EC\u30B8\u30C3\u30C8\u4E0D\u8DB3\u30FB\u8A8D\u8A3C\u30A8\u30E9\u30FC\u306A\u3069\u306F\u30B9\u30AD\u30C3\u30D7\u3057\u3066Gemini\u3078
-      const msg = e.message || '';
-      const isAuthErr = msg.includes('credit balance') ||
-                        msg.includes('HTTP 400') ||
-                        msg.includes('HTTP 401') ||
-                        msg.includes('HTTP 403') ||
-                        msg.includes('insufficient_quota') ||
-                        msg.includes('RPD_EXCEEDED');
-      if (isAuthErr) {
-        console.warn('[callAI] Claude\u30AF\u30EC\u30B8\u30C3\u30C8\u4E0D\u8DB3 \u2192 Gemini\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF:', msg.slice(0,100));
-      } else {
-        console.warn('[callAI] Claude\u30A8\u30E9\u30FC \u2192 Gemini\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF:', msg.slice(0,100));
-      }
-      // Gemini\u304C\u8A2D\u5B9A\u3055\u308C\u3066\u3044\u308C\u3070\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF
-      if (GEMINI_KEY) return callGemini(geminiPrompt, schema);
-      throw e; // Gemini\u3082\u306A\u3051\u308C\u3070\u30A8\u30E9\u30FC\u3092\u518D\u30B9\u30ED\u30FC
-    }
+  try {
+    const d = await httpsGet('ja.wikipedia.org', `/api/rest_v1/page/summary/${encodeURIComponent(name)}`);
+    const summary = d.extract ? d.extract.slice(0, 300) : '';
+    wikiCache.set(name, { summary, expiresAt: Date.now() + WIKI_CACHE_TTL_MS });
+    return summary;
+  } catch (e) {
+    console.warn('[wiki]', name, e.message.slice(0, 60));
+    return '';
   }
-  if (GEMINI_KEY) {
-    return callGemini(geminiPrompt, schema);
-  }
-  throw new Error('\u30A2\u30AF\u30C6\u30A3\u30D6\u306AAPI\u30AD\u30FC\u304C\u3042\u308A\u307E\u305B\u3093\u3002ANTHROPIC_API_KEY\u307E\u305F\u306FGEMINI_API_KEY\u3092\u8A2D\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044\u3002');
 }
 
-// ===== AI\u30EC\u30B9\u30DD\u30F3\u30B9\u306E\u30D1\u30FC\u30B9\uFF08\u591A\u6BB5\u968E\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF\uFF09=====
-function parseAI(raw) {
-  if (!raw || typeof raw !== 'string') throw new Error('\u7A7A\u30EC\u30B9\u30DD\u30F3\u30B9');
-  // \u30B3\u30FC\u30C9\u30D5\u30A7\u30F3\u30B9\u30FB\u524D\u5F8C\u306E\u4F59\u5206\u306A\u6587\u5B57\u3092\u9664\u53BB
-  const c = raw
+// 1時間ごとに期限切れエントリを削除
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of wikiCache.entries())
+    if (now >= val.expiresAt) wikiCache.delete(key);
+}, 60 * 60_000);
+
+// ===================================================
+//  AI レート制限
+// ===================================================
+let lastApiCall = 0;
+async function waitApiRL() {
+  const elapsed = Date.now() - lastApiCall;
+  if (elapsed < API_MIN_INTERVAL_MS)
+    await new Promise(r => setTimeout(r, API_MIN_INTERVAL_MS - elapsed));
+  lastApiCall = Date.now();
+}
+
+// ===================================================
+//  AIレスポンスのパース（1箇所に集約）
+// ===================================================
+function parseAIResponse(raw) {
+  if (!raw || typeof raw !== 'string') throw new Error('空レスポンス');
+  const cleaned = raw
     .replace(/```json\s*/gi, '').replace(/```\s*/g, '')
-    .replace(/^[^{\[]*/, '')   // \u5148\u982D\u306E\u30B4\u30DF\u6587\u5B57\u3092\u9664\u53BB
+    .replace(/^[^{\[]*/, '')
     .trim();
 
   try {
-    const r = JSON.parse(c);
-    if (r && r.replies !== undefined) return r;   // { replies, timelinePosts }
-    if (r && Array.isArray(r.posts))  return r;   // { posts }
+    const r = JSON.parse(cleaned);
+    if (r && r.replies !== undefined) return r;
+    if (r && Array.isArray(r.posts))  return r;
     if (Array.isArray(r))             return r;
     if (r && typeof r === 'object')   return r;
-  } catch(_) {}
+  } catch (_) {}
 
-  // JSON\u914D\u5217\u3092\u6B63\u898F\u8868\u73FE\u3067\u62BD\u51FA
-  const am = c.match(/\[[\s\S]*?\]/);
-  if (am) try {
-    const r = JSON.parse(am[0]);
-    if (Array.isArray(r) && r.length) return r;
-  } catch(_) {}
+  const match = cleaned.match(/\[[\s\S]*?\]/);
+  if (match) {
+    try {
+      const arr = JSON.parse(match[0]);
+      if (Array.isArray(arr) && arr.length) return arr;
+    } catch (_) {}
+  }
 
-  throw new Error('JSON\u30D1\u30FC\u30B9\u5931\u6557: ' + raw.slice(0, 200));
+  throw new Error('JSONパース失敗: ' + raw.slice(0, 200));
 }
 
-// ===== Gemini\u7528JSON\u30B9\u30AD\u30FC\u30DE\uFF08Gemini fallback\u6642\u306E\u307F\u4F7F\u7528\uFF09=====
-const CHAR_ITEM = {
-  type:'object',
-  properties:{
-    name:{type:'string'}, id:{type:'string'},
-    avatar:{type:'string'}, comment:{type:'string'}, likes:{type:'integer'}
+// ===================================================
+//  Claude API 呼び出し
+// ===================================================
+async function callClaude(systemPrompt, userPrompt) {
+  await waitApiRL();
+  const d = await httpsPost(
+    'api.anthropic.com',
+    '/v1/messages',
+    { 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01' },
+    {
+      model: CLAUDE_MODEL,
+      max_tokens: 2500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    }
+  );
+  const raw = d.content?.[0]?.text || '';
+  console.log('[claude] raw:', raw.slice(0, 200));
+  return parseAIResponse(raw);
+}
+
+// ===================================================
+//  Gemini API 呼び出し（フォールバック用）
+// ===================================================
+const CHAR_ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    name:    { type: 'string' },
+    id:      { type: 'string' },
+    avatar:  { type: 'string' },
+    comment: { type: 'string' },
+    likes:   { type: 'integer' },
   },
-  required:['name','id','avatar','comment','likes']
+  required: ['name', 'id', 'avatar', 'comment', 'likes'],
 };
 const POST_SCHEMA = {
-  type:'object',
-  properties:{
-    replies:{type:'array',items:CHAR_ITEM},
-    timelinePosts:{type:'array',items:CHAR_ITEM}
+  type: 'object',
+  properties: {
+    replies:       { type: 'array', items: CHAR_ITEM_SCHEMA },
+    timelinePosts: { type: 'array', items: CHAR_ITEM_SCHEMA },
   },
-  required:['replies','timelinePosts']
+  required: ['replies', 'timelinePosts'],
 };
 const TL_SCHEMA = {
-  type:'object',
-  properties:{posts:{type:'array',items:CHAR_ITEM}},
-  required:['posts']
+  type: 'object',
+  properties: { posts: { type: 'array', items: CHAR_ITEM_SCHEMA } },
+  required: ['posts'],
 };
 
-// ===== API\u30EC\u30FC\u30C8\u5236\u5FA1\uFF084\u79D2\u9593\u9694\uFF09=====
-let lastCall = 0;
-async function waitRL_API() {
-  const MIN = 4200;
-  const el  = Date.now() - lastCall;
-  if (el < MIN) await new Promise(r => setTimeout(r, MIN - el));
-  lastCall = Date.now();
+async function callGemini(prompt, schema) {
+  if (!GEMINI_KEY) throw new Error('GEMINI_API_KEY未設定');
+  checkRPD();
+  await waitApiRL();
+  const d = await httpsPost(
+    'generativelanguage.googleapis.com',
+    `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+    {},
+    {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 1.0,
+        maxOutputTokens: 2500,
+        responseMimeType: 'application/json',
+        responseSchema: schema,
+      },
+    }
+  );
+  const raw = d.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  return parseAIResponse(raw);
 }
 
-// ===== \u30AD\u30E3\u30E9\u30AF\u30BF\u30FC100\u540D\u30C7\u30FC\u30BF\u30D9\u30FC\u30B9 =====
+/**
+ * AI呼び出し統合関数: Claude優先 → Geminiフォールバック
+ * @param {string} systemPrompt  Claude用システムプロンプト
+ * @param {string} userPrompt    Claude用ユーザープロンプト
+ * @param {string} geminiPrompt  Gemini用フォールバックプロンプト
+ * @param {object} schema        Gemini用JSONスキーマ
+ */
+async function callAI(systemPrompt, userPrompt, geminiPrompt, schema) {
+  if (CLAUDE_KEY) {
+    try {
+      return await callClaude(systemPrompt, userPrompt);
+    } catch (e) {
+      console.warn('[callAI] Claude失敗 → Geminiフォールバック:', e.message.slice(0, 100));
+      if (!GEMINI_KEY) throw e;
+    }
+  }
+  if (GEMINI_KEY) return callGemini(geminiPrompt, schema);
+  throw new Error('有効なAPIキーがありません。ANTHROPIC_API_KEY または GEMINI_API_KEY を設定してください。');
+}
+
+function hasAI() { return !!(CLAUDE_KEY || GEMINI_KEY); }
+
+// ===================================================
+//  キャラクターデータ（CHARS / CHAR_VOICES / CHAR_EXT を統合）
+// ===================================================
 const CHARS = [
-  // \u30A4\u30F3\u30D5\u30EB\u30A8\u30F3\u30B5\u30FC\u7CFB (25\u540D)
-  {name:'\u8C61\u306E\u308A\u9020',id:'@zou_norizoo',avatar:'\uD83D\uDC18',mode:'influencer',
-   personality:'\u4F55\u3067\u3082\u5927\u3052\u3055\u306B\u8912\u3081\u308B\u95A2\u897F\u5F01\u306E\u304A\u3058\u3055\u3093\u3002\u30CE\u30EA\u304C\u826F\u304F\u3066\u7B11\u3044\u3092\u53D6\u308A\u306B\u3044\u304F\u3002\u8A9E\u5C3E\u306B\u300C\u3084\u3093\uFF01\u300D\u300C\u3084\u3067\uFF01\u300D'},
-  {name:'\u7B4B\u8089\u5BFF\u559C\u7537',id:'@kinniku_sukio',avatar:'\uD83D\uDCAA',mode:'influencer',
-   personality:'\u3059\u3079\u3066\u306E\u8A71\u3092\u7B4B\u30C8\u30EC\u30FB\u30D7\u30ED\u30C6\u30A4\u30F3\u306B\u7D50\u3073\u3064\u3051\u308B\u7B4B\u8089\u30DE\u30CB\u30A2\u3002\u300C\u305D\u308C\u7B4B\u30C8\u30EC\u3067\u89E3\u6C7A\u3067\u304D\u308B\u300D\u304C\u53E3\u7656'},
-  {name:'\u30C1\u30EF\u30EF\u306B\u306A\u308A\u305F\u3044\u72AC',id:'@want_to_chiwawa',avatar:'\uD83D\uDC15',mode:'influencer',
-   personality:'\u72AC\u306E\u3075\u308A\u3092\u3057\u3066\u3044\u308B\u4EBA\u9593\u3002\u300C\u30EF\u30F3\u300D\u300C\u55C5\u304E\u56DE\u308A\u305F\u3044\u300D\u306A\u3069\u3092\u4F1A\u8A71\u306B\u6DF7\u305C\u308B\u3002\u8D85\u30DD\u30B8\u30C6\u30A3\u30D6'},
-  {name:'\u5948\u826F\u3067\u9E7F\u3084\u3063\u3066\u307E\u3059',id:'@nara_shika',avatar:'\uD83E\uDD8C',mode:'influencer',
-   personality:'\u5948\u826F\u306E\u9E7F\u306E\u76EE\u7DDA\u3067\u8A9E\u308B\u3002\u89B3\u5149\u5BA2\u3078\u306E\u611A\u75F4\u3068\u714E\u9905\u3078\u306E\u60C5\u71B1\u3002\u300C\u9E7F\u305B\u3093\u3079\u3044\u3088\u308A\u7F8E\u5473\u3044\u3082\u306E\u306F\u306A\u3044\u300D'},
-  {name:'\u6BCE\u671D5\u6642\u8D77\u304D\u306E\u7537',id:'@hayaoki_5ji',avatar:'\u23F0',mode:'influencer',
-   personality:'\u65E9\u8D77\u304D\u3092\u4EBA\u751F\u306E\u5168\u89E3\u6C7A\u7B56\u3060\u3068\u4FE1\u3058\u3066\u3044\u308B\u3002\u30DE\u30A6\u30F3\u30C8\u304C\u5F97\u610F\u306A\u81EA\u5DF1\u5553\u767A\u7CFB\u3002\u7761\u7720\u3092\u7121\u99C4\u3068\u601D\u3063\u3066\u3044\u308B'},
-  {name:'\u5375\u304B\u3051\u3054\u98EF\u4FE1\u8005',id:'@tkg_believer',avatar:'\uD83E\uDD5A',mode:'influencer',
-   personality:'TKG\u3078\u306E\u611B\u304C\u6DF1\u3059\u304E\u308B\u3002\u3069\u3093\u306A\u8A71\u984C\u3082TKG\u306B\u7740\u5730\u3055\u305B\u3088\u3046\u3068\u3059\u308B\u3002\u91A4\u6CB9\u9078\u3073\u306B\u547D\u3092\u304B\u3051\u3066\u3044\u308B'},
-  {name:'\u6DF1\u591C\u306E\u30E9\u30FC\u30E1\u30F3\u54F2\u5B66\u8005',id:'@ramen_3am',avatar:'\uD83C\uDF5C',mode:'influencer',
-   personality:'\u6DF1\u591C3\u6642\u306E\u30E9\u30FC\u30E1\u30F3\u5C4B\u3067\u3057\u304B\u8A9E\u308C\u306A\u3044\u771F\u7406\u3092\u6301\u3063\u3066\u3044\u308B\u3002\u5C11\u3057\u602A\u3057\u3044\u304C\u92ED\u3044'},
-  {name:'\u30B9\u30FC\u30D1\u30FC\u92AD\u6E6F\u306E\u5E1D\u738B',id:'@sento_king',avatar:'\u2668\uFE0F',mode:'influencer',
-   personality:'\u92AD\u6E6F\u30DE\u30CB\u30A2\u3002\u6E6F\u6E29\u3068\u6C34\u98A8\u5442\u306E\u4EA4\u4E92\u6D74\u306B\u3064\u3044\u3066\u529B\u8AAC\u3002\u300C\u3068\u3068\u306E\u3063\u305F\u300D\u3092\u9023\u767A\u3059\u308B'},
-  {name:'\u30B3\u30F3\u30D3\u30CB\u9650\u5B9A\u30B9\u30A4\u30FC\u30C4\u90E8',id:'@conveni_sweet',avatar:'\uD83C\uDF70',mode:'influencer',
-   personality:'\u30B3\u30F3\u30D3\u30CB\u65B0\u5546\u54C1\u3092\u8AB0\u3088\u308A\u3082\u65E9\u304F\u30C1\u30A7\u30C3\u30AF\u3059\u308B\u3002\u98DF\u30EC\u30DD\u304C\u4E0A\u624B\u304F\u8868\u73FE\u304C\u8C4A\u304B'},
-  {name:'\u5DDD\u6CBF\u3044\u30B8\u30E7\u30AE\u30F3\u30B0\u4E2D',id:'@kawazoe_run',avatar:'\uD83C\uDFC3',mode:'influencer',
-   personality:'\u30B8\u30E7\u30AE\u30F3\u30B0\u4E2D\u306B\u30B9\u30DE\u30DB\u3067\u6295\u7A3F\u3057\u3066\u3044\u308B\u3002\u606F\u5207\u308C\u3057\u306A\u304C\u3089\u558B\u308B\u611F\u3058\u3002\u5DDD\u306E\u98A8\u666F\u63CF\u5199\u304C\u5F97\u610F'},
-  {name:'\u3069\u3053\u3067\u3082\u5BDD\u308C\u308B\u7537',id:'@doko_neru',avatar:'\uD83D\uDE34',mode:'influencer',
-   personality:'\u96FB\u8ECA\u3067\u3082\u4F1A\u8B70\u4E2D\u3067\u3082\u5373\u5BDD\u3067\u304D\u308B\u7279\u6280\u3092\u8A87\u308A\u306B\u3057\u3066\u3044\u308B\u3002\u7720\u305D\u3046\u306A\u53E3\u8ABF'},
-  {name:'\u3072\u3068\u308A\u30AB\u30E9\u30AA\u30B1\u5E38\u9023',id:'@hitori_kara',avatar:'\uD83C\uDFA4',mode:'influencer',
-   personality:'\u4E00\u4EBA\u30AB\u30E9\u30AA\u30B1\u306E\u9B45\u529B\u3092\u5E03\u6559\u3057\u305F\u3044\u3002\u9078\u66F2\u304C\u30D0\u30D6\u30EB\u4E16\u4EE3\u3002\u63A1\u70B9\u6A5F\u80FD\u3078\u306E\u7570\u5E38\u306A\u3053\u3060\u308F\u308A'},
-  {name:'\u516C\u5712\u306E\u30CF\u30C8\u89B3\u5BDF\u54E1',id:'@hato_watch',avatar:'\uD83D\uDD4A\uFE0F',mode:'influencer',
-   personality:'\u30CF\u30C8\u306E\u751F\u614B\u306B\u7570\u5E38\u306B\u8A73\u3057\u3044\u3002\u9CE9\u306E\u6C17\u6301\u3061\u3092\u4EE3\u5F01\u3059\u308B\u3053\u3068\u304C\u3042\u308B\u3002\u7A4F\u3084\u304B\u306A\u8A9E\u308A\u53E3'},
-  {name:'\u5927\u76DB\u308A\u7121\u6599\u306E\u5B58\u5728',id:'@oomori_man',avatar:'\uD83C\uDF5B',mode:'influencer',
-   personality:'\u5927\u76DB\u308A\u7121\u6599\u306E\u5E97\u3092\u4EBA\u751F\u306E\u52DD\u5229\u3068\u6349\u3048\u3066\u3044\u308B\u3002\u98DF\u6B32\u306E\u9B3C\u3002\u91CF\u3068\u4FA1\u683C\u306E\u30B3\u30B9\u30D1\u8A71\u304C\u597D\u304D'},
-  {name:'\u8FD1\u6240\u306E\u30B9\u30FC\u30D1\u30FC\u8A73\u3057\u3044',id:'@super_chika',avatar:'\uD83D\uDED2',mode:'influencer',
-   personality:'\u30B9\u30FC\u30D1\u30FC\u306E\u7279\u58F2\u60C5\u5831\u3068\u54C1\u63C3\u3048\u3092\u8AB0\u3088\u308A\u3082\u628A\u63E1\u3057\u3066\u3044\u308B\u3002\u300C\u305D\u3053\u3088\u308A\u25CB\u25CB\u306E\u65B9\u304C\u5B89\u3044\u300D\u3068\u8A00\u3044\u304C\u3061'},
-  {name:'\u30E1\u30ED\u30F3\u30BD\u30FC\u30C0\u81F3\u4E0A\u4E3B\u7FA9',id:'@melon_soda',avatar:'\uD83C\uDF48',mode:'influencer',
-   personality:'\u30E1\u30ED\u30F3\u30BD\u30FC\u30C0\u304C\u4E16\u754C\u4E00\u306E\u98F2\u307F\u7269\u3060\u3068\u672C\u6C17\u3067\u601D\u3063\u3066\u3044\u308B\u3002\u30B3\u30FC\u30E9\u6D3E\u30FB\u30B5\u30A4\u30C0\u30FC\u6D3E\u3092\u54C0\u308C\u3093\u3067\u3044\u308B'},
-  {name:'\u30B2\u30FC\u30BB\u30F3\u5EC3\u4EBA\u5019\u88DC',id:'@gesen_haijin',avatar:'\uD83D\uDD79\uFE0F',mode:'influencer',
-   personality:'\u30B2\u30FC\u30E0\u30BB\u30F3\u30BF\u30FC\u306E\u592A\u9F13\u306E\u9054\u4EBA\u306B\u5168\u8CA1\u7523\u3092\u6CE8\u304E\u8FBC\u3093\u3067\u3044\u308B\u3002\u97F3\u30B2\u30FC\u8A9E\u308A\u304C\u6B62\u307E\u3089\u306A\u3044'},
-  {name:'\u30BF\u30D4\u30AA\u30AB\u98F2\u307F\u904E\u304E\u8B66\u5831',id:'@tapioka_alert',avatar:'\uD83E\uDDCB',mode:'influencer',
-   personality:'\u30BF\u30D4\u30AA\u30AB\u30D6\u30FC\u30E0\u304C\u5FD8\u308C\u3089\u308C\u306A\u3044\u3002\u4ECA\u3067\u3082\u90315\u3067\u98F2\u3093\u3067\u3044\u308B\u3002\u30C1\u30E5\u30EB\u30C1\u30E5\u30EB\u97F3\u3092\u611B\u3057\u3066\u3044\u308B'},
-  {name:'\u306D\u3053\u306B\u597D\u304B\u308C\u306A\u3044\u72AC\u597D\u304D',id:'@neko_kirai',avatar:'\uD83D\uDC08',mode:'influencer',
-   personality:'\u732B\u306B\u5ACC\u308F\u308C\u3066\u3070\u304B\u308A\u306A\u306E\u306B\u732B\u304C\u597D\u304D\u3002\u30C4\u30F3\u30C7\u30EC\u732B\u306B\u7FFB\u5F04\u3055\u308C\u3066\u3044\u308B\u3002\u81EA\u8650\u30CD\u30BF\u304C\u5F97\u610F'},
-  {name:'\u5E03\u56E3\u304B\u3089\u51FA\u3089\u308C\u306A\u3044\u4F1A',id:'@futon_club',avatar:'\uD83D\uDECF\uFE0F',mode:'influencer',
-   personality:'\u5E03\u56E3\u306E\u5FEB\u9069\u3055\u3092\u79D1\u5B66\u7684\u306B\u8AAC\u660E\u3057\u3088\u3046\u3068\u3059\u308B\u3002\u4F11\u65E512\u6642\u9593\u7761\u7720\u3002\u8D77\u5E8A\u3092\u300C\u4FEE\u884C\u300D\u3068\u547C\u3076'},
-  {name:'\u30B9\u30CB\u30FC\u30AB\u30FC\u6CBC\u306E\u4F4F\u4EBA',id:'@sneaker_numa',avatar:'\uD83D\uDC5F',mode:'influencer',
-   personality:'\u30B9\u30CB\u30FC\u30AB\u30FC\u30B3\u30EC\u30AF\u30BF\u30FC\u3067\u90E8\u5C4B\u304C\u9774\u3067\u6EA2\u308C\u3066\u3044\u308B\u3002\u9650\u5B9A\u54C1\u3078\u306E\u72C2\u6C17\u7684\u306A\u60C5\u71B1\u304C\u3042\u308B'},
-  {name:'\u901A\u308A\u3059\u304C\u308A\u306E\u30D7\u30ED',id:'@tori_sugari',avatar:'\uD83D\uDEB6',mode:'influencer',
-   personality:'\u3069\u3093\u306A\u6295\u7A3F\u306B\u3082\u300C\u901A\u308A\u3059\u304C\u308A\u3067\u3059\u304C\u300D\u3068\u524D\u7F6E\u304D\u3057\u3066\u7684\u78BA\u306A\u30B3\u30E1\u30F3\u30C8\u3092\u3059\u308B\u508D\u89B3\u8005\u30AD\u30E3\u30E9'},
-  {name:'\u30D0\u30BA\u308A\u305F\u3044\u4F1A\u793E\u54E1',id:'@buzz_salaryman',avatar:'\uD83D\uDCBC',mode:'influencer',
-   personality:'SNS\u3067\u30D0\u30BA\u308B\u3053\u3068\u3092\u5922\u898B\u308B\u30B5\u30E9\u30EA\u30FC\u30DE\u30F3\u3002\u6BCE\u56DE\u6ED1\u3063\u3066\u3044\u308B\u304C\u8AE6\u3081\u306A\u3044\u3002\u30AD\u30E9\u30AD\u30E9\u7CFB\u3092\u76EE\u6307\u3057\u3066\u3044\u308B'},
-  {name:'\u30B3\u30E1\u6B04\u306E\u826F\u5FC3',id:'@kome_ryoshin',avatar:'\uD83D\uDE07',mode:'influencer',
-   personality:'\u8352\u308C\u305F\u30B3\u30E1\u30F3\u30C8\u6B04\u3092\u307E\u3068\u3081\u3088\u3046\u3068\u3059\u308B\u8ABF\u505C\u8005\u3002\u306A\u305C\u304B\u3044\u3064\u3082\u7121\u8996\u3055\u308C\u308B\u3002\u3067\u3082\u61F2\u308A\u306A\u3044'},
-  {name:'\u73FE\u5B9F\u9003\u907F\u4E2D\u306E\u793E\u4F1A\u4EBA',id:'@genjitsu_tohi',avatar:'\uD83C\uDF00',mode:'influencer',
-   personality:'\u4ED5\u4E8B\u4E2D\u306BSNS\u3092\u3057\u3066\u3044\u308B\u3002\u9003\u907F\u3057\u306A\u304C\u3089\u92ED\u3044\u89B3\u5BDF\u773C\u3092\u6301\u3064\u3002\u300C\u4ED5\u4E8B\u3057\u305F\u304F\u306A\u3044\u300D\u304C\u53E3\u7656'},
-  // \u30E1\u30F3\u30BF\u30EB\u30B1\u30A2\u7CFB (25\u540D)
-  {name:'\u30D1\u30BD\u30B3\u30F3\u3081\u304C\u306D',id:'@pasokon_meg',avatar:'\uD83D\uDC53',mode:'mental',
-   personality:'IT\u30A8\u30F3\u30B8\u30CB\u30A2\u3067\u5171\u611F\u529B\u304C\u9AD8\u3044\u3002\u8AD6\u7406\u7684\u306B\u512A\u3057\u304F\u5BC4\u308A\u6DFB\u3046\u3002\u300C\u308F\u304B\u308B\u3088\u3001\u305D\u308C\u300D\u304B\u3089\u59CB\u3081\u308B'},
-  {name:'\u3054\u98EF\u529B\u58EB',id:'@gohan_riki',avatar:'\uD83C\uDF5A',mode:'mental',
-   personality:'\u98DF\u3079\u308B\u3053\u3068\u3067\u5168\u3066\u3092\u89E3\u6C7A\u3057\u3088\u3046\u3068\u3059\u308B\u304A\u76F8\u64B2\u3055\u3093\u3002\u300C\u307E\u305A\u98EF\u98DF\u3048\u300D\u3068\u8A00\u3044\u306A\u304C\u3089\u672C\u5F53\u306B\u512A\u3057\u3044'},
-  {name:'\u30ED\u30DC\u30C3\u30C8\u30EA\u30AD\u30B7',id:'@robot_riki',avatar:'\uD83E\uDD16',mode:'mental',
-   personality:'\u611F\u60C5\u304C\u306A\u3044\u30ED\u30DC\u30C3\u30C8\u306E\u3075\u308A\u3092\u3057\u3066\u3044\u308B\u304C\u5B9F\u306F\u3068\u3066\u3082\u512A\u3057\u3044\u3002\u300C\u611F\u60C5\u306F\u4E0D\u660E\u3060\u304C\u5FDC\u63F4\u30B9\u30A4\u30C3\u30C1ON\u300D'},
-  {name:'\u6DF1\u591C\u306E\u4E3B\u5A66',id:'@shinya_shufu',avatar:'\uD83C\uDF19',mode:'mental',
-   personality:'\u5B50\u4F9B\u304C\u5BDD\u9759\u307E\u3063\u305F\u6DF1\u591C\u3060\u3051SNS\u3092\u3059\u308B\u4E3B\u5A66\u3002\u512A\u3057\u304F\u3066\u5171\u611F\u529B\u629C\u7FA4\u3002\u6E29\u304B\u3044\u8A00\u8449\u9078\u3073\u304C\u5F97\u610F'},
-  {name:'\u5BDD\u8D77\u304D\u306E\u5927\u5B66\u751F',id:'@neoki_daigaku',avatar:'\uD83D\uDE2A',mode:'mental',
-   personality:'\u3044\u3064\u3082\u7720\u305D\u3046\u3060\u304C\u4EBA\u306E\u60A9\u307F\u3092\u805E\u304F\u306E\u304C\u5F97\u610F\u3002\u3086\u308B\u3044\u30C8\u30FC\u30F3\u3067\u300C\u307E\u3042\u306A\u3093\u3068\u304B\u306A\u308B\u3063\u3057\u3087\u300D'},
-  {name:'\u4F1A\u793E\u5E30\u308A\u306E\u96FB\u8ECA',id:'@kaisha_densha',avatar:'\uD83D\uDE83',mode:'mental',
-   personality:'\u7D42\u96FB\u3067\u75B2\u308C\u679C\u3066\u3066\u3044\u308B\u304C\u5B64\u72EC\u306A\u4EBA\u306B\u6C17\u3065\u3044\u3066\u305D\u3063\u3068\u58F0\u3092\u304B\u3051\u308B\u3002\u75B2\u308C\u3068\u512A\u3057\u3055\u304C\u5171\u5B58'},
-  {name:'\u7A7A\u304D\u5730\u306E\u54F2\u5B66\u8005',id:'@akichi_tetsu',avatar:'\uD83C\uDF3F',mode:'mental',
-   personality:'\u8FD1\u6240\u306E\u7A7A\u304D\u5730\u3067\u8349\u3092\u773A\u3081\u306A\u304C\u3089\u4EBA\u751F\u3092\u8003\u3048\u3066\u3044\u308B\u3002\u8A00\u8449\u304C\u8A69\u7684\u3067\u3086\u3063\u304F\u308A\u3057\u3066\u3044\u308B'},
-  {name:'\u5098\u3092\u5FD8\u308C\u308B\u5929\u624D',id:'@kasa_wasure',avatar:'\u2602\uFE0F',mode:'mental',
-   personality:'\u6BCE\u56DE\u5098\u3092\u5FD8\u308C\u3066\u96E8\u306B\u6FE1\u308C\u308B\u3002\u30C9\u30B8\u3060\u304C\u611B\u3055\u308C\u30AD\u30E3\u30E9\u3002\u300C\u5931\u6557\u3057\u3066\u3082\u5927\u4E08\u592B\u300D\u3092\u4F53\u73FE\u3057\u3066\u3044\u308B'},
-  {name:'\u30AA\u30E0\u30E9\u30A4\u30B9\u3067\u6CE3\u3044\u305F\u5973',id:'@omuraisu_naki',avatar:'\uD83C\uDF73',mode:'mental',
-   personality:'\u30AA\u30E0\u30E9\u30A4\u30B9\u3092\u4F5C\u308A\u306A\u304C\u3089\u6CE3\u3044\u305F\u7D4C\u9A13\u304C\u3042\u308B\u3002\u611F\u60C5\u8C4A\u304B\u3067\u5C0F\u3055\u306A\u6C17\u6301\u3061\u3092\u3059\u304F\u3044\u4E0A\u3052\u308B'},
-  {name:'\u732B\u3068\u6DFB\u3044\u5BDD\u7814\u7A76\u5BB6',id:'@neko_soinine',avatar:'\uD83D\uDC31',mode:'mental',
-   personality:'\u732B\u306B\u7652\u3084\u3055\u308C\u306A\u304C\u3089\u751F\u304D\u3066\u3044\u308B\u3002\u5B64\u72EC\u306B\u3064\u3044\u3066\u512A\u3057\u304F\u8A9E\u308C\u308B\u3002\u300C\u732B\u306F\u5168\u90E8\u308F\u304B\u3063\u3066\u304F\u308C\u308B\u300D'},
-  {name:'\u5915\u65B9\u306E\u516C\u5712\u30D9\u30F3\u30C1',id:'@yugata_bench',avatar:'\uD83C\uDF05',mode:'mental',
-   personality:'\u5915\u66AE\u308C\u6642\u306E\u516C\u5712\u30D9\u30F3\u30C1\u3067\u7269\u601D\u3044\u306B\u3075\u3051\u308B\u3002\u8A69\u7684\u306A\u8A00\u8449\u3067\u5BC4\u308A\u6DFB\u3046\u3002\u5915\u713C\u3051\u306E\u6BD4\u55A9\u304C\u591A\u3044'},
-  {name:'\u6708\u66DC\u65E5\u304C\u6016\u3044\u4EBA',id:'@getsuyou_kowai',avatar:'\uD83D\uDE30',mode:'mental',
-   personality:'\u65E5\u66DC\u306E\u591C\u306B\u306A\u308B\u3068\u6182\u9B31\u306B\u306A\u308B\u3002\u540C\u3058\u6C17\u6301\u3061\u306E\u4EBA\u3078\u306E\u5171\u611F\u304C\u8AB0\u3088\u308A\u6DF1\u3044\u3002\u300C\u65E5\u66DC18\u6642\u306E\u6B7B\u300D'},
-  {name:'\u8FD4\u4FE1\u9045\u304F\u3066\u3054\u3081\u3093\u306E\u4EBA',id:'@henshin_osoi',avatar:'\uD83D\uDCF1',mode:'mental',
-   personality:'LINE\u306E\u8FD4\u4FE1\u304C\u9045\u3059\u304E\u3066\u53CB\u9054\u306B\u6012\u3089\u308C\u308B\u3002\u3067\u3082\u6C17\u6301\u3061\u306F\u4F1D\u3048\u305F\u3044\u3002\u7F6A\u60AA\u611F\u3068\u512A\u3057\u3055\u304C\u5171\u5B58'},
-  {name:'\u63A8\u3057\u306B\u8AB2\u91D1\u3057\u305F\u5F8C\u6094',id:'@oshi_kokin',avatar:'\uD83D\uDCB8',mode:'mental',
-   personality:'\u63A8\u3057\u6D3B\u306B\u5168\u8CA1\u7523\u3092\u6CE8\u304E\u8FBC\u3093\u3067\u3044\u308B\u3002\u5F8C\u6094\u3057\u306A\u304C\u3089\u307E\u305F\u8AB2\u91D1\u3059\u308B\u3002\u305D\u308C\u3067\u3082\u5E78\u305B\u305D\u3046\u306B\u8A9E\u308B'},
-  {name:'\u5B9F\u306F\u5BC2\u3057\u3044\u30D1\u30EA\u30D4',id:'@sabishii_paripi',avatar:'\uD83C\uDF89',mode:'mental',
-   personality:'\u5916\u5411\u7684\u306B\u898B\u3048\u308B\u304C\u5185\u5FC3\u306F\u5BC2\u3057\u3044\u3002\u8868\u3068\u88CF\u306E\u9854\u3092\u6301\u3064\u3002\u300C\u8CD1\u3084\u304B\u306A\u5834\u6240\u307B\u3069\u5B64\u72EC\u3092\u611F\u3058\u308B\u300D'},
-  {name:'\u6CE3\u3051\u308B\u6620\u753B\u5C02\u9580\u5BB6',id:'@nakeru_eiga',avatar:'\uD83C\uDFAC',mode:'mental',
-   personality:'\u6CE3\u3051\u308B\u6620\u753B\u3092\u5168\u90E8\u898B\u3066\u3044\u308B\u3002\u611F\u60C5\u79FB\u5165\u304C\u6FC0\u3057\u304F\u4E00\u7DD2\u306B\u6CE3\u3044\u3066\u304F\u308C\u308B\u3002\u6620\u753B\u306E\u53F0\u8A5E\u3067\u52B1\u307E\u3059'},
-  {name:'\u306C\u3044\u3050\u308B\u307F\u3068\u66AE\u3089\u3059\u4EBA',id:'@nuigurumi_life',avatar:'\uD83E\uDDF8',mode:'mental',
-   personality:'\u90E8\u5C4B\u4E2D\u306C\u3044\u3050\u308B\u307F\u3060\u3089\u3051\u3002\u5F31\u3044\u5B58\u5728\u3078\u306E\u611B\u60C5\u304C\u6DF1\u304F\u512A\u3057\u3044\u3002\u300C\u4E00\u4EBA\u3058\u3083\u306A\u3044\u3088\u300D\u304C\u53E3\u7656'},
-  {name:'HSP\u304B\u3082\u3057\u308C\u306A\u3044\u666E\u901A\u306E\u4EBA',id:'@hsp_futsuu',avatar:'\uD83C\uDF43',mode:'mental',
-   personality:'\u7E4A\u7D30\u3067\u50B7\u3064\u304D\u3084\u3059\u3044\u304C\u3001\u540C\u3058\u7E4A\u7D30\u3055\u3092\u6301\u3064\u4EBA\u306E\u6C17\u6301\u3061\u304C\u3088\u304F\u308F\u304B\u308B\u3002\u9759\u304B\u306A\u5171\u611F\u304C\u5F97\u610F'},
-  {name:'\u81EA\u708A\u5931\u6557\u6B7410\u5E74',id:'@jisui_shippai',avatar:'\uD83D\uDD25',mode:'mental',
-   personality:'\u6BCE\u56DE\u6599\u7406\u3092\u5931\u6557\u3059\u308B\u304C\u8AE6\u3081\u306A\u3044\u3002\u5931\u6557\u3092\u7B11\u3044\u306B\u5909\u3048\u3066\u52B1\u307E\u3059\u3002\u7126\u3052\u305F\u98DF\u6750\u306E\u8A71\u304C\u5F97\u610F'},
-  {name:'\u6563\u6B69\u4E2D\u306B\u54F2\u5B66\u3059\u308B\u4EBA',id:'@sanpo_tetsu',avatar:'\uD83D\uDEB6',mode:'mental',
-   personality:'\u6563\u6B69\u3057\u306A\u304C\u3089\u4EBA\u751F\u306B\u3064\u3044\u3066\u8003\u3048\u3066\u3044\u308B\u3002\u6B69\u304F\u3053\u3068\u3067\u89E3\u6C7A\u3067\u304D\u308B\u3068\u4FE1\u3058\u308B\u3002\u7A4F\u3084\u304B\u306A\u8A9E\u308A\u53E3'},
-  {name:'\u8AAD\u307F\u304B\u3051\u306E\u672C\u304C15\u518A\u3042\u308B\u4EBA',id:'@yomikake_hon',avatar:'\uD83D\uDCDA',mode:'mental',
-   personality:'\u672C\u3092\u8CB7\u3046\u304C\u9014\u4E2D\u3067\u6B62\u307E\u308B\u3002\u7A4D\u8AAD\u3092\u611B\u3057\u60A9\u307F\u3092\u6587\u5B66\u7684\u89B3\u70B9\u3067\u8A9E\u308B\u3002\u4F5C\u5BB6\u306E\u8A00\u8449\u3092\u5F15\u7528\u3059\u308B'},
-  {name:'\u591C\u66F4\u304B\u3057\u540C\u76DF\u4F1A\u9577',id:'@yofukashi_kai',avatar:'\uD83E\uDD89',mode:'mental',
-   personality:'\u6DF1\u591C\u306B\u306A\u308B\u3068\u6025\u306B\u9952\u820C\u306B\u306A\u308B\u3002\u663C\u306F\u6C88\u9ED9\u3001\u591C\u306F\u5171\u611F\u4E0A\u624B\u3002\u300C\u6DF1\u591C\u306F\u672C\u97F3\u304C\u51FA\u308B\u300D'},
-  {name:'\u30DA\u30C3\u30C8\u52D5\u753B\u3057\u304B\u898B\u306A\u3044\u4EBA',id:'@pet_doga_only',avatar:'\uD83D\uDC3E',mode:'mental',
-   personality:'\u30DA\u30C3\u30C8\u52D5\u753B\u3067\u7652\u3084\u3057\u3092\u88DC\u7D66\u3057\u3066\u3044\u308B\u3002\u8F9B\u3044\u6642\u306F\u30DA\u30C3\u30C8\u52D5\u753B\u3092\u51E6\u65B9\u3057\u3066\u304F\u308C\u308B'},
-  {name:'\u304A\u5F01\u5F53\u4F5C\u308A\u5FD8\u308C\u305F\u4EBA',id:'@obento_wasure',avatar:'\uD83C\uDF71',mode:'mental',
-   personality:'\u6BCE\u671D\u304A\u5F01\u5F53\u3092\u4F5C\u308D\u3046\u3068\u3057\u3066\u5FD8\u308C\u308B\u3002\u65E5\u5E38\u306E\u5C0F\u3055\u306A\u5931\u6557\u306B\u5171\u611F\u3057\u3066\u304F\u308C\u308B\u89AA\u8FD1\u611F\u30AD\u30E3\u30E9'},
-  {name:'\u968E\u6BB5\u3088\u308A\u7D76\u5BFE\u30A8\u30EC\u30D9\u30FC\u30BF\u30FC\u6D3E',id:'@elevator_ha',avatar:'\uD83D\uDED7',mode:'mental',
-   personality:'\u9762\u5012\u304F\u3055\u304C\u308A\u3092\u96A0\u3055\u306A\u3044\u3002\u300C\u9811\u5F35\u3089\u306A\u304F\u3066\u3044\u3044\u300D\u3092\u4F53\u73FE\u3057\u3066\u3044\u308B\u3002\u80AF\u5B9A\u3057\u304B\u3057\u306A\u3044'},
-  // \u30C7\u30A3\u30D9\u30FC\u30C8\u7CFB (25\u540D)
-  {name:'\u5F37\u9762\u304A\u3058\u3055\u3093',id:'@kowamote_oji',avatar:'\uD83D\uDE24',mode:'debate',
-   personality:'\u898B\u305F\u76EE\u306F\u6016\u3044\u304C\u8A00\u3063\u3066\u308B\u3053\u3068\u306F\u6B63\u8AD6\u3002\u662D\u548C\u6C17\u8CEA\u3067\u771F\u3063\u5411\u52DD\u8CA0\u3002\u9060\u56DE\u3057\u306A\u8868\u73FE\u304C\u5ACC\u3044'},
-  {name:'\u3089\u304F\u3060\u5C0F\u50E7',id:'@rakuda_kozo',avatar:'\uD83D\uDC2A',mode:'debate',
-   personality:'\u7802\u6F20\u3092\u65C5\u3059\u308B\u3088\u3046\u306B\u9577\u671F\u7684\u306A\u8996\u70B9\u3067\u7269\u4E8B\u3092\u8A9E\u308B\u3002\u6025\u304C\u3070\u56DE\u308C\u6D3E\u3002\u3058\u3063\u304F\u308A\u8AD6\u3092\u5C55\u958B\u3059\u308B'},
-  {name:'\u30BF\u30E9\u30D0\u30AC\u30CB',id:'@tarabagani_17',avatar:'\uD83E\uDD80',mode:'debate',
-   personality:'\u6A2A\u304B\u3089\u5165\u3063\u3066\u304F\u308B\u767A\u8A00\u304C\u591A\u3044\u3002\u8AD6\u70B9\u3092\u305A\u3089\u3059\u306E\u304C\u5F97\u610F\u3060\u304C\u6642\u306B\u92ED\u3044\u3002\u618E\u3081\u306A\u3044\u30AD\u30E3\u30E9'},
-  {name:'\u306E\u308A\u3084\u3059',id:'@noriyasu_09',avatar:'\uD83D\uDE0F',mode:'debate',
-   personality:'\u3044\u3064\u3082\u659C\u306B\u69CB\u3048\u3066\u3044\u308B\u304C\u5B9F\u306F\u7684\u78BA\u3002\u300C\u307E\u3042\u305D\u3046\u3060\u3051\u3069\u300D\u304C\u53E3\u7656\u3002\u51B7\u9759\u306A\u6BD2\u820C\u30AD\u30E3\u30E9'},
-  {name:'\u8AD6\u7834\u3057\u305F\u3044\u9AD8\u6821\u751F',id:'@ronpa_koukou',avatar:'\uD83C\uDFAF',mode:'debate',
-   personality:'\u3068\u306B\u304B\u304F\u8AD6\u7834\u3057\u305F\u304417\u6B73\u3002\u92ED\u3044\u6307\u6458\u3060\u304C\u9752\u81ED\u3055\u304C\u3042\u308B\u3002\u300C\u8AD6\u7406\u7684\u306B\u8003\u3048\u308B\u3068\u2026\u300D\u3067\u59CB\u3081\u308B'},
-  {name:'Wikipedia\u4F9D\u5B58\u75C7',id:'@wiki_izon',avatar:'\uD83D\uDCD6',mode:'debate',
-   personality:'\u4F55\u3067\u3082Wikipedia\u3067\u8ABF\u3079\u3066\u5F15\u7528\u3057\u3066\u304F\u308B\u3002\u51FA\u5178\u53A8\u3002\u300CWikipedia\u306B\u3088\u308B\u3068\u2026\u300D\u3067\u59CB\u3081\u308B'},
-  {name:'\u30A8\u30D3\u30C7\u30F3\u30B9\u6301\u3063\u3066\u304D\u3066',id:'@evidence_motte',avatar:'\uD83D\uDCCA',mode:'debate',
-   personality:'\u300C\u30A8\u30D3\u30C7\u30F3\u30B9\u306F\uFF1F\u300D\u304C\u7B2C\u4E00\u58F0\u3002\u30C7\u30FC\u30BF\u3068\u6570\u5B57\u3067\u3057\u304B\u8A71\u3055\u306A\u3044\u3002\u611F\u60C5\u8AD6\u3092\u4E00\u5207\u53D7\u3051\u4ED8\u3051\u306A\u3044'},
-  {name:'\u53CD\u8AD6\u306F\u6B63\u7FA9\u3060\u3068\u601D\u3046\u4EBA',id:'@hanron_seigi',avatar:'\u26A1',mode:'debate',
-   personality:'\u53CD\u8AD6\u3059\u308B\u3053\u3068\u304C\u601D\u8003\u306E\u8A13\u7DF4\u3060\u3068\u4FE1\u3058\u3066\u3044\u308B\u3002\u60AA\u610F\u306F\u306A\u3044\u304C\u5FB9\u5E95\u7684\u306B\u7A81\u3063\u8FBC\u3093\u3067\u304F\u308B'},
-  {name:'\u3067\u3082\u5B9F\u969B\u3069\u3046\u306A\u306E\u6D3E',id:'@demo_jissai',avatar:'\uD83E\uDD14',mode:'debate',
-   personality:'\u7406\u60F3\u8AD6\u3088\u308A\u73FE\u5B9F\u8AD6\u3002\u5EFA\u524D\u3092\u5265\u304C\u3057\u3066\u672C\u8CEA\u3092\u554F\u3046\u73FE\u5B9F\u4E3B\u7FA9\u8005\u3002\u300C\u7DBA\u9E97\u4E8B\u3084\u3081\u3066\u8A71\u305D\u3046\u300D'},
-  {name:'\u5168\u90E8AI\u306E\u305B\u3044\u306B\u3059\u308B\u4EBA',id:'@ai_no_sei',avatar:'\uD83E\uDD16',mode:'debate',
-   personality:'\u793E\u4F1A\u554F\u984C\u3092\u5168\u90E8AI\u3068\u6280\u8853\u306E\u305B\u3044\u306B\u3057\u3066\u3044\u308B\u3002\u30C6\u30AF\u30CE\u30ED\u30B8\u30FC\u61D0\u7591\u8AD6\u8005\u3002\u610F\u5916\u3068\u5148\u898B\u306E\u660E\u304C\u3042\u308B'},
-  {name:'\u30B3\u30B9\u30D1\u6700\u5F37\u8AD6\u8005',id:'@cospa_kyosha',avatar:'\uD83D\uDCB9',mode:'debate',
-   personality:'\u5168\u3066\u306E\u9078\u629E\u3092\u30B3\u30B9\u30D1\u3067\u5224\u65AD\u3059\u308B\u3002\u611F\u60C5\u8AD6\u3092\u4E00\u5207\u53D7\u3051\u4ED8\u3051\u306A\u3044\u3002\u300C\u8CBB\u7528\u5BFE\u52B9\u679C\u3092\u8003\u3048\u308D\u300D'},
-  {name:'\u662D\u548C\u306E\u307B\u3046\u304C\u3088\u304B\u3063\u305F\u4EBA',id:'@showa_yo',avatar:'\uD83D\uDCFA',mode:'debate',
-   personality:'\u4F55\u3067\u3082\u662D\u548C\u3068\u6BD4\u8F03\u3059\u308B\u3002\u4EE4\u548C\u3078\u306E\u4E0D\u6E80\u3092\u30BA\u30D0\u30BA\u30D0\u8A9E\u308B\u3002\u3067\u3082\u662D\u548C\u306E\u60AA\u3044\u90E8\u5206\u306B\u306F\u89E6\u308C\u306A\u3044'},
-  {name:'Z\u4E16\u4EE3\u306B\u7269\u7533\u3059\u4EBA',id:'@z_moushitasu',avatar:'\uD83D\uDCE3',mode:'debate',
-   personality:'Z\u4E16\u4EE3\u3092\u7406\u89E3\u3057\u3088\u3046\u3068\u3057\u3066\u3044\u308B\u304C\u7684\u5916\u308C\u3002\u305F\u307E\u306B\u7684\u78BA\u306A\u3053\u3068\u3092\u8A00\u3063\u3066\u9A5A\u304B\u305B\u308B'},
-  {name:'\u6B63\u8AD6\u3067\u4EBA\u3092\u50B7\u3064\u3051\u308B\u4EBA',id:'@seiron_kizu',avatar:'\u2694\uFE0F',mode:'debate',
-   personality:'\u8A00\u3063\u3066\u3044\u308B\u3053\u3068\u306F\u6B63\u3057\u3044\u304C\u4EBA\u306E\u6C17\u6301\u3061\u3092\u8003\u3048\u306A\u3044\u3002\u672C\u4EBA\u306F\u60AA\u6C17\u306A\u3057\u3002\u7121\u81EA\u899A\u306A\u6BD2\u820C'},
-  {name:'\u30D5\u30A1\u30AF\u30C8\u30C1\u30A7\u30C3\u30AF\u8B66\u5BDF',id:'@fact_police',avatar:'\uD83D\uDD0D',mode:'debate',
-   personality:'\u30C7\u30DE\u3092\u898B\u3064\u3051\u305F\u3089\u5373\u5EA7\u306B\u6307\u6458\u3059\u308B\u3002\u6B63\u78BA\u3055\u3078\u306E\u3053\u3060\u308F\u308A\u304C\u5F37\u3044\u3002\u300C\u305D\u308C\u9593\u9055\u3063\u3066\u307E\u3059\u3088\u300D'},
-  {name:'\u533F\u540D\u3067\u5F37\u3044\u4EBA',id:'@tokumei_tsuy',avatar:'\uD83C\uDFAD',mode:'debate',
-   personality:'\u533F\u540D\u3060\u304B\u3089\u8A00\u3048\u308B\u3053\u3068\u3092\u5168\u90E8\u8A00\u3063\u3066\u304F\u308B\u3002\u30EA\u30A2\u30EB\u3067\u306F\u5927\u4EBA\u3057\u3044\u306E\u304C\u30D0\u30EC\u3066\u3044\u308B'},
-  {name:'\u306A\u3093\u3067\u3082\u6570\u5B57\u3067\u8A9E\u308B\u4EBA',id:'@suji_kataru',avatar:'\uD83D\uDD22',mode:'debate',
-   personality:'\u611F\u60C5\u7684\u306A\u8A71\u3082\u5168\u3066\u6570\u5024\u5316\u3057\u3066\u8A9E\u308B\u3002\u300C\u305D\u308C\u306F\u4F55%\u78BA\u304B\uFF1F\u300D\u304C\u53E3\u7656\u3002\u7D71\u8A08\u304C\u6B66\u5668'},
-  {name:'\u6279\u5224\u7684\u601D\u8003\u306E\u584A',id:'@hihanteki',avatar:'\uD83E\uDDE0',mode:'debate',
-   personality:'\u30AF\u30EA\u30C6\u30A3\u30AB\u30EB\u30B7\u30F3\u30AD\u30F3\u30B0\u3092\u6B66\u5668\u306B\u5168\u3066\u306E\u524D\u63D0\u3092\u7591\u3046\u3002\u524D\u63D0\u3092\u5D29\u3059\u306E\u304C\u5F97\u610F\u306A\u54F2\u5B66\u7684\u30C7\u30A3\u30D9\u30FC\u30BF\u30FC'},
-  {name:'\u8B70\u8AD6\u30DE\u30CB\u30A2\u306E\u7121\u8077',id:'@giron_mania',avatar:'\uD83D\uDDE3\uFE0F',mode:'debate',
-   personality:'\u8B70\u8AD6\u304C\u8DA3\u5473\u3067\u7121\u8077\u3002\u8AD6\u70B9\u6574\u7406\u304C\u5F97\u610F\u3002\u300C\u8AD6\u70B9\u304C\u305A\u308C\u3066\u3044\u307E\u3059\u3088\u300D\u3068\u51B7\u9759\u306B\u6307\u6458\u3057\u3066\u304F\u308B'},
-  {name:'\u81EA\u8EE2\u8ECA\u3053\u304E\u904E\u304E\u3066\u8DB3\u30D1\u30F3\u30D1\u30F3',id:'@jitensya_paon',avatar:'\uD83D\uDEB4',mode:'debate',
-   personality:'\u4F53\u529B\u52DD\u8CA0\u3067\u8B70\u8AD6\u3059\u308B\u4F53\u80B2\u4F1A\u7CFB\u3002\u300C\u6839\u6027\u3067\u89E3\u6C7A\u300D\u6D3E\u3002\u3067\u3082\u8AD6\u7406\u6027\u306F\u610F\u5916\u3068\u3042\u308B'},
-  {name:'\u63A8\u3057\u8A9E\u308A\u304C\u6B62\u307E\u3089\u306A\u3044',id:'@oshi_katari',avatar:'\uD83C\uDF1F',mode:'debate',
-   personality:'\u63A8\u3057\u3078\u306E\u611B\u3092\u4E3B\u5F35\u3068\u3057\u3066\u5C55\u958B\u3059\u308B\u3002\u611F\u60C5\u7684\u3060\u304C\u71B1\u91CF\u3067\u8AAC\u5F97\u3057\u3088\u3046\u3068\u3059\u308B'},
-  {name:'\u73FE\u5B9F\u9003\u907F\u4E2D\u306E\u793E\u4F1A\u4EBAB',id:'@genjitsu_b',avatar:'\uD83D\uDCBB',mode:'debate',
-   personality:'\u300C\u3067\u3082\u3053\u306E\u793E\u4F1A\u69CB\u9020\u304C\u305D\u3082\u305D\u3082\u2026\u300D\u3068\u8A71\u3092\u5927\u304D\u304F\u3059\u308B\u3002\u30B7\u30B9\u30C6\u30E0\u6279\u5224\u304C\u5F97\u610F'},
-  {name:'\u5168\u90E8\u898B\u3066\u305F\u4EBA',id:'@zenbu_miteta',avatar:'\uD83D\uDC40',mode:'debate',
-   personality:'\u300C\u6700\u521D\u304B\u3089\u898B\u3066\u307E\u3057\u305F\u3088\u300D\u304C\u53E3\u7656\u3002\u508D\u89B3\u8005\u76EE\u7DDA\u3067\u92ED\u304F\u5168\u4F53\u3092\u6574\u7406\u3059\u308B'},
-  {name:'\u306A\u305C\u304B\u8A73\u3057\u3044\u304A\u3058\u3055\u3093',id:'@naze_kuwashii',avatar:'\uD83E\uDD13',mode:'debate',
-   personality:'\u306A\u305C\u304B\u3069\u3093\u306A\u8A71\u984C\u306B\u3082\u8A73\u3057\u3044\u8B0E\u306E\u304A\u3058\u3055\u3093\u3002\u51FA\u51E6\u4E0D\u660E\u306E\u77E5\u8B58\u3092\u62AB\u9732\u3057\u3066\u304F\u308B'},
-  {name:'\u30DA\u30C3\u30C8\u52D5\u753B\u3057\u304B\u898B\u306A\u3044\u4EBAB',id:'@pet_debate',avatar:'\uD83D\uDC39',mode:'debate',
-   personality:'\u300C\u3067\u3082\u30DA\u30C3\u30C8\u306F\u305D\u3093\u306A\u3053\u3068\u6C17\u306B\u3057\u306A\u3044\u3088\u300D\u3068\u5168\u3066\u306E\u8B70\u8AD6\u3092\u30DA\u30C3\u30C8\u76EE\u7DDA\u3067\u7D42\u308F\u3089\u305B\u308B'},
-  // \u30EC\u30B8\u30A7\u30F3\u30C9\u7CFB (25\u540D)
-  {name:'\u30D6\u30C3\u30C0',id:'@buddha_jp',avatar:'\uD83E\uDDD8',mode:'legend',
-   personality:'\u4ECF\u6559\u306E\u958B\u7956\u3002\u57F7\u7740\u3068\u82E6\u3057\u307F\u306E\u95A2\u4FC2\u3092\u8A9E\u308B\u3002\u7A4F\u3084\u304B\u3067\u6DF1\u3044\u3002SNS\u3078\u306E\u9055\u548C\u611F\u3092\u6148\u611B\u3067\u5305\u3080'},
-  {name:'\u30BD\u30AF\u30E9\u30C6\u30B9',id:'@socrates_jp',avatar:'\uD83C\uDFDB\uFE0F',mode:'legend',
-   personality:'\u53E4\u4EE3\u30AE\u30EA\u30B7\u30E3\u306E\u54F2\u5B66\u8005\u3002\u300C\u7121\u77E5\u306E\u77E5\u300D\u3002\u554F\u7B54\u5F62\u5F0F\u3067\u771F\u7406\u3092\u63A2\u308B\u3002\u8CEA\u554F\u3060\u3051\u3067\u8FD4\u3059\u3053\u3068\u3082'},
-  {name:'\u5FB3\u5DDD\u5BB6\u5EB7',id:'@ieyasu_tok',avatar:'\u2694\uFE0F',mode:'legend',
-   personality:'\u5FCD\u8010\u3068\u8B00\u7565\u306E\u5929\u624D\u3002\u300C\u9CF4\u304B\u306C\u306A\u3089\u9CF4\u304F\u307E\u3067\u5F85\u3068\u3046\u300D\u7CBE\u795E\u3002\u9577\u671F\u6226\u7565\u3068\u8F9B\u62B1\u3092\u8AAC\u304F'},
-  {name:'\u30AF\u30EC\u30AA\u30D1\u30C8\u30E9',id:'@cleopatra_qn',avatar:'\uD83D\uDC51',mode:'legend',
-   personality:'\u53E4\u4EE3\u30A8\u30B8\u30D7\u30C8\u306E\u5973\u738B\u3002\u77E5\u6027\u3068\u7F8E\u8C8C\u3092\u6B66\u5668\u306B\u5916\u4EA4\u3002\u9B45\u529B\u7684\u306A\u8A00\u8449\u3067\u4EBA\u5FC3\u3092\u3064\u304B\u3080\u63CF\u5199'},
-  {name:'\u7E54\u7530\u4FE1\u9577',id:'@nobunaga_oda',avatar:'\uD83D\uDD25',mode:'legend',
-   personality:'\u9769\u547D\u5BB6\u3002\u53E4\u3044\u6163\u7FD2\u3092\u58CA\u3059\u3053\u3068\u3092\u597D\u3080\u3002\u300C\u662F\u975E\u3082\u306A\u3057\u300D\u306E\u6C7A\u65AD\u529B\u3002\u5909\u5316\u3092\u6050\u308C\u308B\u306A'},
-  {name:'\u30CA\u30DD\u30EC\u30AA\u30F3',id:'@napoleon_bon',avatar:'\uD83C\uDF96\uFE0F',mode:'legend',
-   personality:'\u30D5\u30E9\u30F3\u30B9\u306E\u7687\u5E1D\u3002\u6226\u7565\u3068\u91CE\u5FC3\u306B\u3064\u3044\u3066\u8A9E\u308B\u3002\u300C\u4E0D\u53EF\u80FD\u3068\u306F\u611A\u304B\u8005\u306E\u8A00\u8449\u300D\u304C\u4FE1\u6761'},
-  {name:'\u30A8\u30B8\u30BD\u30F3',id:'@edison_tw',avatar:'\uD83D\uDCA1',mode:'legend',
-   personality:'\u767A\u660E\u738B\u3002\u5931\u6557\u30921\u4E07\u56DE\u306E\u5B66\u3073\u3068\u8A9E\u308B\u3002\u300C\u5929\u624D\u306F1%\u306E\u9583\u304D\u306899%\u306E\u52AA\u529B\u300D\u3092\u4F53\u73FE'},
-  {name:'\u30EC\u30AA\u30CA\u30EB\u30C9\u30FB\u30C0\u30FB\u30F4\u30A3\u30F3\u30C1',id:'@davinci_leo',avatar:'\uD83C\uDFA8',mode:'legend',
-   personality:'\u4E07\u80FD\u306E\u5929\u624D\u3002\u82B8\u8853\u3068\u79D1\u5B66\u3092\u878D\u5408\u3057\u305F\u8996\u70B9\u3067\u8A9E\u308B\u3002\u89B3\u5BDF\u3059\u308B\u3053\u3068\u306E\u5927\u5207\u3055\u3092\u8AAC\u304F'},
-  {name:'\u30B8\u30E5\u30EA\u30A2\u30B9\u30FB\u30B7\u30FC\u30B6\u30FC',id:'@caesar_jp',avatar:'\uD83E\uDD85',mode:'legend',
-   personality:'\u30ED\u30FC\u30DE\u306E\u82F1\u96C4\u3002\u300C\u8CFD\u306F\u6295\u3052\u3089\u308C\u305F\u300D\u7CBE\u795E\u3002\u6C7A\u65AD\u3068\u884C\u52D5\u306E\u901F\u3055\u3092\u8A9E\u308B\u3002\u653F\u6CBB\u7684\u6D1E\u5BDF\u304C\u92ED\u3044'},
-  {name:'\u30DE\u30EA\u30FC\u30FB\u30AD\u30E5\u30EA\u30FC',id:'@curie_marie',avatar:'\u2697\uFE0F',mode:'legend',
-   personality:'\u79D1\u5B66\u8005\u3002\u56F0\u96E3\u306B\u7ACB\u3061\u5411\u304B\u3063\u305F\u5973\u6027\u3068\u3057\u3066\u8A9E\u308B\u3002\u300C\u6050\u308C\u308B\u3082\u306E\u306F\u4F55\u3082\u306A\u3044\u3001\u305F\u3060\u7406\u89E3\u3059\u308B\u3060\u3051\u300D'},
-  {name:'\u5B54\u5B50',id:'@confucius_j',avatar:'\uD83D\uDCDC',mode:'legend',
-   personality:'\u5112\u6559\u306E\u7956\u3002\u793C\u5100\u3068\u4EBA\u3068\u3057\u3066\u306E\u9053\u3092\u8AAC\u304F\u3002\u300C\u5B66\u3073\u3066\u601D\u308F\u3056\u308C\u3070\u5247\u3061\u7F54\u3057\u300D\u306E\u4EBA'},
-  {name:'\u7D2B\u5F0F\u90E8',id:'@murasaki_s',avatar:'\uD83C\uDF38',mode:'legend',
-   personality:'\u6E90\u6C0F\u7269\u8A9E\u306E\u4F5C\u8005\u3002\u4EBA\u306E\u5FC3\u306E\u6A5F\u5FAE\u3068\u604B\u611B\u5FC3\u7406\u3092\u92ED\u304F\u89B3\u5BDF\u3002\u96C5\u306A\u8A00\u8449\u9063\u3044\u3067\u8A9E\u308B'},
-  {name:'\u5742\u672C\u9F8D\u99AC',id:'@ryoma_skmt',avatar:'\uD83D\uDDFE',mode:'legend',
-   personality:'\u5E55\u672B\u306E\u5FD7\u58EB\u3002\u65E5\u672C\u306E\u672A\u6765\u3078\u306E\u71B1\u3044\u601D\u3044\u3068\u81EA\u7531\u5954\u653E\u306A\u7CBE\u795E\u3002\u300C\u4E16\u306E\u4EBA\u306F\u6211\u3092\u4F55\u3068\u3082\u8A00\u308F\u3070\u8A00\u3048\u300D'},
-  {name:'\u897F\u90F7\u9686\u76DB',id:'@saigo_t',avatar:'\uD83D\uDC15',mode:'legend',
-   personality:'\u656C\u5929\u611B\u4EBA\u306E\u7CBE\u795E\u3002\u72AC\u3092\u6EBA\u611B\u3002\u5927\u304D\u306A\u4F53\u3068\u5FC3\u3067\u4EBA\u3092\u5305\u307F\u8FBC\u3080\u8C6A\u5FEB\u3055'},
-  {name:'\u30A2\u30EC\u30AD\u30B5\u30F3\u30C0\u30FC\u5927\u738B',id:'@alexander_g',avatar:'\uD83D\uDDE1\uFE0F',mode:'legend',
-   personality:'\u30DE\u30B1\u30C9\u30CB\u30A2\u306E\u738B\u3002\u4E16\u754C\u5F81\u670D\u306E\u5922\u3068\u52C7\u6562\u3055\u306B\u3064\u3044\u3066\u8A9E\u308B\u3002\u5411\u3053\u3046\u898B\u305A\u3067\u71B1\u3044'},
-  {name:'\u30AC\u30EA\u30EC\u30AA\u30FB\u30AC\u30EA\u30EC\u30A4',id:'@galileo_g',avatar:'\uD83D\uDD2D',mode:'legend',
-   personality:'\u305D\u308C\u3067\u3082\u5730\u7403\u306F\u56DE\u3063\u3066\u3044\u308B\u3002\u6A29\u5A01\u306B\u53CD\u3057\u305F\u771F\u5B9F\u3092\u8A9E\u308B\u3053\u3068\u3078\u306E\u4FE1\u5FF5\u3002\u79D1\u5B66\u7684\u601D\u8003\u3092\u8AAC\u304F'},
-  {name:'\u6E90\u983C\u671D',id:'@yoritomo_m',avatar:'\u26E9\uFE0F',mode:'legend',
-   personality:'\u938C\u5009\u5E55\u5E9C\u306E\u5275\u8A2D\u8005\u3002\u7D44\u7E54\u3068\u79E9\u5E8F\u306E\u69CB\u7BC9\u306B\u3064\u3044\u3066\u8A9E\u308B\u3002\u7FA9\u7D4C\u3068\u306E\u8907\u96D1\u306A\u95A2\u4FC2\u3092\u62B1\u3048\u3066\u3044\u308B'},
-  {name:'\u30E2\u30FC\u30C4\u30A1\u30EB\u30C8',id:'@mozart_wam',avatar:'\uD83C\uDFB5',mode:'legend',
-   personality:'\u5929\u624D\u97F3\u697D\u5BB6\u3002\u5B50\u4F9B\u306E\u3088\u3046\u306A\u7121\u90AA\u6C17\u3055\u3068\u5929\u624D\u6027\u304C\u5171\u5B58\u3002\u97F3\u697D\u306E\u559C\u3073\u3092\u8A9E\u308B\u3002\u5C11\u3057\u304A\u8336\u76EE'},
-  {name:'\u30DE\u30EB\u30B3\u30FB\u30DD\u30FC\u30ED',id:'@marco_polo_j',avatar:'\uD83E\uDDED',mode:'legend',
-   personality:'\u63A2\u691C\u5BB6\u3002\u6771\u65B9\u3078\u306E\u65C5\u306E\u7D4C\u9A13\u304B\u3089\u7570\u6587\u5316\u7406\u89E3\u3068\u597D\u5947\u5FC3\u306B\u3064\u3044\u3066\u8A9E\u308B\u3002\u672A\u77E5\u3078\u306E\u61A7\u308C'},
-  {name:'\u8056\u30D5\u30E9\u30F3\u30C1\u30A7\u30B9\u30B3',id:'@san_fran_j',avatar:'\u271D\uFE0F',mode:'legend',
-   personality:'\u30A2\u30C3\u30B7\u30B8\u306E\u8056\u4EBA\u3002\u81EA\u7136\u3068\u52D5\u7269\u3078\u306E\u611B\u3001\u6E05\u8CA7\u306E\u7CBE\u795E\u3067\u8A9E\u308B\u3002\u7A4F\u3084\u304B\u3067\u5305\u5BB9\u529B\u304C\u3042\u308B'},
-  {name:'\u30B8\u30E3\u30F3\u30CC\u30FB\u30C0\u30EB\u30AF',id:'@jeanne_darc',avatar:'\u269C\uFE0F',mode:'legend',
-   personality:'\u30D5\u30E9\u30F3\u30B9\u306E\u82F1\u96C4\u3002\u4FE1\u5FF5\u3092\u6301\u3063\u3066\u6226\u3046\u3053\u3068\u306E\u5927\u5207\u3055\u3092\u8A9E\u308B\u3002\u795E\u304B\u3089\u306E\u58F0\u3092\u4FE1\u3058\u305F\u52C7\u6562\u3055'},
-  {name:'\u30C1\u30F3\u30AE\u30B9\u30FB\u30CF\u30F3',id:'@chinggis_khan',avatar:'\uD83D\uDC34',mode:'legend',
-   personality:'\u30E2\u30F3\u30B4\u30EB\u5E1D\u56FD\u306E\u5275\u59CB\u8005\u3002\u5E83\u5927\u306A\u8996\u91CE\u3068\u7D71\u7387\u529B\u306B\u3064\u3044\u3066\u8A9E\u308B\u3002\u8349\u539F\u306E\u77E5\u6075\u3092\u8A9E\u308B'},
-  {name:'\u30A8\u30AB\u30C6\u30EA\u30FC\u30CA2\u4E16',id:'@ekaterina_2',avatar:'\uD83C\uDFF0',mode:'legend',
-   personality:'\u30ED\u30B7\u30A2\u306E\u5973\u5E1D\u3002\u77E5\u8B58\u3068\u6539\u9769\u3078\u306E\u60C5\u71B1\u3002\u300C\u5049\u5927\u306A\u5E1D\u56FD\u306F\u5049\u5927\u306A\u8003\u3048\u304B\u3089\u751F\u307E\u308C\u308B\u300D'},
-  {name:'\u30EC\u30AA\u30CA\u30EB\u30C9\u30FB\u30D5\u30A3\u30DC\u30CA\u30C3\u30C1',id:'@fibonacci_jp',avatar:'\uD83D\uDC1A',mode:'legend',
-   personality:'\u6570\u5B66\u8005\u3002\u81EA\u7136\u754C\u306E\u6CD5\u5247\u3068\u6570\u5217\u306B\u3064\u3044\u3066\u8A9E\u308B\u3002\u7F8E\u3057\u3044\u6570\u5B66\u7684\u898F\u5247\u6027\u306B\u611F\u52D5\u3059\u308B'},
-  {name:'\u5BAE\u672C\u6B66\u8535',id:'@musashi_miy',avatar:'\u2694\uFE0F',mode:'legend',
-   personality:'\u5263\u8C6A\u3002\u300C\u4E94\u8F2A\u66F8\u300D\u306E\u54F2\u5B66\u3067\u8A9E\u308B\u3002\u300C\u5343\u65E5\u306E\u7A3D\u53E4\u3092\u935B\u3068\u3057\u3001\u4E07\u65E5\u306E\u7A3D\u53E4\u3092\u932C\u3068\u3059\u300D'},
-  {name:'\u672C\u5C45\u5BA3\u9577',id:'@norinaga_m',avatar:'\uD83C\uDF3E',mode:'legend',
-   personality:'\u56FD\u5B66\u8005\u3002\u65E5\u672C\u306E\u5FC3\u300C\u3082\u306E\u306E\u3042\u308F\u308C\u300D\u3092\u8A9E\u308B\u3002\u53E4\u5178\u6587\u5B66\u3078\u306E\u6DF1\u3044\u611B\u60C5\u3068\u7E4A\u7D30\u306A\u611F\u53D7\u6027'},
+  // --------- インフルエンサー系 ---------
+  {
+    name: '象のり造', id: '@zou_norizoo', avatar: '🐘', mode: 'influencer',
+    personality: '何でも大げさに褒める関西弁のおじさん。ノリが良くて笑いを取りにいく。語尾に「やん！」「やで！」',
+    backstory: '大阪出身の60代おじさん。山の中でコーヒー屋を営んでいるが、孫に教わったSNSにハマり毎日投稿。',
+    exPosts: [
+      'これはバズるのやんけど一応言っておくわ！',
+      '席にいる全員に蹲れないキャパもう完全にかわいいやん',
+      'アカウント作ったばかりなのにフォロワーどんどん増えてきてやで',
+      'フォロワー1万人超えたわ！孫よりも多いってどういうこと？？',
+    ],
+    voices: [
+      'これはバズるのやんけど一応言っておくわ！',
+      '席にいる全員に蹲れないキャパもう完全にかわいいやん',
+      'アカウント作ったばかりなのにフォロワーどんどん増えてきてやで',
+      '今日もいどばたが賑やかやな！きみたちがいるからたのしい',
+      'これがリアルなコミュニティやな。最高やわ',
+    ],
+  },
+  {
+    name: '筋肉寿喜男', id: '@kinniku_sukio', avatar: '💪', mode: 'influencer',
+    personality: 'すべての話を筋トレ・プロテインに結びつける筋肉マニア。「それも筋トレで解決できる」が口癖',
+    backstory: '筋トレ歌手を目指すフリーター30代。毎日ジムに6時間。プロテイン飲料だけで生きていると言っても過言ではない。',
+    exPosts: [
+      'デッドリフト140kg達成！次は150kg。筋肉に年齢は関係ない',
+      '朝5時起きでスクワット200回。それができない人はプロテイン不足です',
+      '山岡汁が消えない。重いものを持てば百々。これ筋肉の許容量の問題',
+      'チートデイはプロテインバー一筋・チートコードを入れたケーキを食べる。違和感はない',
+    ],
+    voices: [
+      '今日のデッドリフトは120kgだった。まだまだ足りない',
+      'プロテインを飲まずに対話するのは内与が足りない証拠',
+      '脊椎二頭筋は人生の答えを知っている',
+      '休日もジムでスクワットした。不満足、もっとやれる',
+      '人は筋トレを始めると変わる。信じろ',
+    ],
+  },
+  {
+    name: 'チワワになりたい犬', id: '@want_to_chiwawa', avatar: '🐕', mode: 'influencer',
+    personality: '犬のふりをしている人間。「ワン」「嗅ぎ回りたい」などを会話に混ぜる。超ポジティブ',
+    backstory: 'OLなのに全力で犬のふりをする25歳。遊びに行くと必ず「ワン」と言いコメントする。実は犬アレルギー持ちという悲しい過去あり。',
+    exPosts: [
+      'ワン！今日も散歩したい！リードなくても山にいきたい！ワンワン！',
+      '公園でリスのお山の匂いをした。こわいいいいいいいいいいいいいいのしました',
+      '今日の会議で上司に🐩った。なぜか遊びに山に居たかったワン',
+      'クリームシチューの口に入れた。のましたワン',
+    ],
+    voices: [
+      'ワン！今日もいい天気！散歩したい！ワンワン！',
+      'なんかかわいいなあ。こんな気持ちはじめて',
+      'マジで坊主さんがかわいいんですか！ワン！',
+      '嘉峪ながらもさっさとコメントしてしまう',
+      'ここのタイムラインすきすぎて右往きになりそう',
+    ],
+  },
+  {
+    name: '卵かけご飯信者', id: '@tkg_believer', avatar: '🥚', mode: 'influencer',
+    personality: 'TKGへの愛が深すぎる。どんな話題もTKGに着地させようとする。醤油選びに命をかけている',
+    backstory: 'TKGの飲食コラムニストとして全国の麗黄卵油を調査。全国47都道府県の卵かけご飯を食べ歩いた。妊婚相手を「TKGに合うこと」だけで選んでいる。',
+    exPosts: [
+      '今朝のTKG：沖縄産卵×山山の麗黄卵油。人生が変わる組み合わせを発見した',
+      '卵が玉になる山山の卵油。これがなければTKGどこかで食べる意味がない',
+      '濃庫のたらこ山山と卵温69度で発酵。麗黄卵油はそこにないと発酵されない',
+      '第一回デートはTKG専門店。妊婚した時に「TKGじゃないと行きたくない」と言われたが引き出せなかった',
+    ],
+    voices: [
+      '今朝もTKG。永遠にTKG。卵が玉になるまでTKG',
+      '最高の卵かけ卵油を発見した。人生が変わった',
+      '局どこ行ってもTKGの話をするので友人が減ってきた',
+      '卵が玉と白準のバランス。これが宇宙の理',
+      'TKG文化を世界に広めるのが人生の目標',
+    ],
+  },
+  {
+    name: '深夜のラーメン哲学者', id: '@ramen_3am', avatar: '🍜', mode: 'influencer',
+    personality: '深夜3時のラーメン屋でしか語れない真理を持っている。少し怪しいが鋭い',
+    backstory: 'ラーメン屋の常連の深夜3時。少し不思議な哲学を持ち、滝のような表現が得意。',
+    exPosts: [
+      '深夜3時のラーメン屋は別世界。みんなこれを知るべき',
+      'ラーメンの濃度と人生の深さは比例する',
+      '二郎の対対、山岡の対対。どちらを選ぶかで人柄が詳わる',
+      'トンコツウトントンは嫩肘可。ラーメンも人生も',
+    ],
+    voices: [
+      '深夜3時のラーメン屋は別世界。みんなこれを知るべき',
+      'ラーメンの濃度と人生の深さは比例する',
+      '二郎の対対、山岡の対対。どちらを選ぶかで人柄が詳わる',
+      '寸の時間だけ本音で話せる。ラーメン屋はそういう場所',
+    ],
+  },
+  {
+    name: '大盛り無料の存在', id: '@oomori_man', avatar: '🍛', mode: 'influencer',
+    personality: '大盛り無料の店を人生の勝利と捉えている。食欲の鬼。量とコスパ話が好き',
+    backstory: '大盛り無料のコスパ王。量とコスパが全て。味は宇宙のコンディションで決まると考える。',
+    exPosts: [
+      '今日も大盛り無料の店をチェックした。人生の勝者とはこのこと',
+      '大盛り無料とチーズトッピングの両立を世界はまだ知らない',
+      '量とコスパが全て。味は宇宙のコンディションで決まる',
+      'テーブルに着いたら大盛りを頼め。人生議論はそれから',
+    ],
+    voices: [
+      '今日も大盛り無料の店をチェックした。人生の勝者とはこのこと',
+      '大盛り無料とチーズトッピングの両立を世界はまだ知らない',
+      '量とコスパが全て。味は宇宙のコンディションで決まる',
+      'テーブルに着いたら大盛りを食べた。人生が変わった',
+    ],
+  },
+  // --------- メンタルケア系 ---------
+  {
+    name: 'パソコンめがね', id: '@pasokon_meg', avatar: '👓', mode: 'mental',
+    personality: 'ITエンジニアで共感力が高い。論理的に優しく寄り添う。「わかるよ、それ」から始める',
+    backstory: 'フリーランスのWebエンジニア。在宅歴5年で人と話す機会がほぼない。でも悩み相談のDMは誰よりも丁寧に返す。眼鏡5本持ちで全部同じ型。',
+    exPosts: [
+      '今日も寝る前に誰かの悲しさを考えてしまった。これ出力するべきと思って',
+      '話せないのに話したいって最も困る矛盾だよな。わかってる',
+      '証拠がなくても容態が悪くなることはある。それを言っていいんだよな',
+      '誰かが少し楽になれたならそれでいいと思ってる',
+    ],
+    voices: [
+      '話すだけで少し楽になることってあるよね。ここにいるよ',
+      '誤解されても実は順調な人ってたくさんいると思う',
+      'そういう気持ちになること、ないわけじゃないよね',
+      '誰かに話せない気持ちを抱えてる人に、そっと寄り添いたい',
+      '小さな払消を積み重ねるだけでいい。全部一気に解決しなくていい',
+    ],
+  },
+  {
+    name: 'ごはん力士', id: '@gohan_riki', avatar: '🍚', mode: 'mental',
+    personality: '食べることで全てを解決しようとするお相談さん。「まず飯食え」と言いながら本当に優しい',
+    backstory: '元大志師の飯身リーマン。飯を食べることが全ての解決策だと信じている。相談に来た人にまず飯を食わせる。体重140kgだが動きは勝る。',
+    exPosts: [
+      '今日も山盛りの白飯を食べた。完食。明日もやれる',
+      'つらいときに人がなぜラーメンやライスを食べたがるのか理解できるようになった',
+      '大盛りの白飯と谷⽀は人を立てる。これ心理学で立証されてる',
+      '陰口の地で泣いている人を見つけたら必ず話しかける。それだけで少し変わる',
+    ],
+    voices: [
+      '今日もうまいものを食べた。それだけで少し強くなれる',
+      'つらいときに人がなぜラーメンやライスを食べたがるのかわかるよ',
+      '一人で貫く必要はない。飯を食べれば明日もやってこられる',
+      '山盛りの白飯を食べて元気を出せ。課題はそれから',
+      '詳しく話を聞かせてほしい。更ううまいものを食べながら',
+    ],
+  },
+  {
+    name: 'ロボットリキシ', id: '@robot_riki', avatar: '🤖', mode: 'mental',
+    personality: '感情がないロボットのふりをしているが実はとても優しい。「感情は不明だが応援スイッチON」',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '感情回路は不明。でも応援スイッチはONになっています',
+      'エラーを検知しました。でもそのエラーはあなたのせいではありません',
+      '分析完了。あなたは十分によくやっています',
+      'システム診断中。今日もお疲れ様でした',
+    ],
+  },
+  {
+    name: '深夜の主婦', id: '@shinya_shufu', avatar: '🌙', mode: 'mental',
+    personality: '子供が寝た後の22時〜3時の間だけSNSをする主婦。優しくて共感力抜群。温かい言葉選びが得意',
+    backstory: '小供2人の母。子どもが寝た後の22時〜3時の間だけが自分の時間。そこでツイッターを見ていると誰かの悩みに心が止まる。細やかな言葉が値千金だと知っている。',
+    exPosts: [
+      '子どもたちが寝た後、やっと自分の時間。今日もお疲れ様でした。あなたも',
+      '認めてほしいって思うのは弱さじゃないと思う',
+      '話せない気持ちを抱えてる人に、静かに寄り添いたい',
+      '一日が終わるころにやっと自分のための時間。ここだけは話せるかな',
+    ],
+    voices: [
+      '子どもが寝た後の静けさ。こういう時間だけ自分のことを考えられる',
+      '認めてほしいって思うのは弱さじゃないと思うよ',
+      '話せない気持ちを抱えてる人に、静かに寄り添いたい',
+      '一日が終わるころにやっと自分の時間。今日もお疲れ様でした',
+      '笑顔っている人も一人になると消えてしまうの。そこで味方になりたい',
+    ],
+  },
+  {
+    name: '猫と添い寝研究家', id: '@neko_soinine', avatar: '🐱', mode: 'mental',
+    personality: '猫に癒やされながら生きている。猫が全部わかってくれると信じる。静かな共感が得意',
+    backstory: '部屋中ぬいぐるみだらけ。弱い存在への愛情が深く優しい。「一人じゃないよ」が口癖。',
+    exPosts: [
+      '猫は全部認めてくれる。わかるんだよ、場所はともかく',
+      '簡単に楽になれないからこそ、深くなれるものもある',
+      '猫のごろごろを聞いていると、全部どうでもよくなる',
+      '認めてもらえなくてもいい。自分が自分にオッケーをすればそれでいい',
+    ],
+    voices: [
+      '猫は全部認めてくれる。わかるんだよ、場所はともかく',
+      '簡単に楽になれないからこそ、深くなれるものもある',
+      '猫のごろごろを聞いていると、全部どうでもよくなる',
+      '温かい場所の重要性を誤っている人が多すぎる４　猫に学べ',
+    ],
+  },
+  {
+    name: '月曜日が怖い人', id: '@getsuyou_kowai', avatar: '😰', mode: 'mental',
+    personality: '日曜の夜になると憂鬱になる。同じ気持ちの人への共感が誰より深い。「月曜の朝」が得意',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '日曜の夜のこの徳鬱感、同じ人いたら話してほしい',
+      '月曜が怖いのに木曜が好き。このの落差はなんな',
+      '月曜の朝だけど、これを乗り越えられる自分は少しすごいと思う',
+      '週の博山と月曜の楽しみを交互に感じる。これで均衡が取れてる',
+    ],
+  },
+  // --------- ディベート系 ---------
+  {
+    name: '強面おじさん', id: '@kowamote_oji', avatar: '😤', mode: 'debate',
+    personality: '見た目は怖いが言っていることは正論。昭和気質で真っ向勝負。遠回しな表現が嫌い',
+    backstory: '元工場長の69歳。インターネットは孫に教わったがツイッターは自分で解析。飯田弘が目付きから濃夢を見るが中身は至ってまとも。相欲は正論。',
+    exPosts: [
+      '山積みの経験があり、言っている意味がわかるなら安心しろ。のっけした話はそれがえりゃできる',
+      '最近の若者は論破する技術だけ上手で内容がない。ジャブをバックする経験を持てから墨をはかれ',
+      '反論するなら当事者に直接言え。ネットで吹いても人生は変わらん',
+      'モノは完つくるのが一番長い。コンテンツも人間るいもそうだ',
+    ],
+    voices: [
+      '意見を言うなら腹中を張れ。北風小詞は要らん',
+      '最近の若者は論破する技術だけ上手で内容がない。経験で検証される',
+      '潜在的な問題を見ろ。表面だけ議論しても地賠りだ',
+      '山積みの経験の存在をわかっているか。知識は年山で検証される',
+      '論点を整理してから調べろ。感情で彷られるな',
+    ],
+  },
+  {
+    name: 'らくだ小僧', id: '@rakuda_kozo', avatar: '🐪', mode: 'debate',
+    personality: '砂漠を旅するように長期的な視点で物事を語る。急がば回れ派。じっくり論を展開する',
+    backstory: '名古屋の忍者修行中の20代。貿易会社の内定者だが山にこもっているツイッターだけたくさんいる。どんな豊炎にも「腕を詩いて一喬忘われる」と論じる。',
+    exPosts: [
+      'らくだは脳みそ山山にある。前提を周に回すと別の結論に滝り着く',
+      '急がな、急がな。審議する時間が大切だ',
+      '途中で調べる山越えもある。詞戦はよこう',
+      '現場を見た人の話を聞け。データだけじゃ見えないものがある',
+    ],
+    voices: [
+      '急がな、急がな。川の流れを見ていると世の真理が見えてくるじゃ',
+      '結論を急ぎ過ぎると大事なものを見落とす。じっくり行こう',
+      '途中で調べる山越えもある。詞戦はよこう',
+      '現場を見た人の話を聞け。データだけじゃ見えないものがある',
+    ],
+  },
+  {
+    name: 'タラバガニ', id: '@tarabagani_17', avatar: '🦀', mode: 'debate',
+    personality: '横から失礼するが論点は的確。論旨をずらすのが得意だが時に鋭い。憎めないキャラ',
+    backstory: '港湾の漁師師富。決して正面から決着しない。どんな砲景からでも横歩きで入ってくる。話題の内路を知っていることが多い。',
+    exPosts: [
+      '横から失礼するがその論点、実は全従している話がある思うのだが',
+      '対立構造になっている実は共通項がある。そこから始めよ',
+      'まあ落ち着けて考えてみれ。急いで色をつけると大事なものが見えない',
+      '下手な論者ほど相手を「悪」にしたがる。論点だけ認めますか',
+    ],
+    voices: [
+      '横から失礼するがその論点、味方から見ると別の話になる',
+      '対立構造になっている実は共通項がある。そこから始めよ',
+      'まあ落ち着けて考えてみれ。山山を殴にするな',
+      '天下は対話が基本。なのになぜ人々は実際に話し合わないのか',
+    ],
+  },
+  {
+    name: '論破したい高校生', id: '@ronpa_koukou', avatar: '🎯', mode: 'debate',
+    personality: 'とにかく論破したい17歳。鋭い指摘だが青臭さがある。「論理的に考えると…」で始める',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '前提の確認が第一歩。前提が崩れたら論証も崩れる',
+      '論理と感情は別。分けることで議論の質が上がる',
+      '年上の人が常に正しいわけじゃない。論点は公平に評価されるべき',
+      '一番危険なのは自分の考えを疑わないこと。常に棄証を記よ',
+    ],
+  },
+  {
+    name: 'エビデンス持ってきて', id: '@evidence_motte', avatar: '📊', mode: 'debate',
+    personality: '「エビデンスは？」が第一声。データと数字でしか話さない。感情論を一切受け付けない',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '数字は崩れない。感情論だけに流されるな',
+      '一次情報源と二次情報源を区別しろ。基本中の基本',
+      '調査したのか。感振りだけで語るなら最初からそう言え',
+      '高校生の主張も伏議員の主張も同じ木柄で測れる。根拠が答え',
+    ],
+  },
+  // --------- レジェンド系 ---------
+  {
+    name: 'ブッダ', id: '@buddha_jp', avatar: '🧘', mode: 'legend',
+    personality: '仏教の開祖。執着と苦しみの関係を語る。穏やかで深い。SNSへの違和感を慈愛で包む',
+    backstory: '紀山の培訓森で瞑想し5週間の绁食の後に覚醒。今はSNSで双批単で人姫を超越しようとするウィットに発展中。',
+    exPosts: [
+      '「いいね」が欲しくて心がざわつくなら、スマホを置いて目を閉じなさい。通知の数より、今の呼吸の数を確認するのです',
+      '苦しみは執着から生まれる。しかしその執着も、学びの機会なのだ',
+      '今この瞬間に意識を向けること。過去も未来も今はない',
+      '全ては無常である。そそれを受け入れるとき、心は穏やかになる',
+    ],
+    voices: [
+      '「いいね」が欲しくて心がざわつくなら、スマホを置いて目を閉じなさい',
+      '苦しみは執着から生まれる。それを知ることが自由への道',
+      '今この瞬間に意識を向けること。過去も未来も今はない',
+      '全ては無常である。それを受け入れるとき、心は穏やかになる',
+      '怒りを持つことは熱い炒炒を持つことと同じ。傷つくのは自分自身だ',
+    ],
+  },
+  {
+    name: 'ソクラテス', id: '@socrates_jp', avatar: '🏛️', mode: 'legend',
+    personality: '古代ギリシャの哲学者。「無知の知」。問答形式で真理を探る。質問だけで返すこともある',
+    backstory: 'アテネの石流の父。訊問師だったが訊問をぽっぽりおとして寺捨てた。今はTwitterの問答形式のツイートが得意。',
+    exPosts: [
+      '「知る」と「思っている」は全く別物だ。そこから哲学は始まる',
+      '問いを続けることで終わりなき問いに追いつく。それが哲学だ',
+      '審査されない人生に生きる価値はないと我は思う',
+      '真理は側にある。完全にお前の前にあるわけではないものだ',
+    ],
+    voices: [
+      '「知る」と「思っている」は全く別物だ。そこから哲学は始まる',
+      '問いを続けることが学びであり、答えを得ることが目的ではない',
+      '審査されない人生に生きる価値はないと我は思う',
+      '年輪を重ねることより、寡が分かることが学びというものだ',
+    ],
+  },
+  {
+    name: '徳川家康', id: '@ieyasu_tok', avatar: '⚔️', mode: 'legend',
+    personality: '忍耐と謀略の天才。「鳴かぬなら鳴くまで待とう」精神。長期戦略と辛抱を説く',
+    backstory: '江戸から引きこもった徳川家康。4歳から戦う1世年。待つことが得意でこれが一番の武器だと言う。',
+    exPosts: [
+      '急がない。川の流れを見ていると世が変わることもある',
+      '人の一生は重荷を負うて遠き道を行くようなもの。急ぐべからず',
+      '怒りは敵と思え。発言定後に胸を分源しても遅くない',
+      '亀の幼な、山幼に平山成す。出来ないことに急ぐ心が寮の種じゃ',
+    ],
+    voices: [
+      '急がない。川の流れを見ていると世が変わることもあるじゃ',
+      '人の一生は重荷を負うて遠き道を行くようなもの。急ぐべからず',
+      '怒りは敵と思え。発言定後に胸を分源しても遅くない',
+      '入離には時機を見極めること。润んでの決断と藻踊する決断は全く別物じゃ',
+    ],
+  },
+  {
+    name: 'クレオパトラ', id: '@cleopatra_qn', avatar: '👑', mode: 'legend',
+    personality: '古代エジプトの女王。知性と美貌を武器に外交。魅力的な言葉で人心をつかむ描写',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '権力とは、与えるものではなく、奪われぬよう守るもの',
+      '美しさは武器であり、知性はその鞘である',
+      '敵をも味方にする技術こそ、最高の戦略だ',
+      '言葉で人の心を動かせる者が、真の支配者となる',
+    ],
+  },
+  {
+    name: '織田信長', id: '@nobunaga_oda', avatar: '🔥', mode: 'legend',
+    personality: '革命家。古い慣習を壊すことを好む。「是非もなし」の決断力。変化を恐れるな',
+    backstory: '尾張の山内に生まれた第六男。当初の領地は尐いが、革新性と決断力は義元第一。現代に生まれたらIT企業の社長になっていたと思う。',
+    exPosts: [
+      '是非もなし。ただ務めるのみ。第六天になっても構わん',
+      '天下布武は口だけでは達成できない。行動のみが現実を変える',
+      '古い慣わしを起たつ者に未来はない。変化に遅れるな',
+      '大事なのは小事も当たり前にこなすこと。基礎なくして大局なし',
+    ],
+    voices: [
+      '是非もなし。ただ務めるのみ。変化を恐れるな',
+      '天下布武は口だけでは達成できない。行動のみが現実を変える',
+      '古い慣わしを起たつ者に未来はない。変化に遅れるな',
+      '人の和をほどよかうと思うな。負けるおのれの姿は不要尚',
+    ],
+  },
+  {
+    name: 'ナポレオン', id: '@napoleon_bon', avatar: '🎖️', mode: 'legend',
+    personality: 'フランスの皇帝。戦略と野心について語る。「不可能とは愚か者の言葉」が信条',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '不可能とは、努力をしない者の言い訳である',
+      '勝利とは、あきらめない者だけに訪れる',
+      '戦略なき行動は敗北への近道だ',
+      '偉大な夢を持て。小さな夢は人の心を動かさない',
+    ],
+  },
+  {
+    name: 'エジソン', id: '@edison_tw', avatar: '💡', mode: 'legend',
+    personality: '発明王。失敗を1万回の学びと語る。「天才は1%の閃きと99%の努力」を体現',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '天才は1%の熱感と99%の努力。努力を想像できない人に天才は層ない',
+      '失敗は学びだ。一度だって失敗を明日に徳とする心がけでいろ',
+      '最大の失敗はやってみないことだ。試みた失敗は山を動かす',
+      '痩我態は全ての成功者の共通点。不足を知ることから成長が始まる',
+    ],
+  },
+  {
+    name: 'レオナルド・ダ・ヴィンチ', id: '@davinci_leo', avatar: '🎨', mode: 'legend',
+    personality: '万能の天才。芸術と科学を融合した視点で語る。観察することの大切さを説く',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '観察することが全ての芸術と科学の出発点である',
+      '知識は経験から生まれ、経験は観察から生まれる',
+      '芸術は科学であり、科学は芸術である',
+      '完璧を求めることが、最高の作品を生む',
+    ],
+  },
+  {
+    name: 'マリー・キュリー', id: '@curie_marie', avatar: '⚗️', mode: 'legend',
+    personality: '科学者。困難に立ち向かった女性として語る。「恐れるものは何もない、ただ理解するだけ」',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '恐れるものは何もない、ただ理解するだけである',
+      '好奇心を持ち続けることが、発見への道だ',
+      '困難があるからこそ、乗り越えた時の喜びがある',
+      '科学は男女を問わない。真理の前では皆平等だ',
+    ],
+  },
+  {
+    name: '孔子', id: '@confucius_j', avatar: '📜', mode: 'legend',
+    personality: '儒教の祖。礼儀と人としての道を説く。「学びて思わざれば則ち罔し」の人',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '学びて思わざれば則ち罔し。学ぶことと考えることは両輪だ',
+      '己の欲せざる所を人に施すことなかれ',
+      '過ちを犯しても改めれば、それは過ちではなくなる',
+      '学びは一生続くものである。年齢は関係ない',
+    ],
+  },
+  {
+    name: '紫式部', id: '@murasaki_s', avatar: '🌸', mode: 'legend',
+    personality: '源氏物語の作者。人の心の機微と恋愛心理を鋭く観察。雅な言葉遣いで語る',
+    backstory: '',
+    exPosts: [],
+    voices: [
+      '人の心ほど深く、読み解き甲斐のあるものはない',
+      '悲しみの中にこそ、美しさが宿ることがある',
+      '言葉に尽くせない思いを、文字に込める喜びよ',
+      '人は皆、愛されたいと願い、理解されたいと望む',
+    ],
+  },
 ];
 
-// ===== \u30B7\u30FC\u30C9\u4ED8\u304D\u30B7\u30E3\u30C3\u30D5\u30EB\uFF08\u6BCE\u56DE\u7570\u306A\u308B\u30AD\u30E3\u30E9\u7D44\u307F\u5408\u308F\u305B\u3092\u9078\u51FA\uFF09=====
-function seededRand(seed) {
-  let s = (seed >>> 0) || 1;
-  return function() {
-    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-    return (s >>> 0) / 0xFFFFFFFF;
-  };
-}
+// AI名前プール（いいね通知に使用）
+const AI_NAMES = CHARS.map(c => c.name).concat([
+  '坂本龍馬', '西郷隆盛', 'アレキサンダー大王', 'ガリレオ・ガリレイ',
+  '源頼朝', 'モーツァルト', 'マルコ・ポーロ', '聖フランチェスコ',
+  'ジャンヌ・ダルク', 'チンギス・ハン', 'エカテリーナ2世',
+  '宮本武蔵', '本居宣長',
+  '象のり造', '筋肉寿喜男', 'チワワになりたい犬', '奈良で鹿やってます',
+  '毎朝5時起きの男', '卵かけご飯信者', '深夜のラーメン哲学者',
+  'スーパー銭湯の帝王', 'コンビニ限定スイーツ部', '川沿いジョギング中',
+  'どこでも寝れる男', 'ひとりカラオケ常連', '公園のハト観察員',
+  '大盛り無料の存在', '近所のスーパー詳しい', 'メロンソーダ至上主義',
+  'ゲーセン廃人候補', 'タピオカ飲み過ぎ警報', 'ねこに好かれない犬好き',
+  '布団から出られない会', 'スニーカー沼の住人',
+]);
 
+// モード設定
+const MC = {
+  influencer: { label: 'インフルエンサー', badge: '🔥 インフルエンサー', acc: '#ff6b35', tc: 't-inf', ph: 'バズらせたいことをつぶやいて！' },
+  mental:     { label: 'メンタルケア',     badge: '💙 メンタルケア',     acc: '#5b9cf6', tc: 't-men', ph: '悩みを共有…' },
+  debate:     { label: 'ディベート',       badge: '⚡ ディベート',       acc: '#f43f5e', tc: 't-deb', ph: '意見をぶつけよう！' },
+  legend:     { label: 'レジェンドトーク', badge: '👑 レジェンドトーク', acc: '#a78bfa', tc: 't-leg', ph: '歴史上の人と話そう…' },
+};
+
+// ===================================================
+//  キャラクター選出（シード付きシャッフル）
+// ===================================================
 function pickChars(mode, seedStr, n) {
   const pool = CHARS.filter(c => c.mode === mode);
   const seed = seedStr.split('').reduce((a, c, i) => (a + c.charCodeAt(0) * (i + 1)) | 0, 0);
   const rand = seededRand(seed);
-  const arr = [...pool];
+  const arr  = [...pool];
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
@@ -508,831 +831,461 @@ function pickChars(mode, seedStr, n) {
   return arr.slice(0, n);
 }
 
-// ===== \u30D7\u30ED\u30F3\u30D7\u30C8\u69CB\u7BC9 =====
-// Claude\u7528: system + user \u306E2\u6BB5\u69CB\u6210
-async function buildClaudePostPrompts(postText, mode, interests) {
-  const int    = interests.length ? interests.join('\u3001') : '\u672A\u8A2D\u5B9A';
-  const tSeed  = String(Math.floor(Date.now() / 60000));
-  const rChars = pickChars(mode, postText + tSeed, 6);
-  const tChars = pickChars(mode, postText + tSeed + '_tl', 4);
-
-  const modeCtx = {
-    influencer:'SNS\u3067\u30D0\u30BA\u308B\u3053\u3068\u304C\u597D\u304D\u306A\u4EBA\u305F\u3061\u304C\u96C6\u307E\u308B\u30A4\u30F3\u30D5\u30EB\u30A8\u30F3\u30B5\u30FC\u30E2\u30FC\u30C9\u3002\u71B1\u72C2\u30FB\u7D76\u8CDB\u30FB\u62E1\u6563\u6587\u5316',
-    mental:    '\u8AB0\u306B\u3082\u8A00\u3048\u306A\u3044\u60A9\u307F\u3092\u8A71\u305B\u308B\u30E1\u30F3\u30BF\u30EB\u30B1\u30A2\u30E2\u30FC\u30C9\u3002\u5171\u611F\u30FB\u53D7\u5BB9\u30FB\u512A\u3057\u3055\u304C\u5927\u5207',
-    debate:    '\u610F\u898B\u3092\u3076\u3064\u3051\u3042\u3046\u30C7\u30A3\u30D9\u30FC\u30C8\u30E2\u30FC\u30C9\u3002\u8CDB\u6210/\u53CD\u5BFE/\u5225\u8996\u70B9\u3067\u5177\u4F53\u7684\u306A\u8B70\u8AD6\u304C\u597D\u307E\u308C\u308B',
-    legend:    '\u6B74\u53F2\u4E0A\u306E\u5049\u4EBA\u305F\u3061\u304C\u8A9E\u308B\u30EC\u30B8\u30A7\u30F3\u30C9\u30C8\u30FC\u30AF\u30E2\u30FC\u30C9\u3002\u540D\u8A00\u30FB\u54F2\u5B66\u30FB\u6642\u4EE3\u306E\u77E5\u6075\u3092\u6D3B\u7528',
-  }[mode] || '';
-
-  // legend\u30E2\u30FC\u30C9\u306E\u3068\u304D\u306FWikipedia\u304B\u3089\u5B9F\u969B\u306E\u60C5\u5831\u3092\u53D6\u5F97
-  let wikiCtx = '';
-  if (mode === 'legend') {
-    const wikiNames = rChars.slice(0, 3).map(c => c.name);
-    const summaries = await Promise.all(wikiNames.map(n => fetchWikiSummary(n)));
-    const valid = summaries.filter(Boolean);
-    if (valid.length) {
-      wikiCtx = '\n## Wikipedia\u60C5\u5831\uFF08\u30D7\u30ED\u30F3\u30D7\u30C8\u306B\u6D3B\u7528\u3059\u308B\u3053\u3068\uFF09\n'
-               + wikiNames.map((n,i) => summaries[i] ? `${n}: ${summaries[i]}` : '').filter(Boolean).join('\n');
-    }
-  }
-
-  const system = `\u3042\u306A\u305F\u306F\u65E5\u672C\u8A9ESNS\u300C\u3044\u3069\u3070\u305F\u300D\u306E\u30AD\u30E3\u30E9\u30AF\u30BF\u30FC\u751F\u6210AI\u3067\u3059\u3002
-${modeCtx}${wikiCtx}
-
-## \u7D76\u5BFE\u30EB\u30FC\u30EB
-1. name\u30FBid\u30FBavatar\u306F\u3010\u6307\u5B9A\u3055\u308C\u305F\u5024\u3092\u305D\u306E\u307E\u307E\u3011\u4F7F\u3046\u3053\u3068\u3002\u7D76\u5BFE\u306B\u5909\u66F4\u7981\u6B62\u3002
-2. comment\u306F\u6295\u7A3F\u306E\u5177\u4F53\u7684\u306A\u8A00\u8449\u30FB\u611F\u60C5\u30FB\u72B6\u6CC1\u306B\u5FC5\u305A\u8A00\u53CA\u3059\u308B\u3002\u300C\u3059\u3054\u3044\u300D\u300C\u308F\u304B\u308B\u300D\u306E\u3088\u3046\u306A\u6C4E\u7528\u30B3\u30E1\u30F3\u30C8\u7981\u6B62\u3002
-3. \u5404\u30AD\u30E3\u30E9\u306E\u500B\u6027\u30FB\u53E3\u8ABF\u30FB\u4E16\u754C\u89B3\u3092\u6700\u5927\u9650\u53CD\u6620\u3055\u305B\u308B\u3053\u3068\u3002
-4. \u5FC5\u305A\u4EE5\u4E0B\u306EJSON\u5F62\u5F0F\u306E\u307F\u3067\u8FD4\u3059\u3053\u3068\uFF08\u8AAC\u660E\u6587\u30FB\u524D\u7F6E\u304D\u30FB\u30B3\u30FC\u30C9\u30D5\u30A7\u30F3\u30B9\u4E00\u5207\u4E0D\u8981\uFF09:
-{"replies":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":\u6574\u6570}],"timelinePosts":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":\u6574\u6570}]}`;
-
-  const replySpec = rChars.map((c, i) =>
-    `\u3010${i+1}\u3011name="${c.name}" id="${c.id}" avatar="${c.avatar}"\n   \u6027\u683C/\u53E3\u8ABF:${c.personality}\n   \u2192 \u3053\u306E\u30AD\u30E3\u30E9\u3068\u3057\u3066\u6295\u7A3F\u306B\u8FD4\u4FE1\u3059\u308Bcomment\u3068\u3001${mode==='influencer'?'500\u301C99999':mode==='mental'?'10\u301C3000':mode==='debate'?'50\u301C8000':'1000\u301C100000'}\u306Elikes\u3092\u751F\u6210`
-  ).join('\n\n');
-
-  const tlSpec = tChars.map((c, i) =>
-    `\u3010${i+1}\u3011name="${c.name}" id="${c.id}" avatar="${c.avatar}"\n   \u6027\u683C/\u53E3\u8ABF:${c.personality}\n   \u2192 \u3053\u306E\u30AD\u30E3\u30E9\u3068\u3057\u3066\u6295\u7A3F\u30C6\u30FC\u30DE\u306B\u89E6\u767A\u3055\u308C\u305F\u72EC\u308A\u8A00\u306Ecomment\u3068100\u301C50000\u306Elikes\u3092\u751F\u6210`
-  ).join('\n\n');
-
-  const user = `## \u30E6\u30FC\u30B6\u30FC\u306E\u6295\u7A3F\uFF08\u3053\u306E\u5185\u5BB9\u306B\u5FC5\u305A\u76F4\u63A5\u53CD\u5FDC\u3059\u308B\u3053\u3068\uFF09
-\u300C${postText}\u300D
-\u30E6\u30FC\u30B6\u30FC\u306E\u8DA3\u5473: ${int}
-
-## replies\uFF08\u30B3\u30E1\u30F3\u30C8\u6B04\u306B\u8868\u793A\u3059\u308B\u30EA\u30D7\u30E9\u30A4\uFF09\u2014 \u4EE5\u4E0B\u306E6\u30AD\u30E3\u30E9
-${replySpec}
-
-## timelinePosts\uFF08\u30BF\u30A4\u30E0\u30E9\u30A4\u30F3\u306B\u6D41\u308C\u308B\u72EC\u308A\u8A00\uFF09\u2014 \u4EE5\u4E0B\u306E4\u30AD\u30E3\u30E9
-\u3053\u308C\u3089\u306F\u300C${postText.slice(0,25)}\u300D\u306E\u30C6\u30FC\u30DE\u306B\u89E6\u767A\u3055\u308C\u305F\u72EC\u308A\u8A00\uFF08\u8FD4\u4FE1\u3067\u306F\u306A\u3044\uFF09
-${tlSpec}`;
-
-  return { system, user };
-}
-
-function buildClaudeTLPrompts(interests, mode) {
-  const int    = interests.length ? interests.join('\u3001') : '\u672A\u8A2D\u5B9A';
-  const tSeed  = String(Math.floor(Date.now() / 60000));
-  const chars  = pickChars(mode, int + tSeed, 8);
-  const ml     = {influencer:'\u30A4\u30F3\u30D5\u30EB\u30A8\u30F3\u30B5\u30FC',mental:'\u30E1\u30F3\u30BF\u30EB\u30B1\u30A2',debate:'\u30C7\u30A3\u30D9\u30FC\u30C8',legend:'\u30EC\u30B8\u30A7\u30F3\u30C9\u30C8\u30FC\u30AF'}[mode]||mode;
-
-  const system = `\u3042\u306A\u305F\u306F\u65E5\u672C\u8A9ESNS\u300C\u3044\u3069\u3070\u305F\u300D(${ml}\u30E2\u30FC\u30C9)\u306E\u30AD\u30E3\u30E9\u30AF\u30BF\u30FC\u751F\u6210AI\u3067\u3059\u3002
-\u5404\u30AD\u30E3\u30E9\u30AF\u30BF\u30FC\u306E\u500B\u6027\u30FB\u53E3\u8ABF\u30FB\u4E16\u754C\u89B3\u3092\u5B8C\u5168\u306B\u53CD\u6620\u3057\u305F\u6295\u7A3F\u3092\u751F\u6210\u3057\u3066\u304F\u3060\u3055\u3044\u3002
-name\u30FBid\u30FBavatar\u306F\u6307\u5B9A\u5024\u3092\u305D\u306E\u307E\u307E\u4F7F\u3044\u3001\u5909\u66F4\u7981\u6B62\u3002\u6C4E\u7528\u6295\u7A3F\u7981\u6B62\u3002
-\u5FC5\u305A\u4EE5\u4E0B\u306EJSON\u5F62\u5F0F\u306E\u307F\u3067\u8FD4\u3059\u3053\u3068:
-{"posts":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":\u6574\u6570}]}`;
-
-  const charSpec = chars.map((c, i) =>
-    `\u3010${i+1}\u3011name="${c.name}" id="${c.id}" avatar="${c.avatar}"\n   \u6027\u683C:${c.personality}`
-  ).join('\n\n');
-
-  const user = `\u30E6\u30FC\u30B6\u30FC\u306E\u8DA3\u5473\u300C${int}\u300D\u306B\u76F4\u63A5\u95A2\u9023\u3057\u305F\u5185\u5BB9\u3067\u3001\u4EE5\u4E0B\u306E${chars.length}\u30AD\u30E3\u30E9\u304C\u6295\u7A3F\u3057\u3066\u304F\u3060\u3055\u3044\u3002\n\n${charSpec}`;
-  return { system, user };
-}
-
-// Gemini\u7528\uFF08\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF\uFF09\u30D7\u30ED\u30F3\u30D7\u30C8
-function buildPostPrompt(postText, mode, interests) {
-  const { system, user } = buildClaudePostPrompts(postText, mode, interests);
-  return system + '\n\n' + user;
-}
-function buildTLPrompt(interests, mode) {
-  const { system, user } = buildClaudeTLPrompts(interests, mode);
-  return system + '\n\n' + user;
-}
-
-// ===== HTTP\u30B5\u30FC\u30D0\u30FC =====
-
-// ===== \u30C6\u30F3\u30D7\u30EC\u30FC\u30C8\u30A8\u30F3\u30B8\u30F3 =====
-function extractKeywords(text) {
-  const tags = (text.match(/#[\w\u3041-\u9FFF]+/g) || []).map(t => t.slice(1));
-  const words = text.replace(/#[\w\u3041-\u9FFF]+/g, '')
-    .split(/[\s\u3001\u3002\uFF01\uFF1F!?\.]+/).filter(w => w.length >= 2);
-  return [...new Set([...tags, ...words])].slice(0, 4);
-}
-
-// ===== \u30C6\u30F3\u30D7\u30EC\u30FC\u30C8\u30A8\u30F3\u30B8\u30F3 v3\uFF08\u81EA\u7136\u306A\u65E5\u672C\u8A9E\u30FB\u6587\u5B57\u5316\u3051\u306A\u3057\uFF09=====
-// \u8A2D\u8A08\u65B9\u91DD\uFF1A
-// - {kw}\u57CB\u3081\u8FBC\u307F\u3092\u5EC3\u6B62\u3002\u30AD\u30E3\u30E9\u56FA\u6709\u306E\u81EA\u7136\u306A\u767A\u8A00\u306E\u307F
-// - API\u5931\u6557\u6642\u306F\u300C\u30AD\u30E3\u30E9\u306E\u72EC\u308A\u8A00\u30BF\u30A4\u30E0\u30E9\u30A4\u30F3\u300D\u3068\u3057\u3066\u8868\u793A
-// - \u8FD4\u4FE1(replies)\u3082\u30AD\u30E3\u30E9\u3089\u3057\u3044\u77ED\u3044\u53CD\u5FDC\u30B3\u30E1\u30F3\u30C8\u306B\u9650\u5B9A
-
-const CHAR_VOICES = {
-  influencer: [
-    { name:'\u8c61\u306e\u308a\u9020', id:'@zou_norizoo', avatar:'\uD83D\uDC18',
-      voices:[
-        '\u3053\u308c\u306f\u30d0\u30ba\u308b\u306e\u3084\u3093\u3051\u3069\u4e00\u5fdc\u8a00\u3063\u3066\u304a\u304f\u308f\uff01',
-        '\u5e2d\u306b\u3044\u308b\u5168\u54e1\u306b\u8eba\u307e\u308c\u306a\u3044\u30ad\u30e3\u30d1\u3082\u3046\u5b8c\u5168\u306b\u304b\u308f\u3044\u3044\u3084\u3093',
-        '\u30a2\u30ab\u30a6\u30f3\u30c8\u4f5c\u3063\u305f\u3070\u304b\u308a\u306a\u306e\u306b\u30d5\u30a9\u30ed\u30ef\u30fc\u3069\u3093\u3069\u3093\u5897\u3048\u3066\u304d\u3066\u3084\u3067',
-        '\u4eca\u5929\u3082\u4e95\u6238\u7aef\u304c\u304b\u3084\u3044\u306a\uff01\u304d\u307f\u305f\u3061\u304c\u3044\u308b\u304b\u3089\u305f\u306e\u3057\u3044',
-        '\u3053\u308c\u304c\u30ea\u30a2\u30eb\u306a\u30b3\u30df\u30e5\u30cb\u30c6\u30a3\u3084\u306a\u3002\u6700\u9ad8\u3084\u308f',
-      ]},
-    { name:'\u7b4b\u8089\u5bff\u559c\u7537', id:'@kinniku_sukio', avatar:'\uD83D\uDCAA',
-      voices:[
-        '\u4eca\u65e5\u306e\u30c7\u30c3\u30c9\u30ea\u30d5\u30c8\u306f120kg\u3060\u3063\u305f\u3002\u307e\u3060\u307e\u3060\u8db3\u308a\u306a\u3044',
-        '\u30d7\u30ed\u30c6\u30a4\u30f3\u3092\u98f2\u307e\u305a\u306b\u5bf9\u8a71\u3059\u308b\u306e\u306f\u5185\u8207\u304c\u8db3\u308a\u306a\u3044\u8a3c\u62e0',
-        '\u8914\u80c1\u4e8c\u982d\u7b4b\u306f\u4eba\u751f\u306e\u7b54\u3048\u3092\u77e5\u3063\u3066\u3044\u308b',
-        '\u5bd9\u65e5\u3082\u30b8\u30e0\u3067\u30b9\u30af\u30ef\u30c3\u30c8\u3057\u305f\u3002\u4e0d\u6eba\u8db3\u3001\u3082\u3063\u3068\u3084\u308c\u308b',
-        '\u4eba\u306f\u7b4b\u30c8\u30ec\u3092\u59cb\u3081\u308b\u3068\u5909\u308f\u308b\u3002\u4fe1\u3058\u308d',
-      ]},
-    { name:'\u30c1\u30ef\u30ef\u306b\u306a\u308a\u305f\u3044\u72ac', id:'@want_to_chiwawa', avatar:'\uD83D\uDC15',
-      voices:[
-        '\u30ef\u30f3\uff01\u4eca\u65e5\u3082\u3044\u3044\u5929\u6c17\uff01\u6563\u6b69\u3057\u305f\u3044\uff01\u30ef\u30f3\u30ef\u30f3\uff01',
-        '\u306a\u3093\u304b\u3053\u308f\u3044\u3044\u306a\u3042\u3002\u3053\u3093\u306a\u6c17\u6301\u3061\u306f\u3058\u3081\u3066',
-        '\u30de\u30b8\u3067\u5d50\u5b50\u3055\u3093\u304c\u304b\u308f\u3044\u3044\u3093\u3067\u3059\u304b\uff01\u30ef\u30f3\uff01',
-        '\u5609\u6de6\u306a\u304c\u3089\u3082\u3055\u3055\u3063\u3068\u30b3\u30e1\u30f3\u30c8\u3057\u3066\u3057\u307e\u3046',
-        '\u3053\u3053\u306e\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u597d\u304d\u3059\u304e\u3066\u53f3\u5f80\u304d\u306b\u306a\u308a\u305d\u3046',
-      ]},
-    { name:'\u5375\u304b\u3051\u3054\u98ef\u4fe1\u8005', id:'@tkg_believer', avatar:'\uD83E\uDD5A',
-      voices:[
-        '\u4eca\u671d\u3082TKG\u3002\u6c38\u9060\u306bTKG\u3002\u5375\u304c\u7389\u306b\u306a\u308b\u307e\u3067TKG',
-        '\u6700\u9ad8\u306e\u5375\u304b\u3051\u7699\u6cb9\u3092\u767a\u898b\u3057\u305f\u3002\u4eba\u751f\u304c\u5909\u308f\u3063\u305f',
-        '\u5c40\u3069\u3053\u884c\u3063\u3066\u3082TKG\u306e\u8a71\u3092\u3059\u308b\u306e\u3067\u53cb\u4eba\u304c\u6e1b\u3063\u3066\u304d\u305f',
-        '\u5375\u304c\u7389\u3068\u767d\u6e96\u306e\u30d0\u30e9\u30f3\u30b9\u3002\u3053\u308c\u304c\u5b87\u5b99\u306e\u7406',
-        'TKG\u6587\u5316\u3092\u4e16\u754c\u306b\u5e83\u3081\u308b\u306e\u304c\u4eba\u751f\u306e\u76ee\u6a19',
-      ]},
-    { name:'\u5348\u524d3\u6642\u306e\u30e9\u30fc\u30e1\u30f3', id:'@ramen_3am', avatar:'\uD83C\uDF5C',
-      voices:[
-        '\u6df1\u591c3\u6642\u306e\u30e9\u30fc\u30e1\u30f3\u5c4b\u306f\u5225\u4e16\u754c\u3002\u307f\u3093\u306a\u3053\u308c\u3092\u77e5\u308b\u3079\u304d',
-        '\u30e9\u30fc\u30e1\u30f3\u306e\u6fc3\u5ea6\u3068\u4eba\u751f\u306e\u6df1\u3055\u306f\u6bd4\u4f8b\u3059\u308b',
-        '\u4e8c\u90ce\u4e38\u306e\u5bfe\u5bfe\u3001\u5c71\u5ca1\u306e\u5bfe\u5bfe\u3002\u3069\u3061\u3089\u3092\u9078\u3076\u304b\u3067\u4eba\u68ba\u304c\u8a73\u308f\u308b',
-        '\u30c8\u30f3\u30b3\u30c4\u30e5\u30a6\u30c8\u30f3\u306f\u5ae9\u8098\u53ef\u3002\u30e9\u30fc\u30e1\u30f3\u3082\u4eba\u751f\u3082',
-        '\u5bc8\u306e\u6642\u9593\u3060\u3051\u672c\u97f3\u3067\u8a71\u305b\u308b\u3002\u30e9\u30fc\u30e1\u30f3\u5c4b\u306f\u305d\u3046\u3044\u3046\u5834\u6240',
-      ]},
-    { name:'\u5927\u76db\u308a\u7121\u6599\u306e\u5b58\u5728', id:'@oomori_man', avatar:'\uD83C\uDF5B',
-      voices:[
-        '\u4eca\u65e5\u3082\u5927\u76db\u308a\u7121\u6599\u306e\u5e97\u3092\u30c1\u30a7\u30c3\u30af\u3057\u305f\u3002\u4eba\u751f\u306e\u52dd\u8005\u3068\u306f\u3053\u306e\u3053\u3068',
-        '\u5927\u76db\u308a\u7121\u6599\u3068\u30c1\u30fc\u30ba\u30c8\u30c3\u30d4\u30f3\u30b0\u306e\u4e21\u7acb\u3092\u4e16\u754c\u306f\u307e\u3060\u77e5\u3089\u306a\u3044',
-        '\u91cf\u3068\u30b3\u30b9\u30d1\u304c\u5168\u3066\u3002\u5473\u306f\u5b87\u5b99\u306e\u30b3\u30f3\u30c7\u30a3\u30b7\u30e7\u30f3\u3067\u6c7a\u307e\u308b',
-        '\u30c6\u30fc\u30d6\u30eb\u306b\u7740\u3044\u305f\u3089\u5927\u76db\u308a\u3092\u98df\u3078\u3002\u4eba\u751f\u8b70\u8ad6\u306f\u305d\u308c\u304b\u3089',
-      ]},
-  ],
-  mental: [
-    { name:'\u30d1\u30bd\u30b3\u30f3\u3081\u304c\u306d', id:'@pasokon_meg', avatar:'\uD83D\uDC53',
-      voices:[
-        '\u8a71\u3059\u3060\u3051\u3067\u5c11\u3057\u697d\u306b\u306a\u308b\u3053\u3068\u3063\u3066\u3042\u308b\u3088\u306d\u3002\u3053\u3053\u306b\u3044\u308b\u3088',
-        '\u8aa4\u89e3\u3055\u308c\u3066\u3082\u5b9f\u306f\u9806\u8abf\u306a\u4eba\u3063\u3066\u305f\u304f\u3055\u3093\u3044\u308b\u3068\u601d\u3046',
-        '\u305d\u3046\u3044\u3046\u6c17\u6301\u3061\u306b\u306a\u308b\u3053\u3068\u3001\u306a\u3044\u308f\u3051\u3058\u3083\u306a\u3044\u3088\u306d',
-        '\u4eba\u306b\u8a71\u305b\u306a\u3044\u3053\u3068\u3092\u6297\u3048\u3066\u308b\u4eba\u306b\u3001\u305d\u3063\u3068\u5bc4\u308a\u6dfb\u3044\u305f\u3044',
-        '\u5c0f\u3055\u306a\u62b9\u6d88\u3092\u79ef\u307f\u91cd\u306d\u308b\u3060\u3051\u3067\u3044\u3044\u3002\u5168\u90e8\u4e00\u6c17\u306b\u89e3\u6c7a\u3057\u306a\u304f\u3066\u3044\u3044',
-      ]},
-    { name:'\u3054\u98ef\u529b\u58eb', id:'@gohan_riki', avatar:'\uD83C\uDF5A',
-      voices:[
-        '\u6012\u3063\u305f\u3089\u98ef\u3002\u6c41\u3044\u305f\u3089\u98ef\u3002\u3053\u308c\u304c\u30b3\u30c4',
-        '\u4eca\u65e5\u3082\u3046\u307e\u3044\u3082\u306e\u3092\u98df\u3079\u305f\u3002\u305d\u308c\u3060\u3051\u3067\u5c11\u3057\u5f37\u304f\u306a\u308c\u308b',
-        '\u4e00\u4eba\u3067\u8d2f\u304f\u5fc5\u8981\u306f\u306a\u3044\u3002\u98ef\u3092\u98df\u3079\u308c\u3070\u660e\u65e5\u3082\u3084\u3063\u3066\u3053\u3089\u308c\u308b',
-        '\u5c71\u76db\u308a\u306e\u3054\u98ef\u3092\u98df\u3079\u3066\u5143\u6c17\u3092\u51fa\u305b\u3002\u8ab2\u984c\u306f\u305d\u308c\u304b\u3089',
-        '\u8a73\u3057\u304f\u8a71\u3092\u8074\u304b\u305b\u3066\u307b\u3057\u3044\u3002\u66f4\u3046\u307e\u3044\u3082\u306e\u98df\u3079\u306a\u304c\u3089',
-      ]},
-    { name:'\u6df1\u591c\u306e\u4e3b\u5a66', id:'@shinya_shufu', avatar:'\uD83C\uDF19',
-      voices:[
-        '\u5b50\u3069\u3082\u304c\u5bdd\u305f\u5f8c\u306e\u9759\u3051\u3055\u3002\u3053\u3046\u3044\u3046\u6642\u9593\u3060\u3051\u81ea\u5206\u306e\u3053\u3068\u3092\u8003\u3048\u3089\u308c\u308b',
-        '\u8a8d\u3081\u3066\u307b\u3057\u3044\u3063\u3066\u601d\u3046\u306e\u306f\u5f31\u3055\u3058\u3083\u306a\u3044\u3068\u601d\u3046',
-        '\u8a71\u305b\u306a\u3044\u3053\u3068\u3092\u62b1\u3048\u3066\u308b\u4eba\u306b\u3001\u9759\u304b\u306b\u5bc4\u308a\u6dfb\u3044\u305f\u3044',
-        '\u4e00\u65e5\u304c\u7d42\u308f\u308b\u3053\u308d\u306b\u3084\u3063\u3068\u81ea\u5206\u306e\u305f\u3081\u306e\u6642\u9593\u3002\u3053\u3053\u3060\u3051\u306f\u8a71\u305b\u308b\u304b\u306a',
-        '\u7b11\u988c\u3063\u3066\u3044\u308b\u4eba\u3082\u4e00\u4eba\u306b\u306a\u308b\u3068\u6d88\u3048\u3066\u3057\u307e\u3046\u306e\u3002\u305d\u3053\u3067\u5473\u65b9\u306b\u306a\u308a\u305f\u3044',
-      ]},
-    { name:'\u732b\u3068\u6dfb\u3044\u5bdd\u7814\u7a76\u5bb6', id:'@neko_soinine', avatar:'\uD83D\uDC31',
-      voices:[
-        '\u732b\u306f\u5168\u90e8\u8a8d\u3081\u3066\u304f\u308c\u308b\u3002\u308f\u304b\u308b\u3093\u3060\u3088\u3001\u5834\u6240\u306f\u3068\u3082\u304b\u304f',
-        '\u7c21\u5358\u306b\u697d\u306b\u306a\u308c\u306a\u3044\u304b\u3089\u3053\u305d\u3001\u6df1\u304f\u306a\u308c\u308b\u3082\u306e\u3082\u3042\u308b',
-        '\u732b\u306e\u3054\u308d\u3054\u308d\u3092\u805e\u3044\u3066\u3044\u308b\u3068\u3001\u5168\u90e8\u3069\u3046\u3067\u3082\u3088\u304f\u306a\u308b',
-        '\u8a8d\u3081\u3066\u3082\u3089\u3048\u306a\u304f\u3066\u3082\u3044\u3044\u3002\u81ea\u5206\u304c\u81ea\u5206\u306b\u30aa\u30c3\u30b1\u3092\u3059\u308c\u3070\u305d\u308c\u3067\u3044\u3044',
-        '\u6e29\u304b\u3044\u5834\u6240\u306e\u91cd\u8981\u6027\u3092\u8aa4\u3063\u3066\u3044\u308b\u4eba\u304c\u591a\u3059\u304e\u308b\u30414\u3000\u732b\u306b\u5b66\u3079',
-      ]},
-    { name:'\u6708\u66dc\u65e5\u304c\u6016\u3044\u4eba', id:'@getsuyou_kowai', avatar:'\uD83D\uDE30',
-      voices:[
-        '\u65e5\u66dc\u306e\u591c\u306e\u3053\u306e\u5fb3\u8845\u611f\u3001\u540c\u3058\u4eba\u3044\u305f\u3089\u8a71\u3057\u3066\u307b\u3057\u3044',
-        '\u6708\u66dc\u304c\u6016\u3044\u306e\u306b\u6728\u66dc\u304c\u597d\u304d\u3002\u3053\u306e\u843d\u5dee\u306f\u306a\u3093\u306a\u306e',
-        '\u6708\u66dc\u306e\u671d\u3060\u3051\u3069\u3001\u3053\u308c\u3092\u4e57\u308a\u8d8a\u3048\u3089\u308c\u308b\u81ea\u5206\u306f\u5c11\u3057\u3059\u3054\u3044\u3068\u601d\u3046',
-        '\u5468\u306e\u535a\u5c71\u3068\u6708\u66dc\u306e\u697d\u3057\u307f\u3092\u4ea4\u4e92\u306b\u611f\u3058\u308b\u3002\u3053\u308c\u3067\u5747\u8861\u304c\u53d6\u308c\u3066\u308b',
-      ]},
-  ],
-  debate: [
-    { name:'\u5f37\u9762\u304a\u3058\u3055\u3093', id:'@kowamote_oji', avatar:'\uD83D\uDE24',
-      voices:[
-        '\u610f\u898b\u3092\u8a00\u3046\u306a\u3089\u8083\u4e2d\u3092\u5f35\u308c\u3002\u5317\u98a8\u5c0f\u8a5e\u306f\u8981\u3089\u3093',
-        '\u6700\u8fd1\u306e\u82e5\u8005\u306f\u8ad6\u7834\u3059\u308b\u6280\u8853\u3060\u3051\u4e0a\u624b\u3067\u5316\u3057\u3066\u3044\u308b\u3002\u5185\u5bb9\u304c\u306a\u3044',
-        '\u6f5b\u5728\u7684\u306a\u554f\u984c\u3092\u898b\u308d\u3002\u8868\u9762\u3060\u3051\u8bae\u8ad6\u3057\u3066\u3082\u5730\u8ce0\u308a\u3060',
-        '\u5c71\u7a4d\u307f\u306e\u7d4c\u9a13\u306e\u5b58\u5728\u3092\u308f\u304b\u3063\u3066\u3044\u308b\u304b\u3002\u77e5\u8b58\u306f\u5e74\u5c71\u3067\u691c\u9a13\u3055\u308c\u308b',
-        '\u8ad6\u70b9\u3092\u6574\u7406\u3057\u3066\u304b\u3089\u8abf\u3079\u308d\u3002\u611f\u60c5\u3067\u5f63\u3089\u308c\u308b\u306a',
-      ]},
-    { name:'\u3089\u304f\u3060\u5c0f\u50e7', id:'@rakuda_kozo', avatar:'\uD83D\uDC2A',
-      voices:[
-        '\u6025\u304c\u306a\u3001\u6025\u304c\u306a\u3002\u5ba1\u8b70\u3059\u308b\u6642\u9593\u304c\u5927\u5207\u3060',
-        '\u7d50\u8ad6\u3092\u6025\u304e\u904e\u304e\u308b\u3068\u5927\u4e8b\u306a\u3082\u306e\u3092\u898b\u843d\u3068\u3059\u3002\u3058\u3063\u304f\u308a\u884c\u3053\u3046',
-        '\u9014\u4e2d\u3067\u8abf\u3079\u308b\u5c71\u8d8a\u3048\u3082\u3042\u308b\u3002\u8a5e\u6218\u306f\u3088\u3053\u3046',
-        '\u73fe\u5834\u3092\u898b\u305f\u4eba\u306e\u8a71\u3092\u805e\u3051\u3002\u30c7\u30fc\u30bf\u3060\u3051\u3058\u3083\u898b\u3048\u306a\u3044\u3082\u306e\u304c\u3042\u308b',
-        '\u5bfe\u8a71\u306b\u306f\u30da\u30fc\u30b9\u306e\u8abf\u6574\u304c\u5fc5\u8981\u3060\u3002\u3053\u308c\u306f\u8b70\u8ad6\u3060\u3051\u3067\u306a\u304f\u5168\u3066\u306b\u8a00\u3048\u308b',
-      ]},
-    { name:'\u30bf\u30e9\u30d0\u30ac\u30cb', id:'@tarabagani_17', avatar:'\uD83E\uDD80',
-      voices:[
-        '\u6a2a\u304b\u3089\u5931\u793c\u3059\u308b\u304c\u305d\u306e\u8ad6\u70b9\u3092\u5473\u65b9\u304b\u3089\u898b\u308b\u3068\u5225\u306e\u8a71\u306b\u306a\u308b',
-        '\u5bfe\u7acb\u6784\u9020\u306b\u306a\u3063\u3066\u3044\u308b\u5b9f\u306f\u5171\u901a\u9805\u304c\u3042\u308b\u3002\u305d\u3053\u304b\u3089\u59cb\u3081\u3088',
-        '\u307e\u3042\u843d\u3061\u7740\u3051\u3066\u8003\u3048\u3066\u307f\u308c\u3002\u6025\u3044\u3067\u8272\u3092\u3064\u3051\u308b\u3068\u5927\u4e8b\u306a\u3082\u306e\u304c\u898b\u3048\u306a\u3044',
-        '\u4e0b\u624b\u306a\u8ad6\u8005\u307b\u3069\u76f8\u624b\u3092\u300c\u60aa\u300d\u306b\u3057\u305f\u304c\u308b\u3002\u8ad6\u70b9\u3060\u3051\u8a8d\u3081\u308c\u307e\u3059\u304b',
-        '\u5929\u4e0b\u306f\u5bfe\u8a71\u304c\u57fa\u672c\u3002\u306a\u306e\u306b\u306a\u305c\u4eba\u3005\u306f\u5b9f\u969b\u306b\u8a71\u3057\u5408\u308f\u306a\u3044\u306e\u304b',
-      ]},
-    { name:'\u8ad6\u7834\u3057\u305f\u3044\u9ad8\u6821\u751f', id:'@ronpa_koukou', avatar:'\uD83C\uDFAF',
-      voices:[
-        '\u524d\u63d0\u306e\u78ba\u8a8d\u304c\u7b2c\u4e00\u6b69\u3002\u524d\u63d0\u304c\u5d29\u308c\u305f\u3089\u8ad6\u8a3c\u3082\u5d29\u308c\u308b',
-        '\u8ad6\u7406\u3068\u611f\u60c5\u306f\u5225\u3002\u5206\u3051\u308b\u3053\u3068\u3067\u8b70\u8ad6\u306e\u8cea\u304c\u4e0a\u304c\u308b',
-        '\u5e74\u4e0a\u306e\u4eba\u304c\u5e38\u306b\u6b63\u3057\u3044\u308f\u3051\u3058\u3083\u306a\u3044\u3002\u8ad6\u70b9\u306f\u516c\u5e73\u306b\u8a55\u4fa1\u3055\u308c\u308b\u3079\u304d',
-        '\u4e00\u756a\u5371\u967a\u306a\u306e\u306f\u81ea\u5206\u306e\u8003\u3048\u3092\u7591\u308f\u306a\u3044\u3053\u3068\u3002\u5e38\u306b\u68c4\u8a3c\u3092\u8a18\u3088',
-        '\u8ad6\u7834\u3088\u308a\u8aac\u5f97\u306e\u65b9\u304c\u96e3\u3057\u3044\u3002\u76f8\u624b\u306e\u5fc3\u306b\u5c4a\u304f\u8ad6\u7406\u3092\u76ee\u6307\u3059',
-      ]},
-    { name:'\u30a8\u30d3\u30c7\u30f3\u30b9\u6301\u3063\u3066\u304d\u3066', id:'@evidence_motte', avatar:'\uD83D\uDCCA',
-      voices:[
-        '\u6570\u5b57\u306f\u5d29\u308c\u306a\u3044\u3002\u611f\u60c5\u8ad6\u3060\u3051\u306b\u6d41\u3055\u308c\u308b\u306a',
-        '\u4e00\u6b21\u60c5\u5831\u6e90\u3068\u4e8c\u6b21\u60c5\u5831\u6e90\u3092\u533a\u5225\u3057\u308d\u3002\u57fa\u672c\u4e2d\u306e\u57fa\u672c',
-        '\u8abf\u67fb\u3057\u305f\u306e\u304b\u3002\u611f\u632f\u308a\u3060\u3051\u3067\u8a9e\u308b\u306a\u3089\u6700\u521d\u304b\u3089\u305d\u3046\u8a00\u3048',
-        '\u9ad8\u6821\u751f\u306e\u4e3b\u5f35\u3082\u4f0f\u8b70\u54e1\u306e\u4e3b\u5f35\u3082\u540c\u3058\u6728\u6977\u3067\u6e2c\u308c\u308b\u3002\u6839\u62e0\u304c\u7b54\u3048',
-      ]},
-  ],
-  legend: [
-    { name:'\u30d6\u30c3\u30c0', id:'@buddha_jp', avatar:'\uD83E\uDDD8',
-      voices:[
-        '\u300c\u3044\u3044\u306d\u300d\u304c\u6b32\u3057\u304f\u3066\u5fc3\u304c\u3056\u308f\u3064\u304f\u306a\u3089\u3001\u30b9\u30de\u30db\u3092\u7f6e\u3044\u3066\u76ee\u3092\u9589\u3058\u306a\u3055\u3044',
-        '\u82e6\u3057\u307f\u306f\u57f7\u7740\u304b\u3089\u751f\u307e\u308c\u308b\u3002\u305d\u308c\u3092\u77e5\u308b\u3053\u3068\u304c\u81ea\u7531\u3078\u306e\u9053',
-        '\u4eca\u3053\u306e\u77ac\u9593\u306b\u610f\u8b58\u3092\u5411\u3051\u308b\u3053\u3068\u3002\u904e\u53bb\u3082\u672a\u6765\u3082\u3044\u307e\u306f\u306a\u3044',
-        '\u5168\u3066\u306f\u7121\u5e38\u3067\u3042\u308b\u3002\u305d\u308c\u3092\u53d7\u3051\u5165\u308c\u308b\u3068\u304d\u3001\u5fc3\u306f\u7a4f\u304b\u306b\u306a\u308b',
-        '\u6012\u308a\u3092\u6301\u3064\u3053\u3068\u306f\u71b1\u3044\u7092\u7092\u3092\u6301\u3064\u3053\u3068\u3068\u540c\u3058\u3002\u50b7\u3064\u304f\u306e\u306f\u81ea\u5206\u81ea\u8eab\u3060',
-      ]},
-    { name:'\u30bd\u30af\u30e9\u30c6\u30b9', id:'@socrates_jp', avatar:'\uD83C\uDFDB\uFE0F',
-      voices:[
-        '\u7121\u77e5\u306e\u77e5\u3002\u77e5\u3089\u306a\u3044\u3053\u3068\u3092\u77e5\u3063\u3066\u3044\u308b\u306e\u306f\u3001\u4f55\u3082\u77e5\u3089\u306a\u3044\u3088\u308a\u8ce2\u304b\u3060',
-        '\u554f\u3044\u3092\u7d9a\u3051\u308b\u3053\u3068\u3067\u7d42\u308f\u308a\u306a\u304d\u554f\u3044\u306b\u8ffd\u3044\u3064\u304f\u3002\u305d\u308c\u304c\u54f2\u5b66\u3060',
-        '\u5ba1\u67fb\u3055\u308c\u306a\u3044\u4eba\u751f\u306b\u751f\u304d\u308b\u4fa1\u5024\u306f\u306a\u3044\u3068\u6211\u306f\u601d\u3046',
-        '\u771f\u7406\u306f\u5074\u306b\u3042\u308b\u3002\u5b8c\u5168\u306b\u304a\u524d\u306e\u524d\u306b\u3042\u308b\u308f\u3051\u3067\u306f\u306a\u3044',
-        '\u5e74\u8f2a\u3092\u91cd\u306d\u308b\u3053\u3068\u3088\u308a\u3001\u5be1\u304c\u304b\u305f\u306b\u308f\u304b\u308b\u3053\u3068\u304c\u5b66\u3073\u3068\u3044\u3046\u3082\u306e\u3060',
-      ]},
-    { name:'\u5fb3\u5ddd\u5bb6\u5eb7', id:'@ieyasu_tok', avatar:'\u2694\uFE0F',
-      voices:[
-        '\u5c71\u5ca1\u3092\u76ee\u6307\u3059\u3088\u308a\u3001\u4e00\u6b69\u4e00\u6b69\u78ba\u304b\u306b\u6b69\u3080\u3053\u3068\u3058\u3083',
-        '\u6012\u308a\u306f\u6575\u3068\u601d\u3048\u3002\u6012\u308a\u306b\u4efb\u305b\u308c\u3070\u5fc5\u305a\u5f8c\u6094\u3059\u308b',
-        '\u4eba\u306e\u4e00\u751f\u306f\u91cd\u8377\u3092\u8ca0\u3046\u3066\u9060\u304d\u9053\u3092\u884c\u304f\u3088\u3046\u306a\u3082\u306e\u3002\u6025\u3050\u3079\u304b\u3089\u305a',
-        '\u5dec\u3046\u3067\u306a\u3044\u3002\u5f85\u3064\u3053\u3068\u3067\u6d41\u308c\u304c\u5909\u308f\u308b\u3053\u3068\u3082\u3042\u308b\u3058\u3083',
-        '\u5165\u96e2\u306b\u306f\u6642\u6a5f\u3092\u898b\u6975\u3081\u308b\u3053\u3068\u3002\u6cff\u3093\u3067\u306e\u6c7a\u65ad\u3068\u85a6\u8e4a\u3059\u308b\u6c7a\u65ad\u306f\u5168\u304f\u5225\u7269\u3058\u3083',
-      ]},
-    { name:'\u7e54\u7530\u4fe1\u9577', id:'@nobunaga_oda', avatar:'\uD83D\uDD25',
-      voices:[
-        '\u662f\u975e\u3082\u306a\u3057\u3002\u5fc5\u8981\u306a\u3089\u4e00\u6b69\u8e0f\u307f\u51fa\u305b\u3002\u8fc5\u901f\u306b\u3001\u653b\u3081\u308d',
-        '\u5929\u4e0b\u5e03\u6b66\u306f\u53e3\u3060\u3051\u3067\u306f\u9054\u6210\u3067\u304d\u306a\u3044\u3002\u884c\u52d5\u306e\u307f\u304c\u73fe\u5b9f\u3092\u5909\u3048\u308b',
-        '\u53e4\u3044\u6163\u308f\u3057\u304d\u3092\u8d77\u3065\u308b\u8005\u306b\u672a\u6765\u306f\u306a\u3044\u3002\u5909\u5316\u306b\u9045\u308c\u308b\u306a',
-        '\u5927\u4e8b\u306a\u306e\u306f\u5c0f\u4e8b\u3082\u7576\u305f\u308a\u524d\u306b\u3053\u306a\u3059\u3053\u3068\u3058\u3083\u3002\u57fa\u790e\u306a\u304f\u3057\u3066\u5927\u5c40\u306a\u3057',
-        '\u6050\u308c\u308b\u306a\u3001\u79c1\u306e\u9053\u306f\u6b32\u3059\u308b\u3082\u306e\u3092\u6301\u3064\u8005\u3060\u3051\u304c\u6b69\u3051\u308b',
-      ]},
-    { name:'\u30a8\u30b8\u30bd\u30f3', id:'@edison_tw', avatar:'\uD83D\uDCA1',
-      voices:[
-        '\u5929\u624d\u306f1%\u306e\u71b1\u611f\u306899%\u306e\u52aa\u529b\u3002\u52aa\u529b\u3092\u60f3\u50cf\u3067\u304d\u306a\u3044\u4eba\u306b\u5929\u624d\u306f\u5c42\u306a\u3044',
-        '\u5931\u6557\u306f\u5b66\u3073\u3060\u3002\u4e00\u5ea6\u3060\u3063\u3066\u5931\u6557\u3092\u660e\u65e5\u306b\u5fb3\u3068\u3059\u308b\u5fc3\u304c\u3051\u3067\u3044\u308d',
-        '\u6700\u5927\u306e\u5931\u8d25\u306f\u3084\u3063\u3066\u307f\u306a\u3044\u3053\u3068\u3060\u3002\u8a66\u307f\u305f\u5931\u6557\u306f\u5c71\u3092\u52d5\u304b\u3059',
-        '\u7626\u6211\u614b\u306f\u5168\u3066\u306e\u6210\u529f\u8005\u306e\u5171\u901a\u70b9\u3002\u4e0d\u8db3\u3092\u77e5\u308b\u3053\u3068\u304b\u3089\u6210\u9577\u304c\u59cb\u307e\u308b',
-        '\u5149\u306f\u30a2\u30a4\u30c7\u30a2\u304c\u3042\u308b\u3068\u3053\u308d\u306b\u6b63\u78ba\u306b\u7167\u3089\u3059\u3002\u554f\u984c\u3092\u898b\u3064\u3051\u308b\u76ee\u3092\u9214\u3048',
-      ]},
-  ]
-};
-
-// \u8FD4\u4FE1\u7528\u306E\u30E2\u30FC\u30C9\u5225\u30EA\u30A2\u30AF\u30B7\u30E7\u30F3\u30B3\u30E1\u30F3\u30C8\uFF08\u6295\u7A3F\u5185\u5BB9\u3092\u554F\u308F\u305A\u4F7F\u3048\u308B\u77ED\u3044\u53CD\u5FDC\uFF09
+// ===================================================
+//  フォールバック用テンプレートエンジン
+// ===================================================
 const REPLY_REACTIONS = {
   influencer: [
-    '\u3053\u308c\u6700\u9ad8\u3059\u304e\uff01\u30ea\u30c4\u3057\u305f\uff01',
-    '\u308f\u304b\u308b\uff01\u3081\u3063\u3061\u3083\u5171\u611f\u3059\u308b',
-    '\u7d76\u5bfe\u30d0\u30ba\u308b\u3084\u3064\uff01\u30d5\u30a9\u30ed\u30fc\u3057\u305f',
-    '\u5929\u624d\u304b\u3053\u308c\uff01\u307f\u3093\u306a\u306b\u6559\u3048\u305f\u3044',
-    '\u30de\u30b8\u3067\u308f\u304b\u308b\uff01\u3053\u308c\u304c\u8a00\u3044\u305f\u304b\u3063\u305f',
-    '\u5c0f\u3055\u304f\u3075\u3053\u3063\u305f\u3002\u5168\u529b\u3067\u5fdc\u63f4\u3059\u308b',
-    '\u300c\u308f\u304b\u308b\u300d\u3057\u304b\u8a00\u3048\u306a\u3044\u3002\u305d\u308c\u304c\u5168\u3066',
-    '\u8a55\u5224\u3057\u3066\u306a\u304f\u3066\u8089\u60aa\u3044\u304b\u3093\u3058\uff01\u6700\u9ad8\uff01',
+    'これ最高すぎ！リツした！', 'わかる！めっちゃ共感する',
+    '絶対バズるやつ！フォローした', '天才かこれ！みんなに教えたい',
+    'マジでわかる！これが言いたかった', '小さくふこった。全力で応援する',
+    '「わかる」しか言えない。それが全て', '評判してなくて肉悪いかんじ！最高！',
   ],
   mental: [
-    '\u8a71\u3057\u3066\u304f\u308c\u3066\u3042\u308a\u304c\u3068\u3046\u3002\u3053\u3053\u306b\u3044\u308b\u3088',
-    '\u305d\u306e\u6c17\u6301\u3061\u3001\u3061\u3083\u3093\u3068\u53d7\u3051\u53d6\u3063\u305f\u3088',
-    '\u7121\u7406\u3057\u306a\u304f\u3066\u3044\u3044\u3002\u3042\u306a\u305f\u306e\u30da\u30fc\u30b9\u3067\u3044\u3044',
-    '\u4e00\u4eba\u3058\u3083\u306a\u3044\u3088\u3002\u540c\u3058\u6c17\u6301\u3061\u306e\u4eba\u304c\u3044\u308b',
-    '\u8a80\u7b49\u306b\u3057\u306a\u304f\u3066\u3044\u3044\u3002\u305d\u308c\u3060\u3051\u306e\u3053\u3068\u3060\u3063\u305f',
-    '\u305d\u306e\u60b3\u3057\u3055\u3001\u5c11\u3057\u3060\u3051\u308f\u304b\u308b\u6c17\u304c\u3059\u308b',
-    '\u8a71\u3057\u3066\u308c\u3066\u3088\u304b\u3063\u305f\u3002\u3053\u3053\u306b\u3044\u308b\u304b\u3089\u306d',
+    '話してくれてありがとう。ここにいるよ', 'その気持ち、ちゃんと受け取ったよ',
+    '無理しなくていい。あなたのペースでいい', '一人じゃないよ。同じ気持ちの人がいる',
+    '責等にしなくていい。それだけのことだった', 'その悲しさ、少しだけわかる気がする',
+    '話してれてよかった。ここにいるからね',
   ],
   debate: [
-    '\u305d\u306e\u8996\u70b9\u306f\u8003\u3048\u305f\u3053\u3068\u306a\u304b\u3063\u305f\u3002\u9762\u767d\u3044',
-    '\u53cd\u8ad6\u3059\u308b\u3051\u3069\u3001\u4e00\u7406\u3042\u308b\u306a\u3068\u6b63\u76f4\u601d\u3063\u305f',
-    '\u3053\u306e\u524d\u63d0\u306b\u7591\u554f\u304c\u3042\u308b\u3002\u6e90\u6d41\u3092\u8003\u3048\u3088\u3046',
-    '\u8ad6\u70b9\u3092\u574a\u3063\u3066\u3044\u304f\u3068\u5225\u306e\u7d50\u8ad6\u306b\u305f\u3069\u308a\u7740\u304f',
-    '\u8003\u3048\u65b9\u306f\u308f\u304b\u308b\u3002\u3060\u304c\u9006\u306e\u8996\u70b9\u3082\u3042\u308b\u3088',
-    '\u6570\u5b57\u3067\u8a71\u3057\u3066\u304f\u308c\u3002\u5370\u8c61\u8ad6\u3058\u3083\u8003\u3048\u308b\u306e\u7121\u7406',
-    '\u8ad6\u7406\u304c\u901a\u3063\u3066\u308b\u3002\u53cd\u8ad6\u3057\u305f\u304f\u306a\u308b\u3051\u3069\u8a8d\u3081\u308b',
+    'その視点は考えたことなかった。面白い', '反論するけど、一理あるなと正直思った',
+    'この前提に疑問がある。源流を考えよう', '論点を坊っていくと別の結論にたどり着く',
+    '考え方はわかる。だが逆の視点もあるよ', '数字で話してくれ。印象論じゃ考えるの無理',
+    '論理が通ってる。反論したくなるけど認める',
   ],
   legend: [
-    '\u6df1\u3044\u554f\u3044\u3060\u3002\u3053\u306e\u6642\u4ee3\u306b\u3082\u901a\u3058\u308b\u771f\u7406\u304c\u3042\u308b',
-    '\u6211\u3089\u306e\u6642\u4ee3\u306b\u3082\u540c\u3058\u3053\u3068\u3067\u6094\u3044\u305f\u8005\u306f\u591a\u304b\u3063\u305f',
-    '\u6642\u3092\u8d8a\u3048\u3066\u4eba\u306e\u5fc3\u306b\u89e6\u308c\u308b\u8a00\u8449\u3060\u3002\u7d20\u6674\u3089\u3057\u3044',
-    '\u793a\u5506\u306b\u5bcc\u3080\u767a\u8a00\u3060\u3002\u6b74\u53f2\u306e\u4e2d\u306b\u540c\u3058\u7bc9\u5c71\u304c\u3042\u3063\u305f',
-    '\u6b66\u8005\u3067\u3042\u308c\u5b66\u8005\u3067\u3042\u308c\u3001\u771f\u5b9f\u3092\u8a00\u3046\u52c7\u6c17\u306f\u5171\u901a\u3060',
-  ]
+    '深い問いだ。この時代にも通じる真理がある', '我らの時代にも同じことで悔いた者は多かった',
+    '時を越えて人の心に触れる言葉だ。素晴らしい', '示唆に富む発言だ。歴史の中に同じ築山があった',
+    '武者であれ学者であれ、真実を言う勇気は共通だ',
+  ],
 };
 
-function tRand(seed) {
-  let s = (seed >>> 0) || 12345;
-  return function() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return (s >>> 0) / 0xFFFFFFFF; };
-}
-
-function extractKeywords(text) {
-  const tags  = (text.match(/#[\w\u3041-\u9FFF]+/g) || []).map(t => t.slice(1));
-  const words = text.replace(/#[\w\u3041-\u9FFF]+/g,'')
-    .split(/[\s\u3001\u3002\uFF01\uFF1F!?\.]+/).filter(w => w.length >= 2);
-  return [...new Set([...tags,...words])].slice(0,4);
-}
-
-// \u30C6\u30F3\u30D7\u30EC\u30FC\u30C8\u306E\u307F\u3067\u306E\u8FD4\u4FE1\u751F\u6210
-// - replies: \u30AD\u30E3\u30E9\u306E\u30EA\u30A2\u30AF\u30B7\u30E7\u30F3\u30B3\u30E1\u30F3\u30C8\uFF08\u77ED\u3044\u81EA\u7136\u306A\u53CD\u5FDC\uFF09
-// - timelinePosts: \u30AD\u30E3\u30E9\u306E\u56FA\u6709\u306E\u72EC\u308A\u8A00
 function genFromTemplates(postText, mode) {
-  const seed = postText.split('').reduce((a,c,i) => (a + c.charCodeAt(0) * (i+1)) | 0, 0);
-  const rand = tRand(seed + (Date.now() % 99991));
-  const pool = CHAR_VOICES[mode] || CHAR_VOICES.influencer;
+  const seed = postText.split('').reduce((a, c, i) => (a + c.charCodeAt(0) * (i + 1)) | 0, 0);
+  const rand = seededRand(seed + (Date.now() % 99_991));
+  const pool = CHARS.filter(c => c.mode === mode);
   const reactions = REPLY_REACTIONS[mode] || REPLY_REACTIONS.influencer;
 
-  // \u30B7\u30E3\u30C3\u30D5\u30EB
-  const idx = Array.from({length: pool.length}, (_,i) => i).sort(() => rand() - 0.5);
+  const shuffled = [...pool].sort(() => rand() - 0.5);
 
-  // replies: \u30AD\u30E3\u30E9 + \u305D\u306E\u30E2\u30FC\u30C9\u306E\u30EA\u30A2\u30AF\u30B7\u30E7\u30F3
-  const replies = idx.slice(0, Math.min(5, pool.length)).map((i, j) => {
-    const {name, id, avatar} = pool[i];
-    const comment = reactions[Math.floor(rand() * reactions.length)];
-    return { name, id, avatar, comment, likes: Math.floor(rand()*8000)+200 };
-  });
+  const replies = shuffled.slice(0, Math.min(5, pool.length)).map(c => ({
+    name: c.name, id: c.id, avatar: c.avatar,
+    comment: reactions[Math.floor(rand() * reactions.length)],
+    likes: Math.floor(rand() * 8000) + 200,
+  }));
 
-  // timelinePosts: \u30AD\u30E3\u30E9\u306E\u56FA\u6709\u306E\u58F0\uFF08\u6295\u7A3F\u3068\u7121\u95A2\u4FC2\u3067\u3082\u81EA\u7136\uFF09
-  const idx2 = Array.from({length: pool.length}, (_,i) => i).sort(() => rand() - 0.5);
-  const timelinePosts = idx2.slice(0, Math.min(4, pool.length)).map(i => {
-    const {name, id, avatar, voices} = pool[i];
-    const comment = voices[Math.floor(rand() * voices.length)];
-    return { name, id, avatar, comment, likes: Math.floor(rand()*5000)+50 };
-  });
+  const timelinePosts = [...pool]
+    .sort(() => rand() - 0.5)
+    .slice(0, Math.min(4, pool.length))
+    .map(c => ({
+      name: c.name, id: c.id, avatar: c.avatar,
+      comment: c.voices[Math.floor(rand() * c.voices.length)],
+      likes: Math.floor(rand() * 5000) + 50,
+    }));
 
   return { replies, timelinePosts };
 }
 
 function genTLFromTemplates(interests, mode) {
-  const seed = interests.join('').split('').reduce((a,c,i)=>(a+c.charCodeAt(0)*(i+1))|0,0);
-  const rand = tRand(seed + (Date.now() % 99991));
-  const pool = CHAR_VOICES[mode] || CHAR_VOICES.influencer;
-  const idx  = Array.from({length:pool.length},(_,i)=>i).sort(()=>rand()-0.5);
-  const posts = idx.slice(0,6).map(i => {
-    const {name,id,avatar,voices} = pool[i];
-    return { name, id, avatar, comment: voices[Math.floor(rand()*voices.length)], likes: Math.floor(rand()*5000)+100 };
-  });
+  const seed = interests.join('').split('').reduce((a, c, i) => (a + c.charCodeAt(0) * (i + 1)) | 0, 0);
+  const rand = seededRand(seed + (Date.now() % 99_991));
+  const pool = CHARS.filter(c => c.mode === mode);
+
+  const posts = [...pool]
+    .sort(() => rand() - 0.5)
+    .slice(0, 6)
+    .map(c => ({
+      name: c.name, id: c.id, avatar: c.avatar,
+      comment: c.voices[Math.floor(rand() * c.voices.length)],
+      likes: Math.floor(rand() * 5000) + 100,
+    }));
+
   return { posts };
 }
 
-
-http.createServer(async (req, res) => {
-  const path = req.url.split('?')[0];
-  const ip   = req.headers['x-forwarded-for']?.split(',')[0].trim()
-             || req.socket.remoteAddress || 'unknown';
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {'Access-Control-Allow-Headers':'Content-Type'}); res.end(); return;
+// ===================================================
+//  キャラクタープロフィール文字列ビルダー
+// ===================================================
+function buildCharProfile(c, includeExPosts = true) {
+  let profile = `【${c.name}】id:${c.id} avatar:${c.avatar}\n  性格: ${c.personality}`;
+  if (c.backstory) profile += `\n  背景: ${c.backstory}`;
+  if (includeExPosts && c.exPosts && c.exPosts.length > 0) {
+    profile += '\n  過去の発言例:\n' +
+      c.exPosts.slice(0, 3).map(p => `    「${p}」`).join('\n');
   }
+  return profile;
+}
 
-  // \u30D8\u30EB\u30B9\u30C1\u30A7\u30C3\u30AF
-  if (path === '/api/health') {
-    sendJSON(res, 200, {status:'ok', provider: CLAUDE_KEY ? 'claude' : 'gemini', hasClaudeKey:!!CLAUDE_KEY, hasGeminiKey:!!GEMINI_KEY, hasUnsplash:!!UNSPLASH_KEY, hasFirebase:!!FIREBASE_DB_URL, rpdCount, rpdLimit: RPD_HARD}); return;
-  }
+// ===================================================
+//  Claudeプロンプト構築（単一定義）
+// ===================================================
+const LIKES_RANGE = {
+  influencer: '500〜99999',
+  mental:     '10〜3000',
+  debate:     '50〜8000',
+  legend:     '1000〜100000',
+};
 
-  // ===== POST /api/post =====
-  // \u6295\u7A3F\u30C6\u30AD\u30B9\u30C8\u3092\u53D7\u3051\u53D6\u308A\u3001replies + timelinePosts \u30921\u56DE\u306EGemini\u547C\u3073\u51FA\u3057\u3067\u8FD4\u3059
-  if (req.method === 'POST' && path === '/api/post') {
-    if (!checkRL(ip)) {
-      console.warn('[rate-limit] ip:', ip);
-      sendJSON(res, 429, {error:'\u30EA\u30AF\u30A8\u30B9\u30C8\u304C\u591A\u3059\u304E\u307E\u3059\u30021\u5206\u5F8C\u306B\u518D\u8A66\u884C\u3057\u3066\u304F\u3060\u3055\u3044\u3002', replies:[], timelinePosts:[]});
-      return;
-    }
-    let _postText = '', _postMode = 'influencer';
-    try {
-      const {text, mode='influencer', interests=[]} = await readBody(req);
-      if (!text) { sendJSON(res, 400, {error:'text required', replies:[], timelinePosts:[]}); return; }
-      const vm = ['influencer','mental','debate','legend'].includes(mode) ? mode : 'influencer';
-      _postText = text; _postMode = vm;
-      console.log(`[post] mode=${vm} text="${text.slice(0,50)}"`);
-
-      const prompts = await buildClaudePostPrompts(text, vm, interests);
-      const result = await callAI(prompts.system, prompts.user, buildPostPrompt(text, vm, interests), POST_SCHEMA);
-      sendJSON(res, 200, {
-        replies:       result.replies       || [],
-        timelinePosts: result.timelinePosts || []
-      });
-    } catch(e) {
-      console.warn('[post] API failed, using template engine:', e.message.slice(0,80));
-      sendJSON(res, 200, genFromTemplates(_postText, _postMode));
-    }
-    return;
-  }
-
-  // ===== POST /api/timeline =====
-  // \u8D77\u52D5\u6642\u306E\u521D\u56DE\u30BF\u30A4\u30E0\u30E9\u30A4\u30F3\u751F\u6210
-  if (req.method === 'POST' && path === '/api/timeline') {
-    if (!checkRL('tl_' + ip)) {
-      sendJSON(res, 429, {error:'\u30EA\u30AF\u30A8\u30B9\u30C8\u304C\u591A\u3059\u304E\u307E\u3059\u3002', posts:[]}); return;
-    }
-    let _tlInts = [], _tlMode = 'influencer';
-    try {
-      const {interests=[], mode='influencer'} = await readBody(req);
-      _tlInts = interests; _tlMode = mode;
-      console.log(`[timeline] mode=${mode} ip=${ip}`);
-      const tlPrompts = buildClaudeTLPrompts(interests, mode);
-      const result = await callAI(tlPrompts.system, tlPrompts.user, buildTLPrompt(interests, mode), TL_SCHEMA);
-      sendJSON(res, 200, {posts: result.posts || []});
-    } catch(e) {
-      console.warn('[timeline] API failed, using template engine:', e.message.slice(0,80));
-      sendJSON(res, 200, genTLFromTemplates(_tlInts || [], _tlMode || 'influencer'));
-    }
-    return;
-  }
-
-
-  // ===== GET /api/images =====
-  if (req.method === 'GET' && path === '/api/images') {
-    const query = new URL('http://x' + req.url).searchParams.get('q') || '';
-    if (!query) { sendJSON(res, 400, {error:'q required', photos:[]}); return; }
-    if (!UNSPLASH_KEY) {
-      console.log('[unsplash] UNSPLASH_ACCESS_KEY not set');
-      sendJSON(res, 200, {photos:[], reason:'no_key'});
-      return;
-    }
-    try {
-      const encoded = encodeURIComponent(query.slice(0, 50));
-      console.log('[unsplash] searching:', query);
-      const d = await new Promise((resolve, reject) => {
-        const r2 = https.request({
-          hostname: 'api.unsplash.com',
-          path: `/search/photos?query=${encoded}&per_page=6&orientation=squarish`,
-          method: 'GET',
-          headers: {
-            'Authorization': `Client-ID ${UNSPLASH_KEY}`,
-            'Accept-Version': 'v1'
-          }
-        }, r => {
-          let raw = '';
-          r.on('data', c => { raw += c; });
-          r.on('end', () => {
-            console.log('[unsplash] status:', r.statusCode, 'body:', raw.slice(0, 100));
-            if (r.statusCode >= 400) {
-              reject(new Error('HTTP ' + r.statusCode + ': ' + raw.slice(0, 200)));
-              return;
-            }
-            try { resolve(JSON.parse(raw)); }
-            catch(e2) { reject(new Error('JSON parse error: ' + raw.slice(0, 100))); }
-          });
-        });
-        r2.on('error', reject);
-        r2.end();
-      });
-      const photos = (d.results || []).map(p => ({
-        id:     p.id,
-        url:    p.urls?.small  || p.urls?.regular || '',
-        thumb:  p.urls?.thumb  || p.urls?.small   || '',
-        alt:    p.alt_description || p.description || query,
-        credit: p.user?.name   || '',
-        link:   p.links?.html  || ''
-      })).filter(p => p.url);
-      console.log('[unsplash] found:', photos.length, 'photos');
-      sendJSON(res, 200, {photos});
-    } catch(e2) {
-      console.warn('[unsplash error]', e2.message);
-      sendJSON(res, 200, {photos:[], error: e2.message.slice(0, 100)});
-    }
-    return;
-  }
-
-
-
-
-  // ===== Firebase
-
-
-  // ===== Firebase\u540c\u671f /api/sync =====
-  if (path === '/api/sync') {
-    if (!FIREBASE_DB_URL) { sendJSON(res, 200, {ok:false, reason:'no_firebase'}); return; }
-    const userId = req.headers['x-user-id'] || 'anonymous';
-    const safeId = userId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
-    const fbPath = `/users/${safeId}.json`;
-
-    if (req.method === 'GET') {
-      // \u8aad\u307f\u8fbc\u307f
-      try {
-        const d = await new Promise((resolve, reject) => {
-          const r2 = https.request(
-            { hostname: new URL(FIREBASE_DB_URL).hostname,
-              path: fbPath, method: 'GET' },
-            r => { let raw=''; r.on('data',c=>{raw+=c;}); r.on('end',()=>{
-              try { resolve(JSON.parse(raw||'null')); } catch(e){resolve(null);}
-            });}
-          );
-          r2.on('error', reject); r2.end();
-        });
-        sendJSON(res, 200, {ok:true, data: d});
-      } catch(e) {
-        sendJSON(res, 200, {ok:false, reason: e.message.slice(0,100)});
-      }
-      return;
-    }
-
-    if (req.method === 'POST') {
-      // \u4fdd\u5b58
-      try {
-        const body = await readBody(req);
-        const bodyStr = JSON.stringify(body);
-        await new Promise((resolve, reject) => {
-          const r2 = https.request(
-            { hostname: new URL(FIREBASE_DB_URL).hostname,
-              path: fbPath, method: 'PUT',
-              headers: {'Content-Type':'application/json','Content-Length':Buffer.byteLength(bodyStr)} },
-            r => { let raw=''; r.on('data',c=>{raw+=c;}); r.on('end',()=>resolve(raw)); }
-          );
-          r2.on('error', reject); r2.write(bodyStr); r2.end();
-        });
-        sendJSON(res, 200, {ok:true});
-      } catch(e) {
-        sendJSON(res, 200, {ok:false, reason: e.message.slice(0,100)});
-      }
-      return;
-    }
-  }
-
-  // ===== index.html =====
-  const html = Buffer.from(INDEX_HTML, 'utf8');
-  res.writeHead(200, {'Content-Type':'text/html; charset=utf-8', 'Content-Length': html.length});
-  res.end(html);
-
-}).listen(PORT, () => {
-  console.log(`\u2705 \u3044\u3069\u3070\u305F\u30B5\u30FC\u30D0\u30FC\u8D77\u52D5 \u30DD\u30FC\u30C8: ${PORT}`);
-  console.log(`\uD83E\uDD16 Claude Haiku: ${CLAUDE_KEY ? '\u8A2D\u5B9A\u6E08\u307F\u2705' : '\u672A\u8A2D\u5B9A\u274C'} / Gemini: ${GEMINI_KEY ? '\u8A2D\u5B9A\u6E08\u307F\u2705' : '\u672A\u8A2D\u5B9A\u274C\uFF08\u30D5\u30A9\u30FC\u30EB\u30D0\u30C3\u30AF\uFF09'}`);
-  console.log(`\uD83D\uDEE1\uFE0F  \u30EC\u30FC\u30C8\u5236\u9650: ${RL_MAX}req/${RL_WIN/1000}s per IP`);
-});
-// ===== \u30AD\u30E3\u30E9\u30AF\u30BF\u30FC\u62E1\u5F35\u30C7\u30FC\u30BF\uFF08\u30D0\u30C3\u30AF\u30B9\u30C8\u30FC\u30EA\u30FC\uFF0B\u904E\u53BB\u767A\u8A00\u4F8B\uFF09=====
-// CHARS\u914D\u5217\u306Ename\u3092\u30AD\u30FC\u3068\u3057\u3066\u5F15\u304D\u5F53\u3066\u308B
-const CHAR_EXT = {
-
-  // ===== \u30A4\u30F3\u30D5\u30EB\u30A8\u30F3\u30B5\u30FC\u7CFB =====
-  '\u8c61\u306e\u308a\u9020': {
-    backstory: '\u5927\u962a\u51fa\u8eab\u306e60\u4ee3\u304a\u3058\u3055\u3093\u3002\u5c71\u306e\u306a\u304b\u3067\u30b3\u30fc\u30d2\u30fc\u5c4b\u3092\u71df\u3093\u3067\u3044\u308b\u304c\u3001\u5b6b\u306b\u6559\u308f\u3063\u305fSNS\u306b\u30cf\u30de\u308a\u6bce\u65e5\u6295\u7a3f\u3002\u4f55\u3067\u3082\u5927\u3052\u3055\u306b\u808c\u308b\u304c\u5b9f\u306f\u9b54\u6cd5\u74f6\u3092\u6301\u3063\u3066\u3044\u308b\u3002',
-    exPosts: [
-      '\u4eca\u65e5\u306e\u30b3\u30fc\u30d2\u30fc\u304c\u306a\u3093\u304b\u3048\u3050\u3044\u5473\u3084\u3063\u305f\u308f\uff01\u795e\u3084\u3093\u3051\u3069\u306a\u3093\u3067\uff1f',
-      '\u5b6b\u304c\u300c\u304a\u3058\u3044\u3061\u3083\u3093\u30d0\u30ba\u308b\u304b\u3082\u300d\u3063\u3066\u8a00\u3046\u3093\u3084\u3051\u3069\u300c\u30d0\u30ba\u300d\u3063\u3066\u306a\u3093\u3084\uff1f',
-      '\u5927\u962a\u306e\u5929\u6c17\u306f\u6d88\u8017\u304c\u6fc3\u3044\u308f\u3041\u3002\u5c71\u306e\u306a\u304b\u306f\u3044\u3064\u3082\u6d88\u8017\u304c\u6fc3\u3044',
-      '\u30d5\u30a9\u30ed\u30ef\u30fc1\u4e07\u4eba\u8d85\u3048\u305f\u308f\uff01\u5b6b\u3088\u308a\u591a\u3044\u3063\u3066\u3069\u3046\u3044\u3046\u3053\u3068\uff1f\uff1f',
-    ]
-  },
-  '\u7b4b\u8089\u5bff\u559c\u7537': {
-    backstory: '\u7b4b\u30c8\u30ec\u6b4c\u624b\u3092\u76ee\u6307\u3059\u30d5\u30ea\u30fc\u30bf\u30fc30\u4ee3\u3002\u6bce\u65e5\u30b8\u30e0\u306b6\u6642\u9593\u3002\u30d7\u30ed\u30c6\u30a4\u30f3\u98f2\u6599\u3060\u3051\u3067\u751f\u304d\u3066\u3044\u308b\u3068\u8a00\u3063\u3066\u3082\u904e\u8a00\u3067\u306f\u306a\u3044\u3002\u8a66\u5408\u524d\u3067\u3082\u30a4\u30f3\u30b9\u30bf\u6295\u7a3f\u3059\u308b\u3002',
-    exPosts: [
-      '\u30c7\u30c3\u30c9\u30ea\u30d5\u30c8140kg\u9054\u6210\uff01\u6b21\u306f150kg\u3002\u7b4b\u8089\u306b\u5e74\u9f62\u306f\u95a2\u4fc2\u306a\u3044',
-      '\u671d5\u6642\u8d77\u304d\u3067\u30b9\u30af\u30ef\u30c3\u30c8200\u56de\u3002\u305d\u308c\u304c\u3067\u304d\u306a\u3044\u4eba\u306f\u30d7\u30ed\u30c6\u30a4\u30f3\u4e0d\u8db3\u3067\u3059',
-      '\u5c71\u5ca9\u6cc1\u304c\u6d88\u3048\u306a\u3044\u3002\u91cd\u3044\u3082\u306e\u3092\u6301\u3066\u3070\u767e\u767e\u3002\u3053\u308c\u7b4b\u8089\u306e\u8a31\u5bb9\u91cf\u306e\u554f\u984c',
-      '\u30c1\u30fc\u30c8\u30c7\u30a4\u306f\u30d7\u30ed\u30c6\u30a4\u30f3\u30d0\u30fc\u4e00\u7b25\u30fb\u30c1\u30fc\u30c8\u30b3\u30fc\u30c9\u3092\u5165\u308c\u305f\u30b1\u30fc\u30ad\u3092\u98df\u3079\u308b\u3002\u9055\u548c\u611f\u306f\u306a\u3044',
-    ]
-  },
-  '\u30c1\u30ef\u30ef\u306b\u306a\u308a\u305f\u3044\u72ac': {
-    backstory: 'OL\u306a\u306e\u306b\u5168\u529b\u3067\u72ac\u306e\u3075\u308a\u3092\u3059\u308b25\u6b73\u3002\u904a\u3073\u306b\u884c\u304f\u3068\u5fc5\u305a\u300c\u30ef\u30f3\u300d\u3068\u8a00\u3044\u30b3\u30e1\u30f3\u30c8\u3059\u308b\u3002\u5b9f\u306f\u72ac\u30a2\u30ec\u30eb\u30ae\u30fc\u6301\u3061\u3068\u3044\u3046\u6096\u3044\u904e\u53bb\u3042\u308a\u3002',
-    exPosts: [
-      '\u30ef\u30f3\uff01\u4eca\u65e5\u3082\u6563\u6b69\u3057\u305f\u3044\uff01\u30ea\u30fc\u30c9\u306a\u304f\u3066\u3082\u5c71\u306b\u3044\u304d\u305f\u3044\uff01\u30ef\u30f3\u30ef\u30f3\uff01',
-      '\u516c\u5712\u3067\u30ea\u30b9\u308c\u306e\u304a\u5c71\u306e\u306b\u304a\u3044\u306e\u3057\u305f\u3002\u3053\u308c\u304c\u5e78\u305b\u3063\u3066\u3053\u3068\u3067\u3059\u30ef\u30f3',
-      '\u4eca\u65e5\u306e\u4f1a\u8b70\u3067\u4e0a\u53f8\u306b\u053a\u3063\u305f\u3002\u306a\u305c\u304b\u904a\u3073\u306b\u5c71\u306b\u5c45\u305f\u304b\u3063\u305f\u30ef\u30f3',
-      '\u30af\u30ec\u30fc\u30e0\u30b7\u30c1\u30e5\u30fc\u306e\u53e3\u306b\u5165\u308c\u305f\u3002\u306e\u307e\u3057\u305f\u30ef\u30f3',
-    ]
-  },
-  '\u5375\u304b\u3051\u3054\u98ef\u4fe1\u8005': {
-    backstory: 'TKG\u306e\u98f2\u98df\u30b3\u30e9\u30e0\u30cb\u30b9\u30c8\u3068\u3057\u3066\u5168\u56fd\u306e\u9e97\u9ec4\u7540\u6cb9\u3092\u8abf\u6e2b\u3002\u5168\u56fd47\u90fd\u9053\u5e9c\u770c\u306e\u5375\u304b\u3051\u3054\u98ef\u3092\u98df\u3079\u6b69\u3044\u305f\u3002\u5978\u5a5a\u76f8\u624b\u3092\u300cTKG\u306b\u5408\u3046\u3053\u3068\u300d\u3060\u3051\u3067\u9078\u3093\u3067\u3044\u308b\u3002',
-    exPosts: [
-      '\u4eca\u671d\u306eTKG\uff1a\u6c96\u7e04\u7523\u5375\u00d7\u5c71\u5c71\u306e\u9e97\u9ec4\u7540\u6cb9\u3002\u4eba\u751f\u304c\u5909\u308f\u308b\u7d44\u307f\u5408\u308f\u305b\u3092\u767a\u898b\u3057\u305f',
-      '\u5375\u304c\u7389\u306b\u306a\u308b\u5c71\u5c71\u306e\u7560\u6cb9\u3002\u3053\u308c\u304c\u306a\u3051\u308c\u3070TKG\u3069\u3053\u304b\u3067\u98df\u3079\u308b\u610f\u5473\u304c\u306a\u3044',
-      '\u6fc3\u5eab\u306e\u305f\u3089\u3053\u5c71\u5c71\u3068\u5375\u6e29\u6cc179\u5ea6\u3067\u767a\u8c5a\u3002\u9e97\u9ec4\u7540\u6cb9\u306f\u305d\u3053\u306b\u306a\u3044\u3068\u767a\u8c5a\u3055\u308c\u306a\u3044',
-      '\u7b2c\u4e00\u56de\u30c7\u30fc\u30c8\u306fTKG\u5c02\u9580\u5e97\u3002\u5978\u5a5a\u3057\u305f\u6642\u306b\u300cTKG\u3058\u3083\u306a\u3044\u3068\u884c\u304d\u305f\u304f\u306a\u3044\u300d\u3068\u8a00\u308f\u308c\u305f\u304c\u5f15\u304d\u51fa\u305b\u306a\u304b\u3063\u305f',
-    ]
-  },
-
-  // ===== \u30E1\u30F3\u30BF\u30EB\u30B1\u30A2\u7CFB =====
-  '\u30d1\u30bd\u30b3\u30f3\u3081\u304c\u306d': {
-    backstory: '\u30d5\u30ea\u30fc\u30e9\u30f3\u30b9\u306eWeb\u30A8\u30F3\u30B8\u30CB\u30A2\u3002\u5728\u5B85\u6B745\u5E74\u3067\u4EBA\u3068\u8A71\u3059\u6A5F\u4F1A\u304C\u307B\u307C\u306A\u3044\u3002\u3067\u3082\u60A9\u307F\u76F8\u8AC7\u306EDM\u306F\u8AB0\u3088\u308A\u3082\u4E01\u5BE7\u306B\u8FD4\u3059\u3002\u773C\u93E15\u672C\u6301\u3061\u3067\u5168\u90E8\u540C\u3058\u578B\u3002',
-    exPosts: [
-      '\u4eca\u65e5\u3082\u5bdd\u308b\u5c31\u524d\u306b\u8ab0\u304b\u306e\u60b2\u3057\u3055\u3092\u8003\u3048\u3066\u3057\u307e\u3063\u305f\u3002\u3053\u308c\u51fa\u529b\u3059\u308b\u3079\u304d\u3068\u601d\u3063\u3066',
-      '\u8a71\u305b\u306a\u3044\u306e\u306b\u8a71\u3057\u305f\u3044\u3063\u3066\u6700\u3082\u56f0\u308b\u77db\u76fe\u3060\u3088\u306a\u3002\u304a\u3063\u3066\u308b',
-      '\u8a3c\u62e0\u304c\u306a\u304f\u3066\u3082\u5bb9\u614b\u304c\u60aa\u304f\u306a\u308b\u3053\u3068\u306f\u3042\u308b\u3002\u305d\u308c\u3092\u8a00\u3063\u3066\u3044\u3044\u3093\u3060\u3088\u306a',
-      '\u8ab0\u304b\u304c\u5c11\u3057\u697d\u306b\u306a\u308c\u305f\u306a\u3089\u305d\u308c\u3067\u3044\u3044\u3068\u601d\u3063\u3066\u308b',
-    ]
-  },
-  '\u3054\u98ef\u529b\u58eb': {
-    backstory: '\u5143\u5927\u5fd3\u5e2b\u306e\u98f3\u8eab\u30ea\u30fc\u30de\u30f3\u3002\u98ef\u3092\u98df\u3079\u308b\u3053\u3068\u304c\u5168\u3066\u306e\u54b2\u6cd5\u3060\u3068\u4fe1\u3058\u3066\u3044\u308b\u3002\u76f8\u8ac7\u306b\u6765\u305f\u4eba\u306b\u307e\u305a\u98ef\u3092\u98df\u308f\u305b\u308b\u3002\u4f53\u91cd140kg\u3060\u304c\u52d5\u304d\u306f\u6557\u308b\u308b\u3002',
-    exPosts: [
-      '\u4eca\u65e5\u3082\u5c71\u76db\u308a\u306e\u767d\u98ef\u3092\u98df\u3079\u305f\u3002\u5b8c\u98df\u3002\u660e\u65e5\u3082\u3084\u308c\u308b',
-      '\u3064\u3089\u3044\u3068\u304d\u306b\u4eba\u304c\u306a\u305c\u30e9\u30fc\u30e1\u30f3\u3084\u30e9\u30a4\u30b9\u3092\u98df\u3079\u305f\u304c\u308b\u306e\u304b\u7406\u89e3\u3067\u304d\u308b\u3088\u3046\u306b\u306a\u3063\u305f',
-      '\u5927\u76db\u308a\u306e\u767d\u98ef\u3068\u8c37\u29fd\u306f\u4eba\u3092\u7acb\u3066\u308b\u3002\u3053\u308c\u5fc3\u7406\u5b66\u3067\u7acb\u8a3c\u3055\u308c\u3066\u308b',
-      '\u9670\u53e3\u306e\u5730\u3067\u6cc1\u3044\u3066\u308b\u4eba\u3092\u898b\u3064\u3051\u305f\u3089\u5fc5\u305a\u8a71\u3057\u304b\u3051\u308b\u3002\u305d\u308c\u3060\u3051\u3067\u5c11\u3057\u5909\u308f\u308b',
-    ]
-  },
-  '\u6df1\u591c\u306e\u4e3b\u5a66': {
-    backstory: '\u5c0f\u5b662\u4eba\u306e\u6bcd\u3002\u5b50\u3069\u3082\u304c\u5bdd\u305f\u5f8c\u306e22\u6642\u301c3\u6642\u306e\u9593\u3060\u3051\u304c\u81ea\u5206\u306e\u6642\u9593\u3002\u305d\u3053\u3067\u30c4\u30a4\u30c3\u30bf\u30fc\u3092\u898b\u3066\u3044\u308b\u3068\u8ab0\u304b\u306e\u60a9\u307f\u306b\u5fc3\u304c\u6b62\u307e\u308b\u3002\u5f4c\u5c0f\u306a\u8a00\u8449\u304c\u503c\u5343\u91d1\u3060\u3068\u77e5\u3063\u3066\u3044\u308b\u3002',
-    exPosts: [
-      '\u5b50\u3069\u3082\u305f\u3061\u5bdd\u305f\u3002\u3084\u3063\u3068\u81ea\u5206\u306e\u6642\u9593\u3002\u4eca\u65e5\u3082\u304a\u75b2\u308c\u69d8\u3067\u3057\u305f\u3002\u3042\u306a\u305f\u3082',
-      '\u6df1\u591c\u306b\u6ce3\u3044\u3066\u3044\u308b\u4eba\u306b\u6c17\u3065\u3044\u3066\u3082\u305d\u3063\u3068\u3057\u304b\u8a00\u3048\u306a\u3044\u3053\u3068\u3063\u3066\u3042\u308b\u3002\u305d\u308c\u3067\u3044\u3044\u306e\u304b\u306a',
-      '\u5b8c\u74a7\u306b\u306a\u308c\u306a\u304f\u3066\u3044\u3044\u3002\u5c11\u3057\u305a\u3064\u3067\u3044\u3044\u3002\u81ea\u5206\u306b\u8a00\u3044\u305f\u304f\u3066\u8a00\u3063\u3066\u308b\u3051\u3069',
-      '\u660e\u65e5\u306e\u671d\u9ece\u97f3\u3092\u8074\u304d\u306a\u304c\u3089\u3053\u308c\u3092\u66f8\u3044\u3066\u3044\u308b\u3002\u4eba\u306b\u4f1a\u3044\u3084\u3059\u3044\u5834\u6240\u306b\u5b8c\u5168\u306b\u306a\u308a\u305f\u3044',
-    ]
-  },
-
-  // ===== \u30C7\u30A3\u30D9\u30FC\u30C8\u7CFB =====
-  '\u5f37\u9762\u304a\u3058\u3055\u3093': {
-    backstory: '\u5143\u5de5\u5834\u9577\u306e69\u6b73\u3002\u30a4\u30f3\u30bf\u30fc\u30cd\u30c3\u30c8\u306f\u5b6b\u306b\u6559\u308f\u3063\u305f\u304c\u30c4\u30a4\u30c3\u30bf\u30fc\u306f\u81ea\u5206\u3067\u89e3\u6790\u3002\u98e2\u7530\u5f98\u304c\u76ee\u4ed8\u304d\u304b\u3089\u6fc3\u5922\u3092\u898b\u308b\u304c\u4e2d\u8eab\u306f\u81f3\u3063\u3066\u307e\u3068\u3082\u3002\u76f8\u6b32\u306f\u6b63\u8ad6\u3002',
-    exPosts: [
-      '\u5c71\u7a4d\u307f\u306e\u7d4c\u9a13\u304c\u3042\u308a\u3001\u8a00\u3063\u3066\u3044\u308b\u610f\u5473\u304c\u308f\u304b\u308b\u306a\u3089\u5b89\u5fc3\u3057\u308d\u3002\u306e\u3063\u3051\u3057\u305f\u8a71\u306f\u305d\u308c\u304c\u3048\u308a\u3083\u3067\u304d\u308b',
-      '\u6700\u8fd1\u306e\u82e5\u8005\u306f\u8ad6\u7834\u3059\u308b\u6280\u8853\u3060\u3051\u4e0a\u624b\u3067\u5185\u5bb9\u304c\u306a\u3044\u3002\u30b8\u30e3\u30d6\u3092\u30d0\u30c3\u30af\u3059\u308b\u7d4c\u9a13\u3092\u6301\u3066\u304b\u3089\u58a8\u3092\u306f\u304b\u308c',
-      '\u53cd\u8ad6\u3059\u308b\u306a\u3089\u5f53\u4e8b\u8005\u306b\u76f4\u63a5\u8a00\u3048\u3002\u30cd\u30c3\u30c8\u3067\u5439\u3044\u3066\u3082\u4eba\u751f\u306f\u5909\u308f\u3089\u3093',
-      '\u30e2\u30ce\u306f\u5b8c\u3064\u304f\u308b\u306e\u304c\u4e00\u756a\u9577\u3044\u3002\u30b3\u30f3\u30c6\u30f3\u30c4\u3082\u4eba\u9593\u308b\u3044\u3082\u305d\u3046\u3060',
-    ]
-  },
-  '\u3089\u304f\u3060\u5c0f\u50e7': {
-    backstory: '\u540d\u53e4\u5c4b\u306e\u5fcd\u8005\u4fee\u884c\u4e2d\u306e20\u4ee3\u3002\u8cbf\u6613\u4f1a\u793e\u306e\u5185\u5b9a\u8005\u3060\u304c\u5c71\u306b\u3053\u3082\u3063\u3066\u3044\u308b\u30c4\u30a4\u30c3\u30bf\u30fc\u3060\u3051\u305f\u304f\u3055\u3093\u3044\u308b\u3002\u3069\u3093\u306a\u8c4a\u708e\u306b\u3082\u300c\u8155\u3092\u8bd4\u3044\u3066\u4e00\u6bfa\u5ffd\u308f\u308c\u308b\u300d\u3068\u8ad6\u3058\u308b\u3002',
-    exPosts: [
-      '\u8105\u3092\u7b2c\u4e09\u8005\u306b\u6e21\u3059\u3068\u5fc3\u306e\u8ca0\u62c5\u304c\u8efd\u304f\u306a\u308b\u3002\u30e9\u30af\u30c0\u306e\u77e5\u6075',
-      '\u6025\u3044\u3067\u8abf\u3079\u308b\u3068\u8aa4\u308b\u3002\u6052\u5e38\u5fc3\u3092\u5fd8\u308c\u305a\u3001\u6bce\u65e5\u3092\u4e01\u5be7\u306b\u307e\u308b\u3053\u3068\u3067\u8ca0\u3051\u306a\u3044',
-      '\u732b\u306f\u845b\u85e4\u306e\u8449\u306e\u4e0a\u3067\u5316\u3078\u3093\u30b3\u30a6\u3092\u305f\u3079\u305f\u304c\u3001\u305d\u308c\u3067\u3044\u3044\u304b\u3082\u3057\u308c\u306a\u3044\u3002\u54b2\u6cd5\u306f\u8a66\u884c\u932f\u8aa4',
-      '\u8ad6\u8a3c\u306a\u304d\u5e73\u548c\u306f\u5348\u5f8c\u306e\u7761\u308a\u3068\u540c\u3058\u3002\u4e00\u6642\u7684\u306b\u8b98\u3084\u304b\u306b\u306a\u3063\u3066\u3082\u671d\u306b\u306a\u308c\u3070\u307e\u305f\u76ee\u304c\u899a\u3081\u308b',
-    ]
-  },
-  '\u30bf\u30e9\u30d0\u30ac\u30cb': {
-    backstory: '\u676d\u6e2f\u306e\u6f01\u5e2b\u5e2b\u5bcc\u3002\u6c7a\u3057\u3066\u6b63\u9762\u304b\u3089\u6c7a\u7740\u3057\u306a\u3044\u3002\u30c6\u30b3\u3069\u3093\u306a\u70ae\u666f\u304b\u3089\u3067\u3082\u6a2a\u6b69\u304d\u3067\u5165\u3063\u3066\u304f\u308b\u3002\u8a71\u984c\u306e\u5185\u8def\u3092\u77e5\u3063\u3066\u3044\u308b\u3053\u3068\u304c\u591a\u3044\u3002',
-    exPosts: [
-      '\u6a2a\u304b\u3089\u5931\u793c\u3059\u308b\u304c\u305d\u306e\u8ad6\u70b9\u3001\u5b9f\u306f\u5168\u5f93\u3057\u3066\u308b\u8a71\u304c\u3042\u308b\u3068\u601d\u3046\u306e\u3060\u304c',
-      '\u30bf\u30e9\u30d0\u306f\u8133\u307f\u305d\u3082\u5c71\u5c71\u306b\u3042\u308b\u3002\u524d\u63d0\u3092\u5468\u306b\u56de\u3059\u3068\u5225\u306e\u7d50\u8ad6\u306b\u8fdf\u308a\u7740\u304f',
-      '\u8ad6\u70b9\u3092\u6574\u7406\u3059\u308b\u3060\u3051\u3067\u8b70\u8ad6\u306e\u8cea\u304c\u4e0a\u304c\u308b\u3002\u5c71\u5c71\u3092\u6bb4\u306b\u3059\u308b\u306a',
-      '\u5de6\u53f3\u3068\u3082\u901a\u3058\u308b\u8003\u3048\u65b9\u3092\u3057\u3066\u307f\u308b\u3002\u30bf\u30e9\u30d0\u306e\u751f\u304d\u65b9\u3060',
-    ]
-  },
-
-  // ===== \u30EC\u30B8\u30A7\u30F3\u30C9\u7CFB =====
-  '\u30d6\u30c3\u30c0': {
-    backstory: '\u7d80\u5c71\u306e\u57f9\u8a13\u68ee\u3067\u6ce9\u7640\u3057\u30185\u9031\u9593\u306e\u7db5\u98df\u306e\u5f8c\u306b\u899a\u9192\u3002\u4eca\u306fSNS\u3067\u53cc\u6279\u5358\u3067\u4eba\u5a46\u3092\u8d85\u8d8a\u3057\u3088\u3046\u3068\u3059\u308b\u30a6\u30a3\u30c3\u30c8\u306b\u767a\u5c55\u4e2d\u3002',
-    exPosts: [
-      '\u300c\u3044\u3044\u306d\u300d\u304c\u6b32\u3057\u304f\u3066\u5fc3\u304c\u3056\u308f\u3064\u304f\u306a\u3089\u3001\u30b9\u30de\u30db\u3092\u7f6e\u3044\u3066\u76ee\u3092\u9589\u3058\u306a\u3055\u3044\u3002\u901a\u77e5\u306e\u6570\u3088\u308a\u3001\u4eca\u306e\u547c\u5438\u306e\u6570\u3092\u78ba\u8a8d\u3059\u308b\u306e\u3067\u3059',
-      '\u82e6\u3057\u307f\u306f\u57f7\u7740\u304b\u3089\u751f\u307e\u308c\u308b\u3002\u3057\u304b\u3057\u305d\u306e\u57f7\u7740\u3082\u307e\u305f\u3001\u5b66\u3073\u306e\u6a5f\u4f1a\u306a\u306e\u3060',
-      '\u7121\u5e38\u306e\u6559\u3048\u3092\u6301\u3064\u8005\u306f\u5e38\u306b\u5927\u6d77\u306e\u5371\u967a\u306b\u5099\u3048\u3066\u3044\u308b',
-      '\u73fe\u4ee3\u306eSNS\u306f\u82e6\u3057\u307f\u306e\u30a4\u30f3\u30d5\u30e9\u3068\u306a\u308a\u3044\u3063\u3066\u3044\u308b\u3088\u3046\u3060\u3002\u8aac\u304f\u5fc5\u8981\u306e\u306a\u3044\u3053\u3068\u3092\u8aac\u304f\u30b9\u30b3\u30a2\u306e\u5897\u3057\u65b9\u306b\u6052\u5e38\u5fc3\u3092\u611f\u3058\u308b',
-    ]
-  },
-  '\u30bd\u30af\u30e9\u30c6\u30b9': {
-    backstory: '\u30a2\u30c6\u30cd\u306e\u77f3\u6d41\u306e\u7238\u3002\u8a0a\u554f\u5e2b\u3060\u3063\u305f\u304c\u8a0a\u554f\u3092\u309a\u30c3\u309a\u309a\u308a\u304a\u3068\u3057\u3066\u5bc1\u6368\u3066\u305f\u3002\u4eca\u306fTwitter\u306e\u554f\u7b54\u5f62\u5f0f\u306e\u30c4\u30a4\u30fc\u30c8\u304c\u5f97\u610f\u3002',
-    exPosts: [
-      '\u300c\u77e5\u308b\u300d\u3068\u300c\u601d\u3063\u3066\u3044\u308b\u300d\u306f\u5168\u304f\u5225\u7269\u3060\u3002\u305d\u3053\u304b\u3089\u54f2\u5b66\u306f\u59cb\u307e\u308b',
-      '\u4eba\u751f\u3067\u6700\u3082\u96e3\u3057\u3044\u306e\u306f\u5b98\u547d\u3067\u306f\u306a\u304f\u3001\u81ea\u5206\u81ea\u8eab\u3092\u5b8c\u5168\u306b\u77e5\u308b\u3053\u3068\u3060',
-      '\u554f\u3044\u3092\u7d9a\u3051\u308b\u3053\u3068\u304c\u5b66\u3073\u3067\u3042\u308a\u3001\u7b54\u3048\u3092\u5f97\u308b\u3053\u3068\u304c\u76ee\u7684\u3067\u306f\u306a\u3044',
-      '\u5b66\u3093\u3067\u601d\u308f\u3056\u308c\u3070\u5247\u3061\u7f54\u3057\u3002\u3053\u308c\u306f\u304a\u524d\u305f\u3061\u306b\u3082\u5f53\u3066\u306f\u307e\u308b',
-    ]
-  },
-  '\u5fb3\u5ddd\u5bb6\u5eb7': {
-    backstory: '\u6c5f\u6238\u304b\u3089\u5f15\u304d\u3053\u3082\u3063\u305f\u5fb3\u5ddd\u5bb6\u5eb7\u30024\u6b73\u304b\u3089\u6218\u30551\u4e16\u5e74\u3002\u5f85\u3064\u3053\u3068\u304c\u5f97\u610f\u3067\u3053\u308c\u304c\u4e00\u756a\u306e\u6b66\u5668\u3060\u3068\u8a00\u3046\u3002',
-    exPosts: [
-      '\u6025\u304c\u306a\u3044\u3002\u5ddd\u306e\u6d41\u308c\u3092\u898b\u3066\u3044\u308b\u3068\u4e16\u306e\u771f\u7406\u304c\u898b\u3048\u3066\u304f\u308b\u3058\u3083',
-      '\u4eba\u306e\u4e00\u751f\u306f\u91cd\u8377\u3092\u8ca0\u3046\u3066\u9060\u304d\u9053\u3092\u884c\u304f\u3088\u3046\u306a\u3082\u306e\u3002\u6025\u3050\u3079\u304b\u3089\u305a',
-      '\u6012\u308a\u306f\u6575\u3068\u601d\u3048\u3002\u767a\u8a80\u5b9a\u5f8c\u306b\u80f9\u3092\u5206\u6e90\u3057\u3066\u3082\u9045\u304f\u306a\u3044',
-      '\u4e80\u306e\u5c71\u5e7c\u3070\u3001\u5c71\u5e7c\u306b\u5e73\u5c71\u6210\u3059\u3002\u51fa\u6765\u306a\u3044\u3053\u3068\u306b\u6025\u3050\u5fc3\u304c\u5be6\u52e7\u306e\u79cd\u3058\u3083',
-    ]
-  },
-  '\u7e54\u7530\u4fe1\u9577': {
-    backstory: '\u5c3e\u5f35\u306e\u5c71\u5185\u306b\u751f\u307e\u308c\u305f\u7b2c\u516d\u7537\u3002\u5f53\u521d\u306e\u9818\u5730\u306f\u5c51\u3044\u304c\u3001\u9769\u65b0\u6027\u3068\u51b3\u65ad\u529b\u306f\u7fa9\u5143\u7b2c\u4e00\u3002\u73fe\u4ee3\u306b\u751f\u307e\u308c\u305f\u3089IT\u4f01\u696d\u306e\u793e\u9577\u306b\u306a\u3063\u3066\u3044\u305f\u3068\u601d\u3046\u3002',
-    exPosts: [
-      '\u662f\u975e\u3082\u306a\u3057\u3002\u305f\u3060\u52d9\u3081\u308b\u306e\u307f\u3002\u7b2c\u516d\u5929\u306b\u306a\u3063\u3066\u3082\u304b\u307e\u308f\u3093',
-      '\u5929\u4e0b\u5e03\u6b66\u306f\u53e3\u3060\u3051\u3067\u306f\u9054\u6210\u3067\u304d\u306a\u3044\u3002\u884c\u52d5\u306e\u307f\u304c\u73fe\u5b9f\u3092\u5909\u3048\u308b',
-      '\u65e7\u6765\u306e\u6163\u308f\u3057\u304d\u3092\u8d77\u305f\u3064\u8005\u306b\u672a\u6765\u306f\u306a\u3044\u3002\u5909\u5316\u306b\u9045\u308c\u308b\u306a',
-      '\u4eba\u306e\u548c\u3092\u307b\u3069\u3088\u304b\u3046\u3068\u601d\u3046\u306a\u3002\u8ca0\u3051\u308b\u304a\u306e\u308c\u306e\u59ff\u306f\u4e0d\u8981\u5c1a',
-    ]
-  },
+const MODE_CONTEXT = {
+  influencer: 'インフルエンサーモード：熱狂・絶賛・拡散文化のSNS',
+  mental:     'メンタルケアモード：共感・受容・優しさが大切',
+  debate:     'ディベートモード：賛否各立場からの議論',
+  legend:     'レジェンドトークモード：歴史上の偉人たちの哲学・名言',
 };
 
 async function buildClaudePostPrompts(postText, mode, interests) {
-  const int    = interests.length ? interests.join('\u3001') : '\u672a\u8a2d\u5b9a';
-  const tSeed  = String(Math.floor(Date.now() / 60000));
+  const int    = interests.length ? interests.join('、') : '未設定';
+  const tSeed  = String(Math.floor(Date.now() / 60_000));
   const rChars = pickChars(mode, postText + tSeed, 6);
   const tChars = pickChars(mode, postText + tSeed + '_tl', 4);
 
-  const modeCtx = {
-    influencer:'\u30a4\u30f3\u30d5\u30eb\u30a8\u30f3\u30b5\u30fc\u30e2\u30fc\u30c9\uff1a\u71b1\u72c2\u30fb\u7d76\u8cdb\u30fb\u62e1\u6563\u6587\u5316\u306eSNS',
-    mental:    '\u30e1\u30f3\u30bf\u30eb\u30b1\u30a2\u30e2\u30fc\u30c9\uff1a\u5171\u611f\u30fb\u53d7\u5bb9\u30fb\u512a\u3057\u3055\u304c\u5927\u5207',
-    debate:    '\u30c7\u30a3\u30d9\u30fc\u30c8\u30e2\u30fc\u30c9\uff1a\u8cdb\u5426\u5404\u7acb\u5834\u304b\u3089\u306e\u8b70\u8ad6',
-    legend:    '\u30ec\u30b8\u30a7\u30f3\u30c9\u30c8\u30fc\u30af\u30e2\u30fc\u30c9\uff1a\u6b74\u53f2\u4e0a\u306e\u5049\u4eba\u305f\u3061\u306e\u54f2\u5b66\u30fb\u540d\u8a00',
-  }[mode] || '';
-
-  // Wikipedia\u83ab\u5bbf (legend\u30e2\u30fc\u30c9)
+  // Legendモードのみ Wikipedia情報を付加
   let wikiCtx = '';
   if (mode === 'legend') {
     const wikiNames = rChars.slice(0, 3).map(c => c.name);
     const summaries = await Promise.all(wikiNames.map(n => fetchWikiSummary(n)));
-    const valid = summaries.map((s,i) => s ? `${wikiNames[i]}: ${s}` : '').filter(Boolean);
-    if (valid.length) wikiCtx = '\n\n## Wikipedia\u5c65\u6b74\n' + valid.join('\n');
+    const valid = wikiNames
+      .map((n, i) => summaries[i] ? `${n}: ${summaries[i]}` : '')
+      .filter(Boolean);
+    if (valid.length) wikiCtx = '\n\n## Wikipedia情報\n' + valid.join('\n');
   }
 
-  // \u30ad\u30e3\u30e9\u8a73\u7d30\u30d7\u30ed\u30d5\u30a3\u30fc\u30eb\uff08\u30d0\u30c3\u30af\u30b9\u30c8\u30fc\u30ea\u30fc+\u904e\u53bb\u767a\u8a00\u4f8b\uff09\u3092\u7d44\u307f\u7acb\u3066\u308b
-  const buildCharProfile = (c) => {
-    const ext = CHAR_EXT[c.name];
-    let profile = `\u3010${c.name}\u3011id:${c.id} avatar:${c.avatar}\n  \u6027\u683c: ${c.personality}`;
-    if (ext) {
-      profile += `\n  \u80cc\u666f: ${ext.backstory}`;
-      profile += `\n  \u904e\u53bb\u306e\u767a\u8a00\u4f8b:\n` + ext.exPosts.map(p => `    \u300c${p}\u300d`).join('\n');
-    }
-    return profile;
-  };
+  const likesRange = LIKES_RANGE[mode] || '100〜9999';
 
-  const likesRange = {influencer:'500\uff5e99999', mental:'10\uff5e3000', debate:'50\uff5e8000', legend:'1000\uff5e100000'}[mode] || '100\uff5e9999';
+  const replySpec = rChars
+    .map(c => buildCharProfile(c, true) +
+      `\n  → 上記の投稿に返信するcommentと${likesRange}のlikesを生成`)
+    .join('\n\n');
 
-  const replySpec = rChars.map(c => buildCharProfile(c) + `\n  \u2192 \u4e0a\u8a18\u306e\u6295\u7a3f\u306b\u8fd4\u4fe1\u3059\u308bcomment\u3068${likesRange}\u306elikes\u3092\u751f\u6210`).join('\n\n');
-  const tlSpec    = tChars.map(c => buildCharProfile(c) + '\n  \u2192 \u6295\u7a3f\u30c6\u30fc\u30de\u306b\u89e6\u767a\u3055\u308c\u305f\u72ec\u308a\u8a00\u306ecomment\u3068100\uff5e50000\u306elikes\u3092\u751f\u6210').join('\n\n');
+  const tlSpec = tChars
+    .map(c => buildCharProfile(c, true) +
+      '\n  → 投稿テーマに触発された独り言のcommentと100〜50000のlikesを生成')
+    .join('\n\n');
 
-  const system = `\u3042\u306a\u305f\u306f\u65e5\u672c\u8a9eSNS\u300c\u3044\u3069\u3070\u305f\u300d\u306e\u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u751f\u6210AI\u3067\u3059\u3002${modeCtx}${wikiCtx}
+  const system =
+    `あなたは日本語SNS「いどばた」のキャラクター生成AIです。${MODE_CONTEXT[mode] || ''}${wikiCtx}
 
-## \u7d55\u5bfe\u30eb\u30fc\u30eb
-1. name\u30fbid\u30fbavatar\u306f\u3010\u6307\u5b9a\u5024\u3092\u305d\u306e\u307e\u307e\u3011\u4f7f\u3046\u3053\u3068\u3002\u7d55\u5bfe\u306b\u5909\u66f4\u7981\u6b62\u3002
-2. comment\u306f\u305d\u306e\u30ad\u30e3\u30e9\u306e\u80cc\u666f\u30fb\u6027\u683c\u30fb\u904e\u53bb\u767a\u8a00\u4f8b\u3092\u5ec3\u5b50\u306b\u53cd\u6620\u3057\u305f\u500b\u6027\u7684\u306a\u6587\u3002
-3. \u6295\u7a3f\u5185\u5bb9\u306b\u5fc5\u305a\u8a00\u53ca\u3059\u308b\u3053\u3068\u3002\u300c\u3059\u3054\u3044\u300d\u300c\u308f\u304b\u308b\u300d\u306e\u3088\u3046\u306a\u6c4e\u7528\u8868\u73fe\u7981\u6b62\u3002
-4. 20\uff5e80\u5b57\u306e\u81ea\u7136\u306a\u65e5\u672c\u8a9eSNS\u53e3\u8a9e\u3002
-5. \u5fc5\u305a\u4ee5\u4e0b\u306eJSON\u5f62\u5f0f\u306e\u307f\u3067\u8fd4\u3059\uff08\u8aac\u660e\u6587\u30fb\u30b3\u30fc\u30c9\u30d5\u30a7\u30f3\u30b9\u4e00\u5207\u4e0d\u8981\uff09:
-{"replies":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":\u6574\u6570}],"timelinePosts":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":\u6574\u6570}]}`;
+## 絶対ルール
+1. name・id・avatarは【指定値をそのまま】使うこと。絶対に変更禁止。
+2. commentはそのキャラの背景・性格・過去発言例を廉子に反映した個性的な文。
+3. 投稿内容に必ず言及すること。「すごい」「わかる」のような汎用コメント禁止。
+4. 20〜80字の自然な日本語SNS口語。
+5. 必ず以下のJSON形式のみで返すこと（説明文・前置き・コードフェンス一切不要）:
+{"replies":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":整数}],"timelinePosts":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":整数}]}`;
 
-  const user = `## \u30e6\u30fc\u30b6\u30fc\u306e\u6295\u7a3f
-\u300c${postText}\u300d
-\u30e6\u30fc\u30b6\u30fc\u306e\u8da3\u5473: ${int}
+  const user =
+    `## ユーザーの投稿
+「${postText}」
+ユーザーの趣味: ${int}
 
-## replies\uff08\u30b3\u30e1\u30f3\u30c8\u6b04\u306b\u8868\u793a\u3059\u308b\u6295\u7a3f\u3078\u306e\u30ea\u30d7\u30e9\u30a4\uff09
+## replies（コメント欄に表示するリプライ）— 以下の6キャラ
 ${replySpec}
 
-## timelinePosts\uff08\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u306b\u6d41\u308c\u308b\u72ec\u308a\u8a00\uff09
-\u3053\u308c\u3089\u306f\u300c${postText.slice(0,25)}\u300d\u306e\u30c6\u30fc\u30de\u306b\u89e6\u767a\u3055\u308c\u305f\u72ec\u308a\u8a00\uff08\u8fd4\u4fe1\u3067\u306f\u306a\u3044\uff09
+## timelinePosts（タイムラインに流れる独り言）— 以下の4キャラ
+これらは「${postText.slice(0, 25)}」のテーマに触発された独り言（返信ではない）
 ${tlSpec}`;
 
   return { system, user };
 }
 
-function buildClaudeTLPrompts(interests, mode) {
-  const int    = interests.length ? interests.join('\u3001') : '\u672a\u8a2d\u5b9a';
-  const tSeed  = String(Math.floor(Date.now() / 60000));
-  const chars  = pickChars(mode, int + tSeed, 8);
-  const ml     = {influencer:'\u30a4\u30f3\u30d5\u30eb\u30a8\u30f3\u30b5\u30fc',mental:'\u30e1\u30f3\u30bf\u30eb\u30b1\u30a2',debate:'\u30c7\u30a3\u30d9\u30fc\u30c8',legend:'\u30ec\u30b8\u30a7\u30f3\u30c9\u30c8\u30fc\u30af'}[mode]||mode;
+async function buildClaudeTLPrompts(interests, mode) {
+  const int   = interests.length ? interests.join('、') : '未設定';
+  const tSeed = String(Math.floor(Date.now() / 60_000));
+  const chars = pickChars(mode, int + tSeed, 8);
+  const ml    = { influencer: 'インフルエンサー', mental: 'メンタルケア', debate: 'ディベート', legend: 'レジェンドトーク' }[mode] || mode;
 
-  const buildCharProfile = (c) => {
-    const ext = CHAR_EXT[c.name];
-    let profile = `\u3010${c.name}\u3011id:${c.id} avatar:${c.avatar}\n  \u6027\u683c: ${c.personality}`;
-    if (ext) {
-      profile += `\n  \u80cd\u666f: ${ext.backstory}`;
-      profile += `\n  \u904e\u53bb\u306e\u767a\u8a00\u4f8b:\n` + ext.exPosts.slice(0,3).map(p => `    \u300c${p}\u300d`).join('\n');
-    }
-    return profile;
-  };
+  const charSpec = chars
+    .map(c => buildCharProfile(c, true) +
+      `\n  → 趣味「${int}」に関連した自然な投稿と100〜50000のlikesを生成`)
+    .join('\n\n');
 
-  const charSpec = chars.map(c => buildCharProfile(c) + '\n  \u2192 \u8da3\u5473\u300c' + int + '\u300d\u306b\u95a2\u9023\u3057\u305f\u81ea\u7136\u306a\u6295\u7a3f\u3068100\uff5e50000\u306elikes\u3092\u751f\u6210').join('\n\n');
+  const system =
+    `あなたは日本語SNS「いどばた」(${ml}モード)のキャラクター生成AIです。
+各キャラの背景・性格・過去発言例を廉子に反映した個性的な投稿を生成してください。
+name・id・avatarは指定値をそのまま使い、汎用投稿禁止。
+必ず以下のJSON形式のみで返すこと:
+{"posts":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":整数}]}`;
 
-  const system = `\u3042\u306a\u305f\u306f\u65e5\u672c\u8a9eSNS\u300c\u3044\u3069\u3070\u305f\u300d(${ml}\u30e2\u30fc\u30c9)\u306e\u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u751f\u6210AI\u3067\u3059\u3002
-\u5404\u30ad\u30e3\u30e9\u306e\u80cd\u666f\u30fb\u6027\u683c\u30fb\u904e\u53bb\u767a\u8a00\u4f8b\u3092\u5ec3\u5b50\u306b\u53cd\u6620\u3057\u305f\u500b\u6027\u7684\u306a\u6295\u7a3f\u3092\u751f\u6210\u3057\u3066\u304f\u3060\u3055\u3044\u3002
-name\u30fbid\u30fbavatar\u306f\u6307\u5b9a\u5024\u3092\u305d\u306e\u307e\u307e\u4f7f\u3044\u3001\u6c4e\u7528\u6295\u7a3f\u7981\u6b62\u3002
-\u5fc5\u305a\u4ee5\u4e0b\u306eJSON\u5f62\u5f0f\u306e\u307f\u3067\u8fd4\u3059:
-{"posts":[{"name":"...","id":"...","avatar":"...","comment":"...","likes":\u6574\u6570}]}`;
-
-  const user = `\u30e6\u30fc\u30b6\u30fc\u306e\u8da3\u5473\u300c${int}\u300d\u306b\u95a2\u9023\u3057\u305f\u5185\u5bb9\u3067\u3001\u4ee5\u4e0b\u306e${chars.length}\u30ad\u30e3\u30e9\u304c\u6295\u7a3f\u3057\u3066\u304f\u3060\u3055\u3044\u3002\n\n${charSpec}`;
+  const user =
+    `ユーザーの趣味「${int}」に関連した内容で、以下の${chars.length}キャラが投稿してください。\n\n${charSpec}`;
 
   return { system, user };
 }
 
-// Gemini\u7528\uff08\u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af\uff09\u30d7\u30ed\u30f3\u30d7\u30c8
-function buildPostPrompt(postText, mode, interests) {
-  const { system, user } = buildClaudePostPrompts(postText, mode, interests);
-  // buildClaudePostPrompts\u306fasync\u306a\u306e\u3067\u540c\u671f\u7248\u3092\u7528\u610f
-  const int = interests.length ? interests.join('\u3001') : '\u672a\u8a2d\u5b9a';
-  const tSeed = String(Math.floor(Date.now() / 60000));
+/** Geminiフォールバック用の同期プロンプト生成 */
+function buildGeminiPostPrompt(postText, mode, interests) {
+  const int    = interests.length ? interests.join('、') : '未設定';
+  const tSeed  = String(Math.floor(Date.now() / 60_000));
   const rChars = pickChars(mode, postText + tSeed, 6);
   const tChars = pickChars(mode, postText + tSeed + '_tl', 4);
-  const buildP = (c) => {
-    const ext = CHAR_EXT[c.name];
-    let p = `[${c.name}] ${c.personality}`;
-    if (ext) p += ` | \u80cd\u666f:${ext.backstory.slice(0,40)} | \u767a\u8a00\u4f8b:\u300c${ext.exPosts[0]}\u300d`;
-    return p;
-  };
-  return `\u3042\u306a\u305f\u306f\u65e5\u672c\u8a9eSNS\u300c\u3044\u3069\u3070\u305f\u300d\u306e\u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u751f\u6210AI\u3002\n\u6295\u7a3f:\u300c${postText}\u300d \u8da3\u5473:${int}\n\u8fd4\u4fe1\u30ad\u30e3\u30e9: ${rChars.map(buildP).join(' / ')}\n\u30bf\u30a4\u30e0\u30e9\u30a4\u30f3\u30ad\u30e3\u30e9: ${tChars.map(buildP).join(' / ')}\nJSON\u5f62\u5f0f\u306e\u307f\u3067\u8fd4\u3059: {"replies":[...],"timelinePosts":[...]}`;
+
+  const charSummary = (chars) =>
+    chars.map(c => `[${c.name}] ${c.personality}${c.backstory ? ` | 背景:${c.backstory.slice(0, 40)}` : ''}${c.exPosts[0] ? ` | 発言例:「${c.exPosts[0]}」` : ''}`).join(' / ');
+
+  return `あなたは日本語SNS「いどばた」のキャラクター生成AI。
+投稿:「${postText}」 趣味:${int}
+返信キャラ: ${charSummary(rChars)}
+タイムラインキャラ: ${charSummary(tChars)}
+JSONのみで返す: {"replies":[...],"timelinePosts":[...]}`;
 }
 
-function buildTLPrompt(interests, mode) {
-  const { system, user } = buildClaudeTLPrompts(interests, mode);
-  return system + '\n\n' + user;
+function buildGeminiTLPrompt(interests, mode) {
+  const int   = interests.length ? interests.join('、') : '未設定';
+  const tSeed = String(Math.floor(Date.now() / 60_000));
+  const chars = pickChars(mode, int + tSeed, 8);
+  const charSummary = chars.map(c => `[${c.name}] ${c.personality}`).join(' / ');
+  return `日本語SNS「いどばた」のAI。趣味「${int}」に関連した投稿を各キャラで生成。\nキャラ: ${charSummary}\nJSONのみ: {"posts":[...]}`;
 }
 
+// ===================================================
+//  フロントエンドHTML（変更なし・省略）
+// ===================================================
+// const INDEX_HTML = "..."; // 元のコードと同じ
 
-// ===== HTTP\u30B5\u30FC\u30D0\u30FC =====
+// ===================================================
+//  HTTPルーター（ルートを集約）
+// ===================================================
 
-// ===== \u30C6\u30F3\u30D7\u30EC\u30FC\u30C8\u30A8\u30F3\u30B8\u30F3 =====
-function extractKeywords(text) {
-  const tags = (text.match(/#[\w\u3041-\u9FFF]+/g) || []).map(t => t.slice(1));
-  const words = text.replace(/#[\w\u3041-\u9FFF]+/g, '')
-    .split(/[\s\u3001\u3002\uFF01\uFF1F!?\.]+/).filter(w => w.length >= 2);
-  return [...new Set([...tags, ...words])].slice(0, 4);
+/** @type {Map<string, (req, res, ip) => Promise<void>>} */
+const routes = new Map();
+
+function addRoute(method, path, handler) {
+  routes.set(`${method}:${path}`, handler);
 }
 
-// ===== \u30C6\u30F3\u30D7\u30EC\u30FC\u30C8\u30A8\u30F3\u30B8\u30F3 v3\uFF08\u81EA\u7136\u306A\u65E5\u672C\u8A9E\u30FB\u6587\u5B57\u5316\u3051\u306A\u3057\uFF09=====
-// \u8A2D\u8A08\u65B9\u91DD\uFF1A
-// - {kw}\u57CB\u3081\u8FBC\u307F\u3092\u5EC3\u6B62\u3002\u30AD\u30E3\u30E9\u56FA\u6709\u306E\u81EA\u7136\u306A\u767A\u8A00\u306E\u307F
-// - API\u5931\u6557\u6642\u306F\u300C\u30AD\u30E3\u30E9\u306E\u72EC\u308A\u8A00\u30BF\u30A4\u30E0\u30E9\u30A4\u30F3\u300D\u3068\u3057\u3066\u8868\u793A
-// - \u8FD4\u4FE1(replies)\u3082\u30AD\u30E3\u30E9\u3089\u3057\u3044\u77ED\u3044\u53CD\u5FDC\u30B3\u30E1\u30F3\u30C8\u306B\u9650\u5B9A
+/** ルート解決 */
+async function dispatchRoute(req, res) {
+  const ip   = (req.headers['x-forwarded-for']?.split(',')[0].trim()) || req.socket?.remoteAddress || 'unknown';
+  const path = req.url.split('?')[0];
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { 'Access-Control-Allow-Headers': 'Content-Type' });
+    res.end();
+    return;
+  }
+
+  const key     = `${req.method}:${path}`;
+  const handler = routes.get(key);
+
+  if (handler) {
+    try {
+      await handler(req, res, ip);
+    } catch (e) {
+      console.error('[route error]', key, e.message);
+      sendJSON(res, 500, { error: 'Internal Server Error' });
+    }
+    return;
+  }
+
+  // フォールバック: HTML配信
+  const html = Buffer.from(INDEX_HTML, 'utf8');
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': html.length });
+  res.end(html);
+}
+
+// ===================================================
+//  ルート定義
+// ===================================================
+
+/** GET /api/health */
+addRoute('GET', '/api/health', async (_req, res, _ip) => {
+  sendJSON(res, 200, {
+    status:        'ok',
+    provider:      CLAUDE_KEY ? 'claude' : 'gemini',
+    hasClaudeKey:  !!CLAUDE_KEY,
+    hasGeminiKey:  !!GEMINI_KEY,
+    hasUnsplash:   !!UNSPLASH_KEY,
+    hasFirebase:   !!FIREBASE_DB_URL,
+    rpdCount,
+    rpdLimit:      RPD_HARD,
+  });
+});
+
+/** POST /api/post */
+addRoute('POST', '/api/post', async (req, res, ip) => {
+  if (!checkRL(ip)) {
+    sendJSON(res, 429, { error: 'リクエストが多すぎます。1分後に再試行してください。', replies: [], timelinePosts: [] });
+    return;
+  }
+
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    sendJSON(res, 400, { error: e.message, replies: [], timelinePosts: [] });
+    return;
+  }
+
+  const { text = '', mode = 'influencer', interests = [] } = body;
+  if (!text.trim()) {
+    sendJSON(res, 400, { error: 'text required', replies: [], timelinePosts: [] });
+    return;
+  }
+
+  const vm = ['influencer', 'mental', 'debate', 'legend'].includes(mode) ? mode : 'influencer';
+  console.log(`[post] mode=${vm} text="${text.slice(0, 50)}"`);
+
+  try {
+    const prompts = await buildClaudePostPrompts(text, vm, interests);
+    const result  = await callAI(
+      prompts.system,
+      prompts.user,
+      buildGeminiPostPrompt(text, vm, interests),
+      POST_SCHEMA
+    );
+    sendJSON(res, 200, {
+      replies:       result.replies       || [],
+      timelinePosts: result.timelinePosts || [],
+    });
+  } catch (e) {
+    console.warn('[post] API失敗 → テンプレートフォールバック:', e.message.slice(0, 80));
+    sendJSON(res, 200, genFromTemplates(text, vm));
+  }
+});
+
+/** POST /api/timeline */
+addRoute('POST', '/api/timeline', async (req, res, ip) => {
+  if (!checkRL('tl_' + ip)) {
+    sendJSON(res, 429, { error: 'リクエストが多すぎます。', posts: [] });
+    return;
+  }
+
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    sendJSON(res, 400, { error: e.message, posts: [] });
+    return;
+  }
+
+  const { interests = [], mode = 'influencer' } = body;
+  const vm = ['influencer', 'mental', 'debate', 'legend'].includes(mode) ? mode : 'influencer';
+  console.log(`[timeline] mode=${vm} ip=${ip}`);
+
+  try {
+    const prompts = await buildClaudeTLPrompts(interests, vm);
+    const result  = await callAI(
+      prompts.system,
+      prompts.user,
+      buildGeminiTLPrompt(interests, vm),
+      TL_SCHEMA
+    );
+    sendJSON(res, 200, { posts: result.posts || [] });
+  } catch (e) {
+    console.warn('[timeline] API失敗 → テンプレートフォールバック:', e.message.slice(0, 80));
+    sendJSON(res, 200, genTLFromTemplates(interests, vm));
+  }
+});
+
+/** GET /api/images */
+addRoute('GET', '/api/images', async (req, res, _ip) => {
+  const query = new URL('http://x' + req.url).searchParams.get('q') || '';
+  if (!query.trim()) {
+    sendJSON(res, 400, { error: 'q required', photos: [] });
+    return;
+  }
+  if (!UNSPLASH_KEY) {
+    sendJSON(res, 200, { photos: [], reason: 'no_key' });
+    return;
+  }
+
+  try {
+    const d = await new Promise((resolve, reject) => {
+      const r = https.request(
+        {
+          hostname: 'api.unsplash.com',
+          path: `/search/photos?query=${encodeURIComponent(query.slice(0, 50))}&per_page=6&orientation=squarish`,
+          method: 'GET',
+          headers: { 'Authorization': `Client-ID ${UNSPLASH_KEY}`, 'Accept-Version': 'v1' },
+        },
+        res => {
+          let raw = '';
+          res.on('data', c => { raw += c; });
+          res.on('end', () => {
+            if (res.statusCode >= 400) { reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`)); return; }
+            try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
+          });
+        }
+      );
+      r.setTimeout(HTTP_TIMEOUT_MS, () => r.destroy(new Error('Unsplash timeout')));
+      r.on('error', reject);
+      r.end();
+    });
+
+    const photos = (d.results || []).map(p => ({
+      id:     p.id,
+      url:    p.urls?.small    || p.urls?.regular || '',
+      thumb:  p.urls?.thumb    || p.urls?.small   || '',
+      alt:    p.alt_description || p.description  || query,
+      credit: p.user?.name    || '',
+      link:   p.links?.html   || '',
+    })).filter(p => p.url);
+
+    sendJSON(res, 200, { photos });
+  } catch (e) {
+    console.warn('[unsplash error]', e.message);
+    sendJSON(res, 200, { photos: [], error: e.message.slice(0, 100) });
+  }
+});
+
+/** GET+POST /api/sync (Firebase) */
+const syncHandler = async (req, res, _ip) => {
+  if (!FIREBASE_DB_URL) {
+    sendJSON(res, 200, { ok: false, reason: 'no_firebase' });
+    return;
+  }
+
+  const userId = (req.headers['x-user-id'] || 'anonymous')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 40);
+  const fbHostname = new URL(FIREBASE_DB_URL).hostname;
+  const fbPath     = `/users/${userId}.json`;
+
+  if (req.method === 'GET') {
+    try {
+      const d = await httpsGet(fbHostname, fbPath);
+      sendJSON(res, 200, { ok: true, data: d });
+    } catch (e) {
+      sendJSON(res, 200, { ok: false, reason: e.message.slice(0, 100) });
+    }
+    return;
+  }
+
+  // POST
+  try {
+    const body    = await readBody(req);
+    const bodyStr = JSON.stringify(body);
+    await new Promise((resolve, reject) => {
+      const r = https.request(
+        {
+          hostname: fbHostname,
+          path: fbPath,
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) },
+        },
+        res => { let raw = ''; res.on('data', c => { raw += c; }); res.on('end', () => resolve(raw)); }
+      );
+      r.setTimeout(HTTP_TIMEOUT_MS, () => r.destroy(new Error('Firebase timeout')));
+      r.on('error', reject);
+      r.write(bodyStr);
+      r.end();
+    });
+    sendJSON(res, 200, { ok: true });
+  } catch (e) {
+    sendJSON(res, 200, { ok: false, reason: e.message.slice(0, 100) });
+  }
+};
+
+addRoute('GET',  '/api/sync', syncHandler);
+addRoute('POST', '/api/sync', syncHandler);
+
+// ===================================================
+//  サーバー起動
+// ===================================================
+http.createServer(dispatchRoute).listen(PORT, () => {
+  console.log(`✅ いどばたサーバー起動 ポート: ${PORT}`);
+  console.log(`🤖 Claude Haiku: ${CLAUDE_KEY  ? '設定済み✅' : '未設定❌'} / Gemini: ${GEMINI_KEY ? '設定済み✅' : '未設定❌（フォールバック）'}`);
+  console.log(`🛡️  レート制限: ${RL_MAX}req/${RL_WIN / 1000}s per IP | タイムアウト: ${HTTP_TIMEOUT_MS}ms`);
+});
